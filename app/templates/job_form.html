@@ -8,6 +8,12 @@
   </div>
 </section>
 
+{% if model_configured %}
+<section class="notice success">模型已配置：会优先使用 LLM 做结构化抽取和话术生成，并用本地规则兜底。</section>
+{% else %}
+<section class="notice">模型尚未配置或连接不可用：本次会使用本地规则分析。可在设置页填写 API Key 并测试连接。</section>
+{% endif %}
+
 <form method="post" action="/jobs/analyze" class="panel form-stack">
   <div class="form-grid">
     <label>平台

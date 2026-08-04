@@ -8,6 +8,10 @@
   </div>
 </section>
 
+{% if notice %}
+<section class="notice {{ notice_type }}">{{ notice }}</section>
+{% endif %}
+
 <section class="metrics">
   <div class="metric"><span>.env</span><strong>{{ "已存在" if env_exists else "未创建" }}</strong></div>
   <div class="metric"><span>今日 token</span><strong>{{ token_stats.today_total }}</strong></div>
@@ -56,7 +60,10 @@
         <input name="output_cost_per_million" type="number" step="0.0001" value="{{ profile.output_cost_per_million }}">
       </label>
       <label class="check"><input name="is_default" type="checkbox" {% if profile.is_default %}checked{% endif %}> 设为默认</label>
-      <button class="button" type="submit">保存配置档</button>
+      <div class="form-actions">
+        <button class="button" type="submit" name="action" value="save">保存配置档</button>
+        <button class="button primary" type="submit" name="action" value="test">保存并测试连接</button>
+      </div>
     </form>
     {% endfor %}
   </div>
@@ -74,7 +81,10 @@
     <label>输入价格 / 百万 token<input name="input_cost_per_million" type="number" step="0.0001" value="0"></label>
     <label>输出价格 / 百万 token<input name="output_cost_per_million" type="number" step="0.0001" value="0"></label>
     <label class="check"><input name="is_default" type="checkbox"> 设为默认</label>
-    <div class="form-actions"><button class="button primary" type="submit">新增</button></div>
+    <div class="form-actions">
+      <button class="button" type="submit" name="action" value="save">新增</button>
+      <button class="button primary" type="submit" name="action" value="test">新增并测试连接</button>
+    </div>
   </form>
 </section>
 

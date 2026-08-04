@@ -118,6 +118,18 @@ p {
   margin-bottom: 18px;
 }
 
+.notice.success {
+  color: #145c35;
+  border-color: #b7dcc6;
+  background: #eef8f1;
+}
+
+.notice.error {
+  color: #8a2f22;
+  border-color: #e1b9b2;
+  background: #fff1ee;
+}
+
 .panel-title,
 .card-head {
   display: flex;

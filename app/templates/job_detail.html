@@ -9,22 +9,30 @@
   <a class="button" href="/interviews">准备面试</a>
 </section>
 
+{% if notice %}
+<section class="notice {{ notice_type }}">{{ notice }}</section>
+{% endif %}
+
 <section class="metrics">
   <div class="metric"><span>匹配分</span><strong>{{ job.match_score }}</strong></div>
   <div class="metric"><span>匹配等级</span><strong>{{ job.match_level or "-" }}</strong></div>
   <div class="metric"><span>建议</span><strong>{{ job.recommendation or "-" }}</strong></div>
   <div class="metric"><span>风险</span><strong>{{ job.risk_level or "-" }}</strong></div>
   <div class="metric"><span>状态</span><strong>{{ job.status }}</strong></div>
+  <div class="metric"><span>分析来源</span><strong>{{ analysis_source_label(job.analysis_source) }}</strong></div>
 </section>
 
 {% if job.analysis_error %}
 <section class="notice">分析提示：{{ job.analysis_error }}</section>
+{% elif job.analysis_source == "local_rules" %}
+<section class="notice">当前使用本地规则分析。配置并测试模型后，点击“重新分析”可使用 LLM 增强抽取和话术。</section>
 {% endif %}
 
 <section class="grid-two">
   <div class="panel">
     <h2>匹配解释</h2>
     {% set scoring = job.extracted.get("scoring", {}) %}
+    {% set extracted = job.extracted.get("extracted", {}) %}
     <p><strong>已匹配技能：</strong>{{ scoring.get("matched_skills", []) | join("、") or "-" }}</p>
     <p><strong>缺口：</strong>{{ scoring.get("missing_skills", []) | join("、") or "-" }}</p>
     <p><strong>谨慎信号：</strong>{{ scoring.get("caution_signals", []) | join("、") or "-" }}</p>
@@ -33,6 +41,67 @@
     <p><strong>跳过原因：</strong>{{ job.skip_reason }}</p>
     {% endif %}
   </div>
+  <div class="panel">
+    <h2>评分分解</h2>
+    {% set breakdown = scoring.get("score_breakdown", {}) %}
+    <p><strong>技术匹配：</strong>{{ breakdown.get("technical", 0) }} / 35</p>
+    <p><strong>成长性：</strong>{{ breakdown.get("growth", 0) }} / 25</p>
+    <p><strong>薪资：</strong>{{ breakdown.get("salary", 0) }} / 15</p>
+    <p><strong>地点与时间：</strong>{{ breakdown.get("location_time", 0) }} / 10</p>
+    <p><strong>公司风险：</strong>{{ breakdown.get("company_risk", 0) }} / 15</p>
+  </div>
+</section>
+
+<section class="grid-two">
+  <div class="panel">
+    <h2>JD 抽取结果</h2>
+    <p><strong>职责：</strong></p>
+    <ul>
+      {% for item in extracted.get("responsibilities", []) %}
+      <li>{{ item }}</li>
+      {% else %}
+      <li class="empty">未抽取到职责条目。</li>
+      {% endfor %}
+    </ul>
+    <p><strong>要求：</strong></p>
+    <ul>
+      {% for item in extracted.get("requirements", []) %}
+      <li>{{ item }}</li>
+      {% else %}
+      <li class="empty">未抽取到要求条目。</li>
+      {% endfor %}
+    </ul>
+    <p><strong>必备技能：</strong>{{ extracted.get("required_skills", []) | join("、") or "-" }}</p>
+    <p><strong>加分技能：</strong>{{ extracted.get("bonus_skills", []) | join("、") or "-" }}</p>
+  </div>
+  <form method="post" action="/jobs/{{ job.id }}/reanalyze" class="panel form-stack">
+    <h2>重新分析</h2>
+    <div class="form-grid compact">
+      <label>岗位名称
+        <input name="title" value="{{ job.title }}">
+      </label>
+      <label>公司名称
+        <input name="company" value="{{ job.company }}">
+      </label>
+      <label>城市
+        <input name="city" value="{{ job.city }}">
+      </label>
+      <label>薪资
+        <input name="salary_text" value="{{ job.salary_text }}">
+      </label>
+      <label>搜索深度
+        <select name="search_depth">
+          {% for value, label in [("auto","自动分档"),("quick","快速"),("standard","标准"),("deep","深度")] %}
+          <option value="{{ value }}" {% if job.search_depth == value %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+      </label>
+    </div>
+    <button class="button primary" type="submit">重新分析</button>
+  </form>
+</section>
+
+<section class="grid-two">
   <form method="post" action="/jobs/{{ job.id }}/status" class="panel form-stack">
     <h2>推进状态</h2>
     <label>状态

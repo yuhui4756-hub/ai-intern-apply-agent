@@ -110,6 +110,7 @@ def init_db() -> None:
                 generated_message TEXT NOT NULL DEFAULT '',
                 generated_email TEXT NOT NULL DEFAULT '',
                 analysis_error TEXT NOT NULL DEFAULT '',
+                analysis_source TEXT NOT NULL DEFAULT 'local_rules',
                 search_depth TEXT NOT NULL DEFAULT 'auto',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -197,7 +198,17 @@ def init_db() -> None:
             );
             """
         )
+        ensure_columns(conn)
         seed_defaults(conn)
+
+
+def ensure_columns(conn: sqlite3.Connection) -> None:
+    table_columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(job_postings)").fetchall()
+    }
+    if "analysis_source" not in table_columns:
+        conn.execute("ALTER TABLE job_postings ADD COLUMN analysis_source TEXT NOT NULL DEFAULT 'local_rules'")
 
 
 def seed_defaults(conn: sqlite3.Connection) -> None:

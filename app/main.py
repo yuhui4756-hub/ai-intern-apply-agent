@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import RedirectResponse, Response
@@ -18,23 +20,30 @@ from .services.analyzer import (
     rule_extract_jd,
     score_job,
 )
-from .services.llm import client_for_task
+from .services.llm import OpenAICompatibleClient, client_for_task
 from .services.research import search_company
 from .services.resume import read_resume_text
 
 
-app = FastAPI(title="简历投递 Agent")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    yield
+
+
+app = FastAPI(title="简历投递 Agent", lifespan=lifespan)
 templates = Jinja2Templates(directory=str(ROOT_DIR / "app" / "templates"))
 app.mount("/static", StaticFiles(directory=str(ROOT_DIR / "app" / "static")), name="static")
 
 
-@app.on_event("startup")
-def on_startup() -> None:
-    init_db()
-
-
 def redirect(path: str) -> RedirectResponse:
     return RedirectResponse(path, status_code=303)
+
+
+def redirect_with_notice(path: str, message: str, notice_type: str = "info") -> RedirectResponse:
+    query = urlencode({"notice": message, "notice_type": notice_type})
+    separator = "&" if "?" in path else "?"
+    return redirect(f"{path}{separator}{query}")
 
 
 def task_label(task_type: str) -> str:
@@ -45,6 +54,14 @@ def parse_json_fields(job: dict[str, Any]) -> dict[str, Any]:
     job = dict(job)
     job["extracted"] = loads(job.get("extracted_json"), {})
     return job
+
+
+def analysis_source_label(value: str) -> str:
+    return {
+        "llm_plus_rules": "LLM + 本地规则",
+        "local_rules": "本地规则",
+        "failed": "待分析",
+    }.get(value or "", value or "本地规则")
 
 
 def auto_search_depth(scoring: dict[str, Any], extracted: dict[str, Any]) -> str:
@@ -146,6 +163,73 @@ def apply_blacklists(extracted: dict[str, Any], jd_text: str) -> None:
             if signal not in risk_signals:
                 risk_signals.append(signal)
     extracted["risk_signals"] = risk_signals
+
+
+def analyze_job_payload(
+    jd_text: str,
+    resume_id: int | None,
+    title: str = "",
+    company: str = "",
+    city: str = "",
+    salary_text: str = "",
+    search_depth: str = "auto",
+) -> dict[str, Any]:
+    _resume, resume_text = get_resume_text(resume_id)
+    fallback_extract = rule_extract_jd(
+        jd_text,
+        fallback_title=title,
+        fallback_company=company,
+        fallback_city=city,
+        fallback_salary=salary_text,
+    )
+    llm_extract, analysis_error = try_llm_jd_extract(jd_text)
+    extracted = clean_extracted({**fallback_extract, **(llm_extract or {})})
+    extracted["required_skills"] = list(dict.fromkeys((llm_extract or {}).get("required_skills") or fallback_extract["required_skills"]))
+    extracted["risk_signals"] = list(dict.fromkeys((llm_extract or {}).get("risk_signals") or fallback_extract["risk_signals"]))
+    extracted["caution_signals"] = list(dict.fromkeys((llm_extract or {}).get("caution_signals") or fallback_extract["caution_signals"]))
+    apply_blacklists(extracted, jd_text)
+
+    scoring = score_job(extracted, jd_text, resume_text)
+    messages = try_llm_message(extracted, scoring, generate_message(extracted, scoring))
+    final_depth = auto_search_depth(scoring, extracted) if search_depth == "auto" else search_depth
+    source = "llm_plus_rules" if llm_extract else "local_rules"
+    if not jd_text:
+        source = "failed"
+        analysis_error = "JD 文本为空"
+
+    return {
+        "extracted": extracted,
+        "scoring": scoring,
+        "messages": messages,
+        "search_depth": final_depth,
+        "analysis_error": analysis_error,
+        "analysis_source": source,
+    }
+
+
+def insert_company_research(conn: Any, job_id: int, company: str, title: str, city: str, search_depth: str) -> None:
+    if not company:
+        return
+    now = utc_now()
+    for result in search_company(company, title, city, search_depth):
+        conn.execute(
+            """
+            INSERT INTO company_research (
+                job_id, company, query, source_title, source_url,
+                summary, risk_signals_json, searched_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                job_id,
+                company,
+                " ".join([company, title, city]).strip(),
+                result.title,
+                result.url,
+                result.summary,
+                dumps([]),
+                now,
+            ),
+        )
 
 
 def token_stats() -> dict[str, Any]:
@@ -277,10 +361,14 @@ def jobs_page(request: Request, status: str = "") -> Any:
 def new_job_page(request: Request) -> Any:
     with connect() as conn:
         resumes = conn.execute("SELECT * FROM resume_versions ORDER BY is_default DESC, id").fetchall()
+    jd_client = client_for_task("jd_extract")
     return templates.TemplateResponse(
         request,
         "job_form.html",
-        {"resumes": [{key: row[key] for key in row.keys()} for row in resumes]},
+        {
+            "resumes": [{key: row[key] for key in row.keys()} for row in resumes],
+            "model_configured": bool(jd_client and jd_client.configured),
+        },
     )
 
 
@@ -290,32 +378,25 @@ async def analyze_job(request: Request) -> RedirectResponse:
     jd_text = str(form.get("jd_text") or "").strip()
     resume_id_raw = str(form.get("selected_resume_id") or "")
     resume_id = int(resume_id_raw) if resume_id_raw.isdigit() else None
-    _resume, resume_text = get_resume_text(resume_id)
-
-    fallback_extract = rule_extract_jd(
-        jd_text,
-        fallback_title=str(form.get("title") or ""),
-        fallback_company=str(form.get("company") or ""),
-        fallback_city=str(form.get("city") or ""),
-        fallback_salary=str(form.get("salary_text") or ""),
-    )
-    llm_extract, analysis_error = try_llm_jd_extract(jd_text)
-    extracted = clean_extracted({**fallback_extract, **(llm_extract or {})})
-    extracted["required_skills"] = list(dict.fromkeys((llm_extract or {}).get("required_skills") or fallback_extract["required_skills"]))
-    extracted["risk_signals"] = list(dict.fromkeys((llm_extract or {}).get("risk_signals") or fallback_extract["risk_signals"]))
-    extracted["caution_signals"] = list(dict.fromkeys((llm_extract or {}).get("caution_signals") or fallback_extract["caution_signals"]))
-    apply_blacklists(extracted, jd_text)
-
-    scoring = score_job(extracted, jd_text, resume_text)
-    messages = try_llm_message(extracted, scoring, generate_message(extracted, scoring))
     requested_depth = str(form.get("search_depth") or "auto")
-    final_depth = auto_search_depth(scoring, extracted) if requested_depth == "auto" else requested_depth
+    analysis = analyze_job_payload(
+        jd_text,
+        resume_id,
+        title=str(form.get("title") or ""),
+        company=str(form.get("company") or ""),
+        city=str(form.get("city") or ""),
+        salary_text=str(form.get("salary_text") or ""),
+        search_depth=requested_depth,
+    )
+    extracted = analysis["extracted"]
+    scoring = analysis["scoring"]
+    messages = analysis["messages"]
+    final_depth = analysis["search_depth"]
 
     now = utc_now()
     status = "待确认" if scoring["recommendation"] in {"必投", "可冲"} else "已归档"
     if not jd_text:
         status = "待分析"
-        analysis_error = "JD 文本为空"
     with connect() as conn:
         cursor = conn.execute(
             """
@@ -324,8 +405,8 @@ async def analyze_job(request: Request) -> RedirectResponse:
                 internship_days, internship_duration, jd_text, extracted_json,
                 selected_resume_id, match_score, match_level, risk_level,
                 recommendation, status, skip_reason, generated_message,
-                generated_email, analysis_error, search_depth, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                generated_email, analysis_error, analysis_source, search_depth, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 str(form.get("platform") or ""),
@@ -347,7 +428,8 @@ async def analyze_job(request: Request) -> RedirectResponse:
                 scoring["skip_reason"] if jd_text else "",
                 messages["message"] if jd_text else "",
                 messages["email"] if jd_text else "",
-                analysis_error,
+                analysis["analysis_error"],
+                analysis["analysis_source"],
                 final_depth,
                 now,
                 now,
@@ -357,25 +439,7 @@ async def analyze_job(request: Request) -> RedirectResponse:
 
         company = extracted.get("company") or str(form.get("company") or "")
         if jd_text and company:
-            for result in search_company(company, extracted.get("title") or "", extracted.get("city") or "", final_depth):
-                conn.execute(
-                    """
-                    INSERT INTO company_research (
-                        job_id, company, query, source_title, source_url,
-                        summary, risk_signals_json, searched_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        job_id,
-                        company,
-                        " ".join([company, extracted.get("title") or "", extracted.get("city") or ""]).strip(),
-                        result.title,
-                        result.url,
-                        result.summary,
-                        dumps([]),
-                        now,
-                    ),
-                )
+            insert_company_research(conn, job_id, company, extracted.get("title") or "", extracted.get("city") or "", final_depth)
     return redirect(f"/jobs/{job_id}")
 
 
@@ -394,6 +458,9 @@ def job_detail(job_id: int, request: Request) -> Any:
             "job": parse_json_fields({key: job[key] for key in job.keys()}),
             "research": [{key: row[key] for key in row.keys()} for row in research],
             "events": [{key: row[key] for key in row.keys()} for row in events],
+            "analysis_source_label": analysis_source_label,
+            "notice": request.query_params.get("notice", ""),
+            "notice_type": request.query_params.get("notice_type", "info"),
         },
     )
 
@@ -416,6 +483,84 @@ async def update_job_status(job_id: int, request: Request) -> RedirectResponse:
                 (job_id, "状态更新", note, now),
             )
     return redirect(f"/jobs/{job_id}")
+
+
+@app.post("/jobs/{job_id}/reanalyze")
+async def reanalyze_job(job_id: int, request: Request) -> RedirectResponse:
+    form = await request.form()
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM job_postings WHERE id = ?", (job_id,)).fetchone()
+    if not row:
+        return redirect("/jobs")
+
+    job = {key: row[key] for key in row.keys()}
+    resume_id = job.get("selected_resume_id")
+    requested_depth = str(form.get("search_depth") or job.get("search_depth") or "auto")
+    analysis = analyze_job_payload(
+        job.get("jd_text") or "",
+        int(resume_id) if resume_id else None,
+        title=str(form.get("title") or job.get("title") or ""),
+        company=str(form.get("company") or job.get("company") or ""),
+        city=str(form.get("city") or job.get("city") or ""),
+        salary_text=str(form.get("salary_text") or job.get("salary_text") or ""),
+        search_depth=requested_depth,
+    )
+    extracted = analysis["extracted"]
+    scoring = analysis["scoring"]
+    messages = analysis["messages"]
+    status = job.get("status") or "待确认"
+    if status in {"待分析", "待确认", "已归档"}:
+        status = "待确认" if scoring["recommendation"] in {"必投", "可冲"} else "已归档"
+
+    now = utc_now()
+    with connect() as conn:
+        conn.execute("DELETE FROM company_research WHERE job_id = ?", (job_id,))
+        conn.execute(
+            """
+            UPDATE job_postings
+            SET title = ?, company = ?, city = ?, salary_text = ?,
+                internship_days = ?, internship_duration = ?, extracted_json = ?,
+                match_score = ?, match_level = ?, risk_level = ?, recommendation = ?,
+                status = ?, skip_reason = ?, generated_message = ?, generated_email = ?,
+                analysis_error = ?, analysis_source = ?, search_depth = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                extracted.get("title") or "",
+                extracted.get("company") or "",
+                extracted.get("city") or "",
+                extracted.get("salary_text") or "",
+                extracted.get("internship_days") or "",
+                extracted.get("internship_duration") or "",
+                dumps({"extracted": extracted, "scoring": scoring}),
+                scoring["score"],
+                scoring["level"],
+                scoring["risk_level"],
+                scoring["recommendation"],
+                status,
+                scoring["skip_reason"],
+                messages["message"],
+                messages["email"],
+                analysis["analysis_error"],
+                analysis["analysis_source"],
+                analysis["search_depth"],
+                now,
+                job_id,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO application_events (job_id, event_type, content, created_at) VALUES (?, ?, ?, ?)",
+            (job_id, "重新分析", f"使用{analysis_source_label(analysis['analysis_source'])}刷新岗位分析。", now),
+        )
+        insert_company_research(
+            conn,
+            job_id,
+            extracted.get("company") or "",
+            extracted.get("title") or "",
+            extracted.get("city") or "",
+            analysis["search_depth"],
+        )
+    return redirect_with_notice(f"/jobs/{job_id}", "已重新分析岗位。", "success")
 
 
 @app.get("/interviews")
@@ -568,6 +713,8 @@ def settings_page(request: Request) -> Any:
             "env_example": (ROOT_DIR / ".env.example").read_text(encoding="utf-8"),
             "blacklist_companies": "\n".join(get_setting("blacklist_companies", []) or []),
             "blacklist_keywords": "\n".join(get_setting("blacklist_keywords", []) or []),
+            "notice": request.query_params.get("notice", ""),
+            "notice_type": request.query_params.get("notice_type", "info"),
         },
     )
 
@@ -576,6 +723,7 @@ def settings_page(request: Request) -> Any:
 async def upsert_model_profile(request: Request) -> RedirectResponse:
     form = await request.form()
     profile_id = str(form.get("profile_id") or "")
+    action = str(form.get("action") or "save")
     api_key_env = str(form.get("api_key_env") or "OPENAI_COMPATIBLE_API_KEY").strip()
     api_key_value = str(form.get("api_key") or "").strip()
     if api_key_value and not looks_masked(api_key_value):
@@ -617,7 +765,31 @@ async def upsert_model_profile(request: Request) -> RedirectResponse:
                 """,
                 (*values, values[-1]),
             )
-    return redirect("/settings")
+
+    if action == "test":
+        profile = {
+            "name": values[0],
+            "base_url": values[1],
+            "api_key_env": values[2],
+            "model": values[3],
+            "temperature": values[4],
+            "input_cost_per_million": values[5],
+            "output_cost_per_million": values[6],
+        }
+        client = OpenAICompatibleClient(profile, "settings_test")
+        try:
+            client.complete_text(
+                [
+                    {"role": "system", "content": "你是模型连通性测试助手。"},
+                    {"role": "user", "content": "请只回复 OK。"},
+                ]
+            )
+            return redirect_with_notice("/settings", f"模型连接成功：{values[0]} / {values[3]}", "success")
+        except Exception as exc:
+            client.log_error(str(exc))
+            return redirect_with_notice("/settings", f"模型连接失败：{str(exc)[:160]}", "error")
+
+    return redirect_with_notice("/settings", "模型配置已保存。", "success")
 
 
 @app.post("/settings/blacklists")
