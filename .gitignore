@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Local app data
+*.sqlite
+*.sqlite3
+*.db
+data/
+local_data/
+exports/
+logs/
+
+# Resume and interview private artifacts
+private/
+recordings/
+transcripts/
+interview_audio/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
