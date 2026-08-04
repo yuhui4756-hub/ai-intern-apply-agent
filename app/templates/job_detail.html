@@ -1,0 +1,92 @@
+{% extends "layout.html" %}
+{% block title %}{{ job.title or "岗位详情" }} - 简历投递 Agent{% endblock %}
+{% block content %}
+<section class="page-head">
+  <div>
+    <h1>{{ job.title or "未命名岗位" }}</h1>
+    <p>{{ job.company or "未知公司" }} · {{ job.city or "城市未填" }} · {{ job.salary_text or "薪资未填" }}</p>
+  </div>
+  <a class="button" href="/interviews">准备面试</a>
+</section>
+
+<section class="metrics">
+  <div class="metric"><span>匹配分</span><strong>{{ job.match_score }}</strong></div>
+  <div class="metric"><span>匹配等级</span><strong>{{ job.match_level or "-" }}</strong></div>
+  <div class="metric"><span>建议</span><strong>{{ job.recommendation or "-" }}</strong></div>
+  <div class="metric"><span>风险</span><strong>{{ job.risk_level or "-" }}</strong></div>
+  <div class="metric"><span>状态</span><strong>{{ job.status }}</strong></div>
+</section>
+
+{% if job.analysis_error %}
+<section class="notice">分析提示：{{ job.analysis_error }}</section>
+{% endif %}
+
+<section class="grid-two">
+  <div class="panel">
+    <h2>匹配解释</h2>
+    {% set scoring = job.extracted.get("scoring", {}) %}
+    <p><strong>已匹配技能：</strong>{{ scoring.get("matched_skills", []) | join("、") or "-" }}</p>
+    <p><strong>缺口：</strong>{{ scoring.get("missing_skills", []) | join("、") or "-" }}</p>
+    <p><strong>谨慎信号：</strong>{{ scoring.get("caution_signals", []) | join("、") or "-" }}</p>
+    <p><strong>高风险信号：</strong>{{ scoring.get("risk_signals", []) | join("、") or "-" }}</p>
+    {% if job.skip_reason %}
+    <p><strong>跳过原因：</strong>{{ job.skip_reason }}</p>
+    {% endif %}
+  </div>
+  <form method="post" action="/jobs/{{ job.id }}/status" class="panel form-stack">
+    <h2>推进状态</h2>
+    <label>状态
+      <select name="status">
+        {% for status in ["待确认","待投递","已投递","已沟通","待笔试","待面试","面试准备中","已面试","已拒绝","已通过","已归档"] %}
+        <option value="{{ status }}" {% if job.status == status %}selected{% endif %}>{{ status }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>跳过原因
+      <input name="skip_reason" value="{{ job.skip_reason }}">
+    </label>
+    <label>备注
+      <textarea name="note" rows="4" placeholder="记录沟通、投递或面试进展"></textarea>
+    </label>
+    <button class="button primary" type="submit">保存状态</button>
+  </form>
+</section>
+
+<section class="grid-two">
+  <div class="panel">
+    <div class="panel-title">
+      <h2>平台打招呼</h2>
+      <button class="button copy-button" type="button" data-copy-target="message">复制</button>
+    </div>
+    <textarea id="message" class="copy-area" rows="8">{{ job.generated_message }}</textarea>
+  </div>
+  <div class="panel">
+    <div class="panel-title">
+      <h2>邮箱正文</h2>
+      <button class="button copy-button" type="button" data-copy-target="email">复制</button>
+    </div>
+    <textarea id="email" class="copy-area" rows="8">{{ job.generated_email }}</textarea>
+  </div>
+</section>
+
+<section class="panel">
+  <h2>公司搜索证据</h2>
+  {% if research %}
+    <div class="cards">
+      {% for item in research %}
+      <article class="card">
+        <a href="{{ item.source_url }}" target="_blank" rel="noreferrer">{{ item.source_title }}</a>
+        <p>{{ item.summary }}</p>
+      </article>
+      {% endfor %}
+    </div>
+  {% else %}
+    <p class="empty">暂无搜索结果。可能是公司名为空、搜索失败，或该岗位被快速跳过。</p>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <h2>原始 JD</h2>
+  <pre class="pre">{{ job.jd_text }}</pre>
+</section>
+{% endblock %}

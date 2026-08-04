@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}简历投递 Agent{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='styles.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/">简历投递 Agent</a>
+    <nav>
+      <a href="/">仪表盘</a>
+      <a href="/jobs/new">JD 分析</a>
+      <a href="/jobs">岗位列表</a>
+      <a href="/resumes">候选人画像</a>
+      <a href="/interviews">面试准备</a>
+      <a href="/settings">设置</a>
+    </nav>
+  </header>
+  <main class="page">
+    {% block content %}{% endblock %}
+  </main>
+  <script src="{{ url_for('static', path='app.js') }}"></script>
+</body>
+</html>

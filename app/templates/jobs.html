@@ -1,0 +1,46 @@
+{% extends "layout.html" %}
+{% block title %}岗位列表 - 简历投递 Agent{% endblock %}
+{% block content %}
+<section class="page-head">
+  <div>
+    <h1>岗位列表</h1>
+    <p>筛选、复盘和推进每一个岗位。</p>
+  </div>
+  <a class="button primary" href="/jobs/new">分析新 JD</a>
+</section>
+
+<section class="panel">
+  {% if jobs %}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>岗位</th>
+          <th>公司</th>
+          <th>城市</th>
+          <th>匹配</th>
+          <th>风险</th>
+          <th>建议</th>
+          <th>状态</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for job in jobs %}
+        <tr>
+          <td><a href="/jobs/{{ job.id }}">{{ job.title or "未命名岗位" }}</a></td>
+          <td>{{ job.company or "-" }}</td>
+          <td>{{ job.city or "-" }}</td>
+          <td><span class="badge">{{ job.match_level or "-" }} {{ job.match_score }}</span></td>
+          <td>{{ job.risk_level or "-" }}</td>
+          <td>{{ job.recommendation or "-" }}</td>
+          <td>{{ job.status }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+    <p class="empty">还没有岗位。先去分析一条 JD。</p>
+  {% endif %}
+</section>
+{% endblock %}

@@ -1,0 +1,48 @@
+{% extends "layout.html" %}
+{% block title %}仪表盘 - 简历投递 Agent{% endblock %}
+{% block content %}
+<section class="page-head">
+  <div>
+    <h1>仪表盘</h1>
+    <p>先把岗位筛清楚，再把每一次沟通和面试准备落到记录里。</p>
+  </div>
+  <a class="button primary" href="/jobs/new">分析新 JD</a>
+</section>
+
+<section class="metrics">
+  <div class="metric"><span>待确认</span><strong>{{ counts.get("待确认", 0) }}</strong></div>
+  <div class="metric"><span>已投递</span><strong>{{ counts.get("已投递", 0) }}</strong></div>
+  <div class="metric"><span>面试中</span><strong>{{ counts.get("待面试", 0) + counts.get("面试准备中", 0) }}</strong></div>
+  <div class="metric"><span>简历版本</span><strong>{{ resumes }}</strong></div>
+  <div class="metric"><span>今日 token</span><strong>{{ token_stats.today_total }}</strong></div>
+</section>
+
+<section class="panel">
+  <div class="panel-title">
+    <h2>最近岗位</h2>
+    <a href="/jobs">查看全部</a>
+  </div>
+  {% if recent_jobs %}
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>岗位</th><th>公司</th><th>匹配</th><th>建议</th><th>状态</th></tr>
+        </thead>
+        <tbody>
+          {% for job in recent_jobs %}
+          <tr>
+            <td><a href="/jobs/{{ job.id }}">{{ job.title or "未命名岗位" }}</a></td>
+            <td>{{ job.company or "-" }}</td>
+            <td><span class="badge">{{ job.match_level or "-" }} {{ job.match_score }}</span></td>
+            <td>{{ job.recommendation or "-" }}</td>
+            <td>{{ job.status }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% else %}
+    <p class="empty">还没有岗位记录。先粘贴一条 JD 试试看。</p>
+  {% endif %}
+</section>
+{% endblock %}

@@ -1,0 +1,1 @@
+"""AI internship application agent."""

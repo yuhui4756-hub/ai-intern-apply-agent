@@ -1,0 +1,54 @@
+{% extends "layout.html" %}
+{% block title %}JD 分析 - 简历投递 Agent{% endblock %}
+{% block content %}
+<section class="page-head">
+  <div>
+    <h1>JD 分析</h1>
+    <p>粘贴岗位描述，选择简历版本，Agent 会给出匹配评分、风险判断和投递话术。</p>
+  </div>
+</section>
+
+<form method="post" action="/jobs/analyze" class="panel form-stack">
+  <div class="form-grid">
+    <label>平台
+      <input name="platform" placeholder="Boss 直聘 / 实习僧 / 牛客 / 公司官网">
+    </label>
+    <label>岗位链接
+      <input name="source_url" placeholder="https://...">
+    </label>
+    <label>岗位名称（可选）
+      <input name="title" placeholder="AI 应用开发实习生">
+    </label>
+    <label>公司（可选）
+      <input name="company" placeholder="公司名">
+    </label>
+    <label>城市（可选）
+      <input name="city" placeholder="杭州 / 深圳 / 远程">
+    </label>
+    <label>薪资（可选）
+      <input name="salary_text" placeholder="200-300元/天">
+    </label>
+    <label>简历版本
+      <select name="selected_resume_id">
+        {% for resume in resumes %}
+        <option value="{{ resume.id }}">{{ resume.name }} - {{ resume.target_role }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>搜索深度
+      <select name="search_depth">
+        <option value="auto">自动分档</option>
+        <option value="quick">快速</option>
+        <option value="standard">标准</option>
+        <option value="deep">深度</option>
+      </select>
+    </label>
+  </div>
+  <label>JD 文本
+    <textarea name="jd_text" rows="16" required placeholder="把岗位描述粘贴到这里"></textarea>
+  </label>
+  <div class="form-actions">
+    <button class="button primary" type="submit">分析并保存</button>
+  </div>
+</form>
+{% endblock %}

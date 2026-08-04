@@ -1,0 +1,632 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+from fastapi import FastAPI, Form, Request
+from fastapi.responses import RedirectResponse, Response
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+
+from .config import ROOT_DIR, TASK_TYPES
+from .db import connect, dumps, get_setting, init_db, loads, set_setting, utc_now
+from .services.analyzer import (
+    build_interview_review,
+    generate_message,
+    rule_extract_jd,
+    score_job,
+)
+from .services.llm import client_for_task
+from .services.research import search_company
+from .services.resume import read_resume_text
+
+
+app = FastAPI(title="简历投递 Agent")
+templates = Jinja2Templates(directory=str(ROOT_DIR / "app" / "templates"))
+app.mount("/static", StaticFiles(directory=str(ROOT_DIR / "app" / "static")), name="static")
+
+
+@app.on_event("startup")
+def on_startup() -> None:
+    init_db()
+
+
+def redirect(path: str) -> RedirectResponse:
+    return RedirectResponse(path, status_code=303)
+
+
+def task_label(task_type: str) -> str:
+    return dict(TASK_TYPES).get(task_type, task_type)
+
+
+def parse_json_fields(job: dict[str, Any]) -> dict[str, Any]:
+    job = dict(job)
+    job["extracted"] = loads(job.get("extracted_json"), {})
+    return job
+
+
+def auto_search_depth(scoring: dict[str, Any], extracted: dict[str, Any]) -> str:
+    if scoring.get("risk_signals"):
+        return "quick"
+    if scoring.get("level") == "高匹配" and not extracted.get("company"):
+        return "deep"
+    if scoring.get("level") == "高匹配" or scoring.get("caution_signals"):
+        return "deep"
+    if scoring.get("level") == "中匹配":
+        return "standard"
+    return "quick"
+
+
+def get_resume_text(resume_id: int | None) -> tuple[dict[str, Any] | None, str]:
+    if not resume_id:
+        return None, ""
+    with connect() as conn:
+        resume = conn.execute("SELECT * FROM resume_versions WHERE id = ?", (resume_id,)).fetchone()
+        if not resume:
+            return None, ""
+        resume_dict = {key: resume[key] for key in resume.keys()}
+        parsed = resume_dict.get("parsed_text") or ""
+        file_path = resume_dict.get("file_path") or ""
+        if not parsed and file_path:
+            parsed = read_resume_text(file_path)
+            if parsed:
+                conn.execute(
+                    """
+                    UPDATE resume_versions
+                    SET parsed_text = ?, file_type = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (parsed, Path(file_path).suffix.lower().lstrip("."), utc_now(), resume_id),
+                )
+                resume_dict["parsed_text"] = parsed
+        return resume_dict, parsed
+
+
+def try_llm_jd_extract(jd_text: str) -> tuple[dict[str, Any] | None, str]:
+    client = client_for_task("jd_extract")
+    if not client or not client.configured:
+        return None, ""
+    prompt = (
+        "你是求职投递 Agent 的 JD 结构化抽取器。请只输出 JSON，不要输出 Markdown。"
+        "字段：title, company, city, salary_text, internship_days, internship_duration, "
+        "responsibilities(array), requirements(array), required_skills(array), bonus_skills(array), "
+        "risk_signals(array), caution_signals(array)。如果不知道，填空字符串或空数组。"
+    )
+    try:
+        return client.complete_json(
+            [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": jd_text[:12000]},
+            ]
+        ), ""
+    except Exception as exc:
+        client.log_error(str(exc))
+        return None, str(exc)
+
+
+def try_llm_message(extracted: dict[str, Any], scoring: dict[str, Any], fallback: dict[str, str]) -> dict[str, str]:
+    client = client_for_task("message_draft")
+    if not client or not client.configured:
+        return fallback
+    prompt = (
+        "请基于岗位信息和候选人优势生成投递话术，风格礼貌正式但有学生真诚感。"
+        "不要编造经历。输出 JSON：message, email。"
+    )
+    try:
+        result = client.complete_json(
+            [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": dumps({"job": extracted, "scoring": scoring})},
+            ]
+        )
+        return {
+            "message": result.get("message") or fallback["message"],
+            "email": result.get("email") or fallback["email"],
+        }
+    except Exception as exc:
+        client.log_error(str(exc))
+        return fallback
+
+
+def apply_blacklists(extracted: dict[str, Any], jd_text: str) -> None:
+    keywords = get_setting("blacklist_keywords", []) or []
+    companies = get_setting("blacklist_companies", []) or []
+    risk_signals = list(extracted.get("risk_signals") or [])
+    for keyword in keywords:
+        keyword = str(keyword).strip()
+        if keyword and keyword in jd_text and keyword not in risk_signals:
+            risk_signals.append(keyword)
+    company = str(extracted.get("company") or "").strip()
+    for blacklisted in companies:
+        blacklisted = str(blacklisted).strip()
+        if blacklisted and company and (blacklisted in company or company in blacklisted):
+            signal = f"黑名单公司：{blacklisted}"
+            if signal not in risk_signals:
+                risk_signals.append(signal)
+    extracted["risk_signals"] = risk_signals
+
+
+def token_stats() -> dict[str, Any]:
+    with connect() as conn:
+        today = conn.execute(
+            """
+            SELECT COALESCE(SUM(total_tokens), 0) AS total, COALESCE(SUM(estimated_cost), 0) AS cost
+            FROM model_call_logs
+            WHERE date(created_at) = date('now')
+            """
+        ).fetchone()
+        all_time = conn.execute(
+            """
+            SELECT COALESCE(SUM(total_tokens), 0) AS total, COALESCE(SUM(estimated_cost), 0) AS cost
+            FROM model_call_logs
+            """
+        ).fetchone()
+    return {
+        "today_total": int(today["total"] or 0),
+        "today_cost": float(today["cost"] or 0),
+        "all_total": int(all_time["total"] or 0),
+        "all_cost": float(all_time["cost"] or 0),
+    }
+
+
+@app.get("/")
+def dashboard(request: Request) -> Any:
+    with connect() as conn:
+        counts = {
+            row["status"]: row["count"]
+            for row in conn.execute("SELECT status, COUNT(*) AS count FROM job_postings GROUP BY status").fetchall()
+        }
+        recent_jobs = [
+            parse_json_fields({key: row[key] for key in row.keys()})
+            for row in conn.execute("SELECT * FROM job_postings ORDER BY created_at DESC LIMIT 6").fetchall()
+        ]
+        resumes = conn.execute("SELECT COUNT(*) AS count FROM resume_versions").fetchone()["count"]
+    return templates.TemplateResponse(
+        request,
+        "dashboard.html",
+        {"counts": counts, "recent_jobs": recent_jobs, "resumes": resumes, "token_stats": token_stats()},
+    )
+
+
+@app.get("/resumes")
+def resumes_page(request: Request) -> Any:
+    with connect() as conn:
+        profile = conn.execute("SELECT * FROM candidate_profile ORDER BY id LIMIT 1").fetchone()
+        resumes = conn.execute("SELECT * FROM resume_versions ORDER BY id").fetchall()
+    return templates.TemplateResponse(
+        request,
+        "resumes.html",
+        {
+            "profile": {key: profile[key] for key in profile.keys()} if profile else {},
+            "resumes": [{key: row[key] for key in row.keys()} for row in resumes],
+            "loads": loads,
+        },
+    )
+
+
+@app.post("/resumes/profile")
+async def update_profile(request: Request) -> RedirectResponse:
+    form = await request.form()
+    now = utc_now()
+    with connect() as conn:
+        profile = conn.execute("SELECT id FROM candidate_profile ORDER BY id LIMIT 1").fetchone()
+        values = (
+            str(form.get("name") or ""),
+            str(form.get("education") or ""),
+            str(form.get("github_url") or ""),
+            str(form.get("demo_url") or ""),
+            dumps([item.strip() for item in str(form.get("target_roles") or "").splitlines() if item.strip()]),
+            dumps([item.strip() for item in str(form.get("skills") or "").splitlines() if item.strip()]),
+            now,
+        )
+        if profile:
+            conn.execute(
+                """
+                UPDATE candidate_profile
+                SET name = ?, education = ?, github_url = ?, demo_url = ?,
+                    target_roles = ?, skills_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (*values, profile["id"]),
+            )
+    return redirect("/resumes")
+
+
+@app.post("/resumes/{resume_id}")
+async def update_resume(resume_id: int, request: Request) -> RedirectResponse:
+    form = await request.form()
+    file_path = str(form.get("file_path") or "").strip()
+    parsed_text = str(form.get("parsed_text") or "")
+    if file_path and not parsed_text:
+        parsed_text = read_resume_text(file_path)
+    with connect() as conn:
+        conn.execute(
+            """
+            UPDATE resume_versions
+            SET name = ?, target_role = ?, file_path = ?, parsed_text = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                str(form.get("name") or ""),
+                str(form.get("target_role") or ""),
+                file_path,
+                parsed_text,
+                utc_now(),
+                resume_id,
+            ),
+        )
+    return redirect("/resumes")
+
+
+@app.get("/jobs")
+def jobs_page(request: Request, status: str = "") -> Any:
+    params: tuple[Any, ...] = ()
+    query = "SELECT * FROM job_postings"
+    if status:
+        query += " WHERE status = ?"
+        params = (status,)
+    query += " ORDER BY created_at DESC"
+    with connect() as conn:
+        jobs = [parse_json_fields({key: row[key] for key in row.keys()}) for row in conn.execute(query, params).fetchall()]
+    return templates.TemplateResponse(request, "jobs.html", {"jobs": jobs, "status_filter": status})
+
+
+@app.get("/jobs/new")
+def new_job_page(request: Request) -> Any:
+    with connect() as conn:
+        resumes = conn.execute("SELECT * FROM resume_versions ORDER BY is_default DESC, id").fetchall()
+    return templates.TemplateResponse(
+        request,
+        "job_form.html",
+        {"resumes": [{key: row[key] for key in row.keys()} for row in resumes]},
+    )
+
+
+@app.post("/jobs/analyze")
+async def analyze_job(request: Request) -> RedirectResponse:
+    form = await request.form()
+    jd_text = str(form.get("jd_text") or "").strip()
+    resume_id_raw = str(form.get("selected_resume_id") or "")
+    resume_id = int(resume_id_raw) if resume_id_raw.isdigit() else None
+    _resume, resume_text = get_resume_text(resume_id)
+
+    fallback_extract = rule_extract_jd(
+        jd_text,
+        fallback_title=str(form.get("title") or ""),
+        fallback_company=str(form.get("company") or ""),
+        fallback_city=str(form.get("city") or ""),
+        fallback_salary=str(form.get("salary_text") or ""),
+    )
+    llm_extract, analysis_error = try_llm_jd_extract(jd_text)
+    extracted = {**fallback_extract, **(llm_extract or {})}
+    extracted["required_skills"] = list(dict.fromkeys((llm_extract or {}).get("required_skills") or fallback_extract["required_skills"]))
+    extracted["risk_signals"] = list(dict.fromkeys((llm_extract or {}).get("risk_signals") or fallback_extract["risk_signals"]))
+    extracted["caution_signals"] = list(dict.fromkeys((llm_extract or {}).get("caution_signals") or fallback_extract["caution_signals"]))
+    apply_blacklists(extracted, jd_text)
+
+    scoring = score_job(extracted, jd_text, resume_text)
+    messages = try_llm_message(extracted, scoring, generate_message(extracted, scoring))
+    requested_depth = str(form.get("search_depth") or "auto")
+    final_depth = auto_search_depth(scoring, extracted) if requested_depth == "auto" else requested_depth
+
+    now = utc_now()
+    status = "待确认" if scoring["recommendation"] in {"必投", "可冲"} else "已归档"
+    if not jd_text:
+        status = "待分析"
+        analysis_error = "JD 文本为空"
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO job_postings (
+                platform, source_url, title, company, city, salary_text,
+                internship_days, internship_duration, jd_text, extracted_json,
+                selected_resume_id, match_score, match_level, risk_level,
+                recommendation, status, skip_reason, generated_message,
+                generated_email, analysis_error, search_depth, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(form.get("platform") or ""),
+                str(form.get("source_url") or ""),
+                extracted.get("title") or "",
+                extracted.get("company") or str(form.get("company") or ""),
+                extracted.get("city") or "",
+                extracted.get("salary_text") or "",
+                extracted.get("internship_days") or "",
+                extracted.get("internship_duration") or "",
+                jd_text,
+                dumps({"extracted": extracted, "scoring": scoring}),
+                resume_id,
+                scoring["score"] if jd_text else 0,
+                scoring["level"] if jd_text else "",
+                scoring["risk_level"] if jd_text else "",
+                scoring["recommendation"] if jd_text else "",
+                status,
+                scoring["skip_reason"] if jd_text else "",
+                messages["message"] if jd_text else "",
+                messages["email"] if jd_text else "",
+                analysis_error,
+                final_depth,
+                now,
+                now,
+            ),
+        )
+        job_id = cursor.lastrowid
+
+        company = extracted.get("company") or str(form.get("company") or "")
+        if jd_text and company:
+            for result in search_company(company, extracted.get("title") or "", extracted.get("city") or "", final_depth):
+                conn.execute(
+                    """
+                    INSERT INTO company_research (
+                        job_id, company, query, source_title, source_url,
+                        summary, risk_signals_json, searched_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        job_id,
+                        company,
+                        " ".join([company, extracted.get("title") or "", extracted.get("city") or ""]).strip(),
+                        result.title,
+                        result.url,
+                        result.summary,
+                        dumps([]),
+                        now,
+                    ),
+                )
+    return redirect(f"/jobs/{job_id}")
+
+
+@app.get("/jobs/{job_id}")
+def job_detail(job_id: int, request: Request) -> Any:
+    with connect() as conn:
+        job = conn.execute("SELECT * FROM job_postings WHERE id = ?", (job_id,)).fetchone()
+        research = conn.execute("SELECT * FROM company_research WHERE job_id = ? ORDER BY id", (job_id,)).fetchall()
+        events = conn.execute("SELECT * FROM application_events WHERE job_id = ? ORDER BY id DESC", (job_id,)).fetchall()
+    if not job:
+        return redirect("/jobs")
+    return templates.TemplateResponse(
+        request,
+        "job_detail.html",
+        {
+            "job": parse_json_fields({key: job[key] for key in job.keys()}),
+            "research": [{key: row[key] for key in row.keys()} for row in research],
+            "events": [{key: row[key] for key in row.keys()} for row in events],
+        },
+    )
+
+
+@app.post("/jobs/{job_id}/status")
+async def update_job_status(job_id: int, request: Request) -> RedirectResponse:
+    form = await request.form()
+    now = utc_now()
+    status = str(form.get("status") or "待确认")
+    note = str(form.get("note") or "").strip()
+    skip_reason = str(form.get("skip_reason") or "").strip()
+    with connect() as conn:
+        conn.execute(
+            "UPDATE job_postings SET status = ?, skip_reason = ?, updated_at = ? WHERE id = ?",
+            (status, skip_reason, now, job_id),
+        )
+        if note:
+            conn.execute(
+                "INSERT INTO application_events (job_id, event_type, content, created_at) VALUES (?, ?, ?, ?)",
+                (job_id, "状态更新", note, now),
+            )
+    return redirect(f"/jobs/{job_id}")
+
+
+@app.get("/interviews")
+def interviews_page(request: Request) -> Any:
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT i.*, j.title AS job_title, j.company AS company
+            FROM interview_preparations i
+            LEFT JOIN job_postings j ON j.id = i.job_id
+            ORDER BY i.created_at DESC
+            """
+        ).fetchall()
+        jobs = conn.execute("SELECT id, title, company FROM job_postings ORDER BY created_at DESC").fetchall()
+    return templates.TemplateResponse(
+        request,
+        "interviews.html",
+        {
+            "interviews": [{key: row[key] for key in row.keys()} for row in rows],
+            "jobs": [{key: row[key] for key in row.keys()} for row in jobs],
+        },
+    )
+
+
+@app.post("/interviews")
+async def create_interview_review(request: Request) -> RedirectResponse:
+    form = await request.form()
+    job_id_raw = str(form.get("job_id") or "")
+    job_id = int(job_id_raw) if job_id_raw.isdigit() else None
+    source_text = str(form.get("source_text") or "")
+    job: dict[str, Any] | None = None
+    if job_id:
+        with connect() as conn:
+            row = conn.execute("SELECT * FROM job_postings WHERE id = ?", (job_id,)).fetchone()
+            if row:
+                job = parse_json_fields({key: row[key] for key in row.keys()})
+
+    review = build_interview_review(job, source_text)
+    client = client_for_task("interview_review")
+    if client and client.configured and source_text:
+        try:
+            llm_markdown = client.complete_text(
+                [
+                    {"role": "system", "content": "请生成中文面试复盘 Markdown，聚焦没答好问题、补强建议和下一轮模拟题。"},
+                    {"role": "user", "content": dumps({"job": job or {}, "transcript": source_text[:12000]})},
+                ]
+            )
+            if llm_markdown.strip():
+                review["markdown"] = llm_markdown.strip()
+        except Exception as exc:
+            client.log_error(str(exc))
+
+    now = utc_now()
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO interview_preparations (
+                job_id, source_text, prep_plan_json, question_bank_json,
+                review_markdown, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (job_id, source_text, dumps(review["plan"]), dumps(review["questions"]), review["markdown"], now, now),
+        )
+        review_id = cursor.lastrowid
+    return redirect(f"/interviews/{review_id}")
+
+
+@app.get("/interviews/{review_id}")
+def interview_detail(review_id: int, request: Request) -> Any:
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT i.*, j.title AS job_title, j.company AS company
+            FROM interview_preparations i
+            LEFT JOIN job_postings j ON j.id = i.job_id
+            WHERE i.id = ?
+            """,
+            (review_id,),
+        ).fetchone()
+    if not row:
+        return redirect("/interviews")
+    review = {key: row[key] for key in row.keys()}
+    review["plan"] = loads(review.get("prep_plan_json"), {})
+    review["questions"] = loads(review.get("question_bank_json"), [])
+    return templates.TemplateResponse(request, "interview_detail.html", {"review": review})
+
+
+@app.get("/interviews/{review_id}/download")
+def download_interview_review(review_id: int) -> Response:
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT i.review_markdown, COALESCE(j.title, 'interview-review') AS title
+            FROM interview_preparations i
+            LEFT JOIN job_postings j ON j.id = i.job_id
+            WHERE i.id = ?
+            """,
+            (review_id,),
+        ).fetchone()
+    if not row:
+        return Response("Not found", status_code=404)
+    filename = safe_filename(row["title"] or "interview-review") + ".md"
+    return Response(
+        row["review_markdown"] or "",
+        media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+def safe_filename(value: str) -> str:
+    keep = []
+    for char in value:
+        if char.isalnum() or char in {"-", "_"}:
+            keep.append(char)
+        elif char.isspace():
+            keep.append("-")
+    return "".join(keep).strip("-")[:80] or "interview-review"
+
+
+@app.get("/settings")
+def settings_page(request: Request) -> Any:
+    with connect() as conn:
+        profiles = conn.execute("SELECT * FROM model_profiles ORDER BY is_default DESC, id").fetchall()
+        routes = conn.execute(
+            """
+            SELECT r.*, p.name AS profile_name
+            FROM model_routes r
+            LEFT JOIN model_profiles p ON p.id = r.profile_id
+            ORDER BY r.id
+            """
+        ).fetchall()
+        logs = conn.execute("SELECT * FROM model_call_logs ORDER BY created_at DESC LIMIT 20").fetchall()
+    env_path = ROOT_DIR / ".env"
+    return templates.TemplateResponse(
+        request,
+        "settings.html",
+        {
+            "profiles": [{key: row[key] for key in row.keys()} for row in profiles],
+            "routes": [{key: row[key] for key in row.keys()} for row in routes],
+            "logs": [{key: row[key] for key in row.keys()} for row in logs],
+            "task_label": task_label,
+            "token_stats": token_stats(),
+            "env_exists": env_path.exists(),
+            "env_example": (ROOT_DIR / ".env.example").read_text(encoding="utf-8"),
+            "blacklist_companies": "\n".join(get_setting("blacklist_companies", []) or []),
+            "blacklist_keywords": "\n".join(get_setting("blacklist_keywords", []) or []),
+        },
+    )
+
+
+@app.post("/settings/model-profiles")
+async def upsert_model_profile(request: Request) -> RedirectResponse:
+    form = await request.form()
+    profile_id = str(form.get("profile_id") or "")
+    values = (
+        str(form.get("name") or "未命名配置"),
+        str(form.get("base_url") or ""),
+        str(form.get("api_key_env") or "OPENAI_COMPATIBLE_API_KEY"),
+        str(form.get("model") or ""),
+        float(form.get("temperature") or 0.2),
+        float(form.get("input_cost_per_million") or 0),
+        float(form.get("output_cost_per_million") or 0),
+        1 if form.get("is_default") == "on" else 0,
+        utc_now(),
+    )
+    with connect() as conn:
+        if values[7]:
+            conn.execute("UPDATE model_profiles SET is_default = 0")
+        if profile_id.isdigit():
+            conn.execute(
+                """
+                UPDATE model_profiles
+                SET name = ?, base_url = ?, api_key_env = ?, model = ?, temperature = ?,
+                    input_cost_per_million = ?, output_cost_per_million = ?,
+                    is_default = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (*values, int(profile_id)),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO model_profiles (
+                    name, base_url, api_key_env, model, temperature,
+                    input_cost_per_million, output_cost_per_million, is_default,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (*values, values[-1]),
+            )
+    return redirect("/settings")
+
+
+@app.post("/settings/blacklists")
+async def update_blacklists(request: Request) -> RedirectResponse:
+    form = await request.form()
+    companies = [item.strip() for item in str(form.get("blacklist_companies") or "").splitlines() if item.strip()]
+    keywords = [item.strip() for item in str(form.get("blacklist_keywords") or "").splitlines() if item.strip()]
+    set_setting("blacklist_companies", companies)
+    set_setting("blacklist_keywords", keywords)
+    return redirect("/settings")
+
+
+@app.post("/settings/routes")
+async def update_routes(request: Request) -> RedirectResponse:
+    form = await request.form()
+    now = utc_now()
+    with connect() as conn:
+        for task_type, _label in TASK_TYPES:
+            raw = str(form.get(task_type) or "")
+            profile_id = int(raw) if raw.isdigit() else None
+            conn.execute(
+                "UPDATE model_routes SET profile_id = ?, updated_at = ? WHERE task_type = ?",
+                (profile_id, now, task_type),
+            )
+    return redirect("/settings")

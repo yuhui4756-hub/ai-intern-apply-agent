@@ -1,0 +1,47 @@
+{% extends "layout.html" %}
+{% block title %}面试复盘 - 简历投递 Agent{% endblock %}
+{% block content %}
+<section class="page-head">
+  <div>
+    <h1>{{ review.job_title or "面试复盘" }}</h1>
+    <p>{{ review.company or "未关联公司" }} · {{ review.created_at }}</p>
+  </div>
+  <a class="button" href="/interviews/{{ review.id }}/download">下载 Markdown</a>
+</section>
+
+<section class="grid-two">
+  <div class="panel">
+    <h2>3 天冲刺</h2>
+    <ul>
+      {% for item in review.plan.get("three_day_plan", []) %}
+      <li>{{ item }}</li>
+      {% endfor %}
+    </ul>
+  </div>
+  <div class="panel">
+    <h2>7 天准备</h2>
+    <ul>
+      {% for item in review.plan.get("seven_day_plan", []) %}
+      <li>{{ item }}</li>
+      {% endfor %}
+    </ul>
+  </div>
+</section>
+
+<section class="panel">
+  <h2>重点问题</h2>
+  <ul>
+    {% for question in review.questions %}
+    <li>{{ question }}</li>
+    {% endfor %}
+  </ul>
+</section>
+
+<section class="panel">
+  <div class="panel-title">
+    <h2>复盘 Markdown</h2>
+    <button class="button copy-button" type="button" data-copy-target="review-markdown">复制</button>
+  </div>
+  <textarea id="review-markdown" class="copy-area" rows="18">{{ review.review_markdown }}</textarea>
+</section>
+{% endblock %}

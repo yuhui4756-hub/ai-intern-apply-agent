@@ -1,0 +1,142 @@
+{% extends "layout.html" %}
+{% block title %}设置 - 简历投递 Agent{% endblock %}
+{% block content %}
+<section class="page-head">
+  <div>
+    <h1>设置</h1>
+    <p>配置模型档案、任务路由和 token 消耗统计。真实 API Key 建议放在本地 .env。</p>
+  </div>
+</section>
+
+<section class="metrics">
+  <div class="metric"><span>.env</span><strong>{{ "已存在" if env_exists else "未创建" }}</strong></div>
+  <div class="metric"><span>今日 token</span><strong>{{ token_stats.today_total }}</strong></div>
+  <div class="metric"><span>累计 token</span><strong>{{ token_stats.all_total }}</strong></div>
+  <div class="metric"><span>预计费用</span><strong>{{ "%.4f"|format(token_stats.all_cost) }}</strong></div>
+</section>
+
+<section class="panel">
+  <h2>.env 模板</h2>
+  <p class="muted">将下面内容复制到项目根目录的 <code>.env</code>，填入自己的服务地址、模型和 Key。真实 Key 不要提交。</p>
+  <pre class="pre">{{ env_example }}</pre>
+</section>
+
+<section class="panel">
+  <h2>模型配置档</h2>
+  <div class="cards">
+    {% for profile in profiles %}
+    <form method="post" action="/settings/model-profiles" class="card form-stack">
+      <input type="hidden" name="profile_id" value="{{ profile.id }}">
+      <div class="card-head">
+        <strong>{{ profile.name }}</strong>
+        {% if profile.is_default %}<span class="badge">默认</span>{% endif %}
+      </div>
+      <label>名称
+        <input name="name" value="{{ profile.name }}">
+      </label>
+      <label>Base URL
+        <input name="base_url" value="{{ profile.base_url }}" placeholder="https://api.example.com/v1">
+      </label>
+      <label>API Key 环境变量名
+        <input name="api_key_env" value="{{ profile.api_key_env }}">
+      </label>
+      <label>模型
+        <input name="model" value="{{ profile.model }}">
+      </label>
+      <label>Temperature
+        <input name="temperature" type="number" step="0.1" min="0" max="2" value="{{ profile.temperature }}">
+      </label>
+      <label>输入价格 / 百万 token
+        <input name="input_cost_per_million" type="number" step="0.0001" value="{{ profile.input_cost_per_million }}">
+      </label>
+      <label>输出价格 / 百万 token
+        <input name="output_cost_per_million" type="number" step="0.0001" value="{{ profile.output_cost_per_million }}">
+      </label>
+      <label class="check"><input name="is_default" type="checkbox" {% if profile.is_default %}checked{% endif %}> 设为默认</label>
+      <button class="button" type="submit">保存配置档</button>
+    </form>
+    {% endfor %}
+  </div>
+</section>
+
+<section class="panel">
+  <h2>新增模型配置档</h2>
+  <form method="post" action="/settings/model-profiles" class="form-grid">
+    <label>名称<input name="name" placeholder="低成本模型"></label>
+    <label>Base URL<input name="base_url" placeholder="https://api.example.com/v1"></label>
+    <label>API Key 环境变量名<input name="api_key_env" value="OPENAI_COMPATIBLE_API_KEY"></label>
+    <label>模型<input name="model" placeholder="model-name"></label>
+    <label>Temperature<input name="temperature" type="number" step="0.1" min="0" max="2" value="0.2"></label>
+    <label>输入价格 / 百万 token<input name="input_cost_per_million" type="number" step="0.0001" value="0"></label>
+    <label>输出价格 / 百万 token<input name="output_cost_per_million" type="number" step="0.0001" value="0"></label>
+    <label class="check"><input name="is_default" type="checkbox"> 设为默认</label>
+    <div class="form-actions"><button class="button primary" type="submit">新增</button></div>
+  </form>
+</section>
+
+<section class="panel">
+  <h2>任务模型路由</h2>
+  <form method="post" action="/settings/routes" class="form-stack">
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>任务</th><th>模型配置档</th></tr></thead>
+        <tbody>
+          {% for route in routes %}
+          <tr>
+            <td>{{ task_label(route.task_type) }}</td>
+            <td>
+              <select name="{{ route.task_type }}">
+                <option value="">不使用模型</option>
+                {% for profile in profiles %}
+                <option value="{{ profile.id }}" {% if profile.id == route.profile_id %}selected{% endif %}>{{ profile.name }}</option>
+                {% endfor %}
+              </select>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <button class="button primary" type="submit">保存路由</button>
+  </form>
+</section>
+
+<section class="panel">
+  <h2>黑名单</h2>
+  <form method="post" action="/settings/blacklists" class="form-grid">
+    <label>黑名单公司，每行一个
+      <textarea name="blacklist_companies" rows="8" placeholder="公司名">{{ blacklist_companies }}</textarea>
+    </label>
+    <label>高风险关键词，每行一个
+      <textarea name="blacklist_keywords" rows="8">{{ blacklist_keywords }}</textarea>
+    </label>
+    <div class="form-actions">
+      <button class="button primary" type="submit">保存黑名单</button>
+    </div>
+  </form>
+</section>
+
+<section class="panel">
+  <h2>最近模型调用</h2>
+  {% if logs %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>时间</th><th>任务</th><th>模型</th><th>token</th><th>状态</th></tr></thead>
+      <tbody>
+        {% for log in logs %}
+        <tr>
+          <td>{{ log.created_at }}</td>
+          <td>{{ task_label(log.task_type) }}</td>
+          <td>{{ log.model_profile }} / {{ log.model_name }}</td>
+          <td>{{ log.total_tokens }}</td>
+          <td>{{ log.status }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+    <p class="empty">还没有模型调用记录。</p>
+  {% endif %}
+</section>
+{% endblock %}

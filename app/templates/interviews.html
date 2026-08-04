@@ -1,0 +1,50 @@
+{% extends "layout.html" %}
+{% block title %}面试准备 - 简历投递 Agent{% endblock %}
+{% block content %}
+<section class="page-head">
+  <div>
+    <h1>面试准备</h1>
+    <p>粘贴面试邀请、面试记录或转写文本，生成复习计划和复盘材料。</p>
+  </div>
+</section>
+
+<section class="panel">
+  <h2>新建面试复盘 / 准备</h2>
+  <form method="post" action="/interviews" class="form-stack">
+    <label>关联岗位
+      <select name="job_id">
+        <option value="">不关联岗位</option>
+        {% for job in jobs %}
+        <option value="{{ job.id }}">{{ job.company or "未知公司" }} - {{ job.title or "未命名岗位" }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>面试邀请、面试记录或转写文本
+      <textarea name="source_text" rows="12" placeholder="可以粘贴面试邀请、上一轮没答好的问题，或者录音转写文本"></textarea>
+    </label>
+    <button class="button primary" type="submit">生成准备 / 复盘</button>
+  </form>
+</section>
+
+<section class="panel">
+  <h2>历史记录</h2>
+  {% if interviews %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>岗位</th><th>公司</th><th>创建时间</th></tr></thead>
+      <tbody>
+        {% for item in interviews %}
+        <tr>
+          <td><a href="/interviews/{{ item.id }}">{{ item.job_title or "未关联岗位" }}</a></td>
+          <td>{{ item.company or "-" }}</td>
+          <td>{{ item.created_at }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+    <p class="empty">还没有面试准备记录。</p>
+  {% endif %}
+</section>
+{% endblock %}

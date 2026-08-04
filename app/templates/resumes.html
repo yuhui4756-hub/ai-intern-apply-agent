@@ -1,0 +1,64 @@
+{% extends "layout.html" %}
+{% block title %}候选人画像 - 简历投递 Agent{% endblock %}
+{% block content %}
+<section class="page-head">
+  <div>
+    <h1>候选人画像</h1>
+    <p>这里维护可用于岗位匹配和面试准备的公开信息、技能标签和简历版本。</p>
+  </div>
+</section>
+
+<section class="panel">
+  <h2>基础画像</h2>
+  <form method="post" action="/resumes/profile" class="form-grid">
+    <label>姓名
+      <input name="name" value="{{ profile.name or '' }}" placeholder="可暂时留空">
+    </label>
+    <label>教育经历
+      <input name="education" value="{{ profile.education or '' }}">
+    </label>
+    <label>GitHub
+      <input name="github_url" value="{{ profile.github_url or '' }}">
+    </label>
+    <label>项目演示 / 作品链接
+      <input name="demo_url" value="{{ profile.demo_url or '' }}">
+    </label>
+    <label>目标岗位，每行一个
+      <textarea name="target_roles" rows="4">{{ (loads(profile.target_roles, []) if profile else []) | join('\n') }}</textarea>
+    </label>
+    <label>技能标签，每行一个
+      <textarea name="skills" rows="8">{{ (loads(profile.skills_json, []) if profile else []) | join('\n') }}</textarea>
+    </label>
+    <div class="form-actions">
+      <button class="button primary" type="submit">保存画像</button>
+    </div>
+  </form>
+</section>
+
+<section class="panel">
+  <h2>简历版本</h2>
+  <div class="cards">
+    {% for resume in resumes %}
+    <form method="post" action="/resumes/{{ resume.id }}" class="card form-stack">
+      <div class="card-head">
+        <strong>{{ resume.name }}</strong>
+        {% if resume.is_default %}<span class="badge">默认</span>{% endif %}
+      </div>
+      <label>版本名称
+        <input name="name" value="{{ resume.name }}">
+      </label>
+      <label>目标方向
+        <input name="target_role" value="{{ resume.target_role }}">
+      </label>
+      <label>本地文件路径
+        <input name="file_path" value="{{ resume.file_path }}" placeholder="例如 D:\path\resume.docx">
+      </label>
+      <label>解析文本
+        <textarea name="parsed_text" rows="8" placeholder="可以自动从 docx 解析，也可以手动粘贴">{{ resume.parsed_text }}</textarea>
+      </label>
+      <button class="button" type="submit">保存版本</button>
+    </form>
+    {% endfor %}
+  </div>
+</section>
+{% endblock %}

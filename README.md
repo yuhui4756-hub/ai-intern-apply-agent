@@ -14,6 +14,35 @@
 
 需求规格见 [docs/requirements.md](docs/requirements.md)。
 
+## Quick Start
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python -m pip install -r requirements.txt
+Copy-Item .env.example .env
+.\.venv\Scripts\python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+然后打开 <http://127.0.0.1:8000>。
+
+真实 API Key 只填在本地 `.env` 或系统环境变量中，不要提交。
+
+## V0.1 Includes
+
+- 本地 SQLite 数据库。
+- 候选人画像和多份简历版本管理。
+- JD 粘贴分析、匹配评分、风险判断和一键复制话术。
+- 岗位状态、跳过原因和公司搜索证据记录。
+- 面试准备、转写文本复盘和 Markdown 导出。
+- OpenAI-compatible 模型配置档、任务路由和 token 统计。
+
+## Checks
+
+```powershell
+.\.venv\Scripts\python -m pytest -q
+.\.venv\Scripts\python -m compileall app tests
+```
+
 ## License
 
 MIT
