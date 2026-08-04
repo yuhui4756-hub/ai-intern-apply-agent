@@ -13,3 +13,7 @@
 - 在收到面试邀请后生成准备计划、题库和复盘材料。
 
 需求规格见 [docs/requirements.md](docs/requirements.md)。
+
+## License
+
+MIT
