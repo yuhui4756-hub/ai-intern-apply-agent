@@ -4,7 +4,7 @@
 <section class="page-head">
   <div>
     <h1>设置</h1>
-    <p>配置模型档案、任务路由和 token 消耗统计。真实 API Key 建议放在本地 .env。</p>
+    <p>配置模型档案、任务路由和 token 消耗统计。API Key 保存到本地 .env，页面只显示打码状态。</p>
   </div>
 </section>
 
@@ -17,7 +17,7 @@
 
 <section class="panel">
   <h2>.env 模板</h2>
-  <p class="muted">将下面内容复制到项目根目录的 <code>.env</code>，填入自己的服务地址、模型和 Key。真实 Key 不要提交。</p>
+  <p class="muted">可以在下面的模型配置档里直接填写 API Key；应用会写入本地 <code>.env</code> 并立即生效。这个模板只作为手动配置参考。</p>
   <pre class="pre">{{ env_example }}</pre>
 </section>
 
@@ -39,6 +39,9 @@
       </label>
       <label>API Key 环境变量名
         <input name="api_key_env" value="{{ profile.api_key_env }}">
+      </label>
+      <label>API Key
+        <input name="api_key" type="password" placeholder="{{ '已设置：' ~ profile.api_key_mask if profile.api_key_mask else '未设置，填写后保存到本地 .env' }}">
       </label>
       <label>模型
         <input name="model" value="{{ profile.model }}">
@@ -65,6 +68,7 @@
     <label>名称<input name="name" placeholder="低成本模型"></label>
     <label>Base URL<input name="base_url" placeholder="https://api.example.com/v1"></label>
     <label>API Key 环境变量名<input name="api_key_env" value="OPENAI_COMPATIBLE_API_KEY"></label>
+    <label>API Key<input name="api_key" type="password" placeholder="保存到本地 .env，页面不回显明文"></label>
     <label>模型<input name="model" placeholder="model-name"></label>
     <label>Temperature<input name="temperature" type="number" step="0.1" min="0" max="2" value="0.2"></label>
     <label>输入价格 / 百万 token<input name="input_cost_per_million" type="number" step="0.0001" value="0"></label>

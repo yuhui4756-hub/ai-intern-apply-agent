@@ -25,7 +25,7 @@ Copy-Item .env.example .env
 
 然后打开 <http://127.0.0.1:8000>。
 
-真实 API Key 只填在本地 `.env` 或系统环境变量中，不要提交。
+API Key 可以在设置页直接填写；应用会保存到本地 `.env` 并立即生效，页面只显示打码状态。真实 `.env` 不要提交。
 
 ## V0.1 Includes
 

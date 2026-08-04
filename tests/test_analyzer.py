@@ -1,4 +1,4 @@
-from app.services.analyzer import rule_extract_jd, score_job
+from app.services.analyzer import clean_extracted, rule_extract_jd, score_job
 
 
 def test_high_match_rag_agent_job_is_recommended():
@@ -31,3 +31,34 @@ def test_high_risk_keyword_is_skipped():
     assert scoring["recommendation"] == "跳过"
     assert scoring["risk_level"] == "高"
     assert "培训费" in scoring["skip_reason"]
+
+
+def test_extract_company_from_jd_text():
+    jd = """
+    公司名称：杭州测试智能科技有限公司
+    岗位：AI 应用开发实习生
+    要求 Python、RAG、FastAPI。
+    """
+
+    extracted = rule_extract_jd(jd)
+
+    assert extracted["company"] == "杭州测试智能科技有限公司"
+
+
+def test_clean_unknown_placeholders():
+    cleaned = clean_extracted(
+        {
+            "title": "?",
+            "company": "未知",
+            "city": "N/A",
+            "salary_text": "200-300元/天",
+            "required_skills": ["Python", "？", "RAG"],
+            "risk_signals": ["暂无"],
+        }
+    )
+
+    assert cleaned["title"] == ""
+    assert cleaned["company"] == ""
+    assert cleaned["city"] == ""
+    assert cleaned["required_skills"] == ["Python", "RAG"]
+    assert cleaned["risk_signals"] == []

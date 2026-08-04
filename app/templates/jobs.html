@@ -27,8 +27,8 @@
       <tbody>
         {% for job in jobs %}
         <tr>
-          <td><a href="/jobs/{{ job.id }}">{{ job.title or "未命名岗位" }}</a></td>
-          <td>{{ job.company or "-" }}</td>
+          <td><a href="/jobs/{{ job.id }}">{{ (job.company ~ " - " if job.company else "") ~ (job.title or "岗位待补充") }}</a></td>
+          <td>{{ job.company or "公司待补充" }}</td>
           <td>{{ job.city or "-" }}</td>
           <td><span class="badge">{{ job.match_level or "-" }} {{ job.match_score }}</span></td>
           <td>{{ job.risk_level or "-" }}</td>

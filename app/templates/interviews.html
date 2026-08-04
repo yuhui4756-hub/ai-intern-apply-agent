@@ -15,7 +15,7 @@
       <select name="job_id">
         <option value="">不关联岗位</option>
         {% for job in jobs %}
-        <option value="{{ job.id }}">{{ job.company or "未知公司" }} - {{ job.title or "未命名岗位" }}</option>
+        <option value="{{ job.id }}">{{ job.company or "公司待补充" }} - {{ job.title or "岗位待补充" }}</option>
         {% endfor %}
       </select>
     </label>

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -8,10 +9,11 @@ from fastapi.responses import RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from .config import ROOT_DIR, TASK_TYPES
+from .config import ROOT_DIR, TASK_TYPES, looks_masked, mask_secret, set_env_value
 from .db import connect, dumps, get_setting, init_db, loads, set_setting, utc_now
 from .services.analyzer import (
     build_interview_review,
+    clean_extracted,
     generate_message,
     rule_extract_jd,
     score_job,
@@ -298,7 +300,7 @@ async def analyze_job(request: Request) -> RedirectResponse:
         fallback_salary=str(form.get("salary_text") or ""),
     )
     llm_extract, analysis_error = try_llm_jd_extract(jd_text)
-    extracted = {**fallback_extract, **(llm_extract or {})}
+    extracted = clean_extracted({**fallback_extract, **(llm_extract or {})})
     extracted["required_skills"] = list(dict.fromkeys((llm_extract or {}).get("required_skills") or fallback_extract["required_skills"]))
     extracted["risk_signals"] = list(dict.fromkeys((llm_extract or {}).get("risk_signals") or fallback_extract["risk_signals"]))
     extracted["caution_signals"] = list(dict.fromkeys((llm_extract or {}).get("caution_signals") or fallback_extract["caution_signals"]))
@@ -536,7 +538,7 @@ def safe_filename(value: str) -> str:
 @app.get("/settings")
 def settings_page(request: Request) -> Any:
     with connect() as conn:
-        profiles = conn.execute("SELECT * FROM model_profiles ORDER BY is_default DESC, id").fetchall()
+        profile_rows = conn.execute("SELECT * FROM model_profiles ORDER BY is_default DESC, id").fetchall()
         routes = conn.execute(
             """
             SELECT r.*, p.name AS profile_name
@@ -546,12 +548,18 @@ def settings_page(request: Request) -> Any:
             """
         ).fetchall()
         logs = conn.execute("SELECT * FROM model_call_logs ORDER BY created_at DESC LIMIT 20").fetchall()
+    profiles = []
+    for row in profile_rows:
+        profile = {key: row[key] for key in row.keys()}
+        key_name = profile.get("api_key_env") or "OPENAI_COMPATIBLE_API_KEY"
+        profile["api_key_mask"] = mask_secret(os.environ.get(key_name, ""))
+        profiles.append(profile)
     env_path = ROOT_DIR / ".env"
     return templates.TemplateResponse(
         request,
         "settings.html",
         {
-            "profiles": [{key: row[key] for key in row.keys()} for row in profiles],
+            "profiles": profiles,
             "routes": [{key: row[key] for key in row.keys()} for row in routes],
             "logs": [{key: row[key] for key in row.keys()} for row in logs],
             "task_label": task_label,
@@ -568,10 +576,15 @@ def settings_page(request: Request) -> Any:
 async def upsert_model_profile(request: Request) -> RedirectResponse:
     form = await request.form()
     profile_id = str(form.get("profile_id") or "")
+    api_key_env = str(form.get("api_key_env") or "OPENAI_COMPATIBLE_API_KEY").strip()
+    api_key_value = str(form.get("api_key") or "").strip()
+    if api_key_value and not looks_masked(api_key_value):
+        set_env_value(api_key_env, api_key_value)
+
     values = (
         str(form.get("name") or "未命名配置"),
         str(form.get("base_url") or ""),
-        str(form.get("api_key_env") or "OPENAI_COMPATIBLE_API_KEY"),
+        api_key_env,
         str(form.get("model") or ""),
         float(form.get("temperature") or 0.2),
         float(form.get("input_cost_per_million") or 0),

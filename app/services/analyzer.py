@@ -78,6 +78,7 @@ GOOD_GROWTH_KEYWORDS = [
 ]
 
 CITIES = ["北京", "上海", "广州", "深圳", "杭州", "重庆", "成都", "南京", "苏州", "厦门", "武汉", "长沙"]
+UNKNOWN_VALUES = {"?", "？", "未知", "未填写", "未填", "无", "暂无", "N/A", "n/a", "None", "null"}
 
 
 def normalize(text: str) -> str:
@@ -115,6 +116,46 @@ def extract_salary(text: str) -> str:
     return ""
 
 
+def extract_company(text: str) -> str:
+    patterns = [
+        r"(?:公司名称|公司|企业|单位)[:：]\s*([^\n\r，,。；;]{2,40})",
+        r"([^\n\r，,。；;]{2,40})(?:招聘|直聘|校招)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            value = clean_value(match.group(1))
+            if value:
+                return value
+    return ""
+
+
+def clean_value(value: Any) -> str:
+    text = normalize(str(value or ""))
+    text = text.strip(" -:：,，。；;")
+    return "" if text in UNKNOWN_VALUES else text
+
+
+def clean_list(values: Any) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    cleaned = []
+    for value in values:
+        item = clean_value(value)
+        if item and item not in cleaned:
+            cleaned.append(item)
+    return cleaned
+
+
+def clean_extracted(extracted: dict[str, Any]) -> dict[str, Any]:
+    cleaned = dict(extracted)
+    for key in ["title", "company", "city", "salary_text", "internship_days", "internship_duration"]:
+        cleaned[key] = clean_value(cleaned.get(key))
+    for key in ["responsibilities", "requirements", "required_skills", "bonus_skills", "risk_signals", "caution_signals"]:
+        cleaned[key] = clean_list(cleaned.get(key))
+    return cleaned
+
+
 def salary_score(salary_text: str) -> int:
     if not salary_text:
         return 8
@@ -150,9 +191,9 @@ def rule_extract_jd(jd_text: str, fallback_title: str = "", fallback_company: st
     caution_signals = [keyword for keyword in CAUTION_KEYWORDS if keyword in text]
     city = fallback_city or extract_city(text)
     salary = fallback_salary or extract_salary(text)
-    return {
+    return clean_extracted({
         "title": fallback_title or guess_title(text),
-        "company": fallback_company,
+        "company": fallback_company or extract_company(text),
         "city": city,
         "salary_text": salary,
         "internship_days": "5 天" if re.search(r"每周\s*5|5\s*天", text) else "",
@@ -163,7 +204,7 @@ def rule_extract_jd(jd_text: str, fallback_title: str = "", fallback_company: st
         "bonus_skills": [skill for skill in skills if skill in ["LangChain", "LlamaIndex", "LangGraph", "Docker", "Elasticsearch"]],
         "risk_signals": risk_signals,
         "caution_signals": caution_signals,
-    }
+    })
 
 
 def split_section(text: str, markers: list[str]) -> list[str]:

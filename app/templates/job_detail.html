@@ -3,8 +3,8 @@
 {% block content %}
 <section class="page-head">
   <div>
-    <h1>{{ job.title or "未命名岗位" }}</h1>
-    <p>{{ job.company or "未知公司" }} · {{ job.city or "城市未填" }} · {{ job.salary_text or "薪资未填" }}</p>
+    <h1>{{ (job.company ~ " - " if job.company else "") ~ (job.title or "岗位待补充") }}</h1>
+    <p>{{ job.company or "公司待补充" }} · {{ job.city or "城市待补充" }} · {{ job.salary_text or "薪资待补充" }}</p>
   </div>
   <a class="button" href="/interviews">准备面试</a>
 </section>
