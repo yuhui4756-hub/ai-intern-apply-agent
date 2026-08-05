@@ -483,6 +483,47 @@ def test_extension_conversation_capture_creates_safe_draft(tmp_path, monkeypatch
     assert "主要工作内容" in draft["message"]
 
 
+def test_liepin_resume_button_does_not_trigger_manual_review():
+    from app.services.conversation import classify_conversation, compact_conversation_text
+
+    text = """
+    张女士 杭州聚泽工程项目管理有限...
+    成本助理实习生 统招本... 经验不限 2-3k
+    杭州聚泽工程项目管理有限...
+    不需要融资 杭州-余杭区
+    我们正在招成本助理实习生，您可以看下职位信息，有兴趣可以聊一聊
+    再考虑一下
+    发简历
+    18:32
+    我们为您生成了合适的打招呼语，去使用>
+    不支持此消息查看，请登录“猎聘APP”查看消息内容！
+    发简历
+    交换手机号
+    交换微信号
+    请输入文字，按Enter键发送
+    发送
+    """
+
+    clean = compact_conversation_text(text)
+    result = classify_conversation(text, {"title": "成本助理实习生"})
+
+    assert "发简历" not in clean
+    assert "交换手机号" not in clean
+    assert result["message_type"] == "岗位沟通"
+    assert result["action_required"] is False
+    assert result["draft_message"]
+
+
+def test_hr_resume_request_still_triggers_manual_review():
+    from app.services.conversation import classify_conversation
+
+    result = classify_conversation("HR：麻烦你发一下简历附件，我这边先看看。")
+
+    assert result["message_type"] == "需要我处理"
+    assert result["action_required"] is True
+    assert result["draft_message"] == ""
+
+
 def test_extension_conversation_capture_marks_interview_invite(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "conversation-interview.sqlite3"))
 

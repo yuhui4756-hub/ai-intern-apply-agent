@@ -7,16 +7,33 @@ from .job_fetcher import normalize_visible_text
 
 
 INTERVIEW_RE = re.compile(r"(面试|笔试|约.*时间|时间方便|视频面|电话面|腾讯会议|飞书会议|牛客|面一下)")
-SENSITIVE_RE = re.compile(r"(简历|附件|手机号|电话|微信|邮箱|身份证|银行卡|押金|培训费|贷款|offer|地址|到公司|线下)")
+RESUME_REQUEST_RE = re.compile(
+    r"((发|发送|投递|上传|提交|补充|提供|给|看下|看看).{0,12}(简历|附件))|"
+    r"((简历|附件).{0,12}(发|发送|投递|上传|提交|补充|提供|给|看下|看看))"
+)
+SENSITIVE_RE = re.compile(r"(手机号|电话|微信|邮箱|身份证|银行卡|押金|培训费|贷款|offer|地址|到公司|线下)")
 IRRELEVANT_RE = re.compile(r"(周末玩|游戏|恋爱|私事|无关)")
 JOB_INFO_RE = re.compile(r"(工作内容|技术栈|实习周期|到岗|每周|薪资|导师|转正|远程|base|地点|流程|要求|接受大二)")
+HIGH_RISK_RE = re.compile(r"(押金|培训费|贷款)")
+UI_NOISE_LINE_RE = re.compile(
+    r"^(发简历|交换手机号|交换微信号|再考虑一下|发送|去使用>?|"
+    r"请输入文字.*发送|我们为您生成了.*打招呼语.*|不支持此消息查看.*查看消息内容[!！]?)$"
+)
+TIMESTAMP_LINE_RE = re.compile(r"^\d{1,2}:\d{2}$")
 
 
 def compact_conversation_text(text: str, limit: int = 12000) -> str:
     normalized = normalize_visible_text(text or "")
+    lines = [line for line in normalized.splitlines() if not is_conversation_noise_line(line)]
+    normalized = "\n".join(lines).strip()
     if len(normalized) <= limit:
         return normalized
     return normalized[-limit:]
+
+
+def is_conversation_noise_line(line: str) -> bool:
+    clean = line.strip()
+    return not clean or bool(UI_NOISE_LINE_RE.search(clean) or TIMESTAMP_LINE_RE.search(clean))
 
 
 def classify_conversation(text: str, job: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -24,9 +41,9 @@ def classify_conversation(text: str, job: dict[str, Any] | None = None) -> dict[
     latest = latest_message_excerpt(clean)
     risk_flags: list[str] = []
 
-    if SENSITIVE_RE.search(clean):
+    if RESUME_REQUEST_RE.search(clean) or SENSITIVE_RE.search(clean):
         risk_flags.append("涉及简历、联系方式、面试时间、薪资谈判或敏感信息，需要用户确认")
-    if re.search(r"(押金|培训费|贷款)", clean):
+    if HIGH_RISK_RE.search(clean):
         risk_flags.append("命中高风险招聘信号")
 
     if INTERVIEW_RE.search(clean):
