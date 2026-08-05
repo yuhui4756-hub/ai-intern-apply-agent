@@ -4,7 +4,7 @@
 <section class="page-head">
   <div>
     <h1>岗位搜索</h1>
-    <p>用浏览器打开招聘平台搜索页，采集候选岗位链接，再逐条导入 JD 分析。</p>
+    <p>推荐先用 Edge 打开招聘平台，登录和筛选后再采集当前页面；采集到候选链接后，再逐条导入 JD 分析。</p>
   </div>
   <a class="button" href="/jobs">岗位列表</a>
 </section>
@@ -13,42 +13,9 @@
 <section class="notice {{ notice_type }}">{{ notice }}</section>
 {% endif %}
 
-<form method="post" action="/searches" class="panel form-stack">
-  <div class="panel-title">
-    <h2>自动采集</h2>
-    <span class="badge">浏览器自动化</span>
-  </div>
-  <div class="form-grid">
-    <label>平台
-      <select name="platform">
-        <option value="Boss 直聘">Boss 直聘</option>
-        <option value="实习僧">实习僧</option>
-        <option value="猎聘">猎聘</option>
-        <option value="智联招聘">智联招聘</option>
-        <option value="前程无忧">前程无忧</option>
-      </select>
-    </label>
-    <label>关键词
-      <input name="keyword" required placeholder="AI 应用开发实习 / Agent 开发实习 / Python RAG">
-    </label>
-    <label>城市
-      <input name="city" placeholder="杭州 / 深圳 / 成都">
-    </label>
-    <label>浏览器
-      <select name="browser_channel">
-        <option value="msedge">Microsoft Edge</option>
-        <option value="chromium">Chromium</option>
-      </select>
-    </label>
-  </div>
-  <div class="form-actions">
-    <button class="button primary" type="submit">打开浏览器并采集候选岗位</button>
-  </div>
-</form>
-
 <form method="post" class="panel form-stack">
   <div class="panel-title">
-    <h2>手动确认采集</h2>
+    <h2>推荐流程：手动确认采集</h2>
     <span class="badge">Edge 当前页面</span>
   </div>
   <div class="form-grid">
@@ -74,8 +41,41 @@
     </label>
   </div>
   <div class="form-actions">
-    <button class="button" type="submit" formaction="/searches/open-manual">打开 Edge 搜索页</button>
-    <button class="button primary" type="submit" formaction="/searches/capture-current">采集当前 Edge 页面</button>
+    <button class="button" type="submit" formaction="/searches/open-manual">1. 打开 Edge 搜索页</button>
+    <button class="button primary" type="submit" formaction="/searches/capture-current">2. 采集当前 Edge 页面</button>
+  </div>
+</form>
+
+<form method="post" action="/searches" class="panel form-stack">
+  <div class="panel-title">
+    <h2>自动采集</h2>
+    <span class="badge">高级 / 实验</span>
+  </div>
+  <div class="form-grid">
+    <label>平台
+      <select name="platform">
+        <option value="Boss 直聘">Boss 直聘</option>
+        <option value="实习僧">实习僧</option>
+        <option value="猎聘">猎聘</option>
+        <option value="智联招聘">智联招聘</option>
+        <option value="前程无忧">前程无忧</option>
+      </select>
+    </label>
+    <label>关键词
+      <input name="keyword" required placeholder="AI 应用开发实习 / Agent 开发实习 / Python RAG">
+    </label>
+    <label>城市
+      <input name="city" placeholder="杭州 / 深圳 / 成都">
+    </label>
+    <label>浏览器
+      <select name="browser_channel">
+        <option value="msedge">Microsoft Edge</option>
+        <option value="chromium">Chromium</option>
+      </select>
+    </label>
+  </div>
+  <div class="form-actions">
+    <button class="button" type="submit">打开浏览器并采集候选岗位</button>
   </div>
 </form>
 

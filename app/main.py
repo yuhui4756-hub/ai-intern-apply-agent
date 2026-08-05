@@ -439,6 +439,29 @@ def save_search_result(result: Any) -> int:
     return int(run_id)
 
 
+def save_search_failure(platform: str, keyword: str, city: str, browser_channel: str, error_message: str) -> int:
+    now = utc_now()
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO job_search_runs (
+                platform, keyword, city, search_url, browser_channel, status, note, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                platform,
+                keyword,
+                city,
+                "",
+                browser_channel or "msedge",
+                "失败",
+                error_message[:500],
+                now,
+            ),
+        )
+    return int(cursor.lastrowid)
+
+
 @app.get("/")
 def dashboard(request: Request) -> Any:
     with connect() as conn:
@@ -624,7 +647,8 @@ async def create_search_run(request: Request) -> RedirectResponse:
     try:
         result = search_jobs_with_browser(platform, keyword, city, browser_channel=browser_channel)
     except Exception as exc:
-        return redirect_with_notice("/searches", f"搜索采集失败：{str(exc)[:160]}", "error")
+        run_id = save_search_failure(platform, keyword, city, browser_channel, f"自动采集失败：{str(exc)}")
+        return redirect_with_notice(f"/searches/{run_id}", f"搜索采集失败：{str(exc)[:160]}", "error")
 
     run_id = save_search_result(result)
     return redirect_with_notice(f"/searches/{run_id}", f"已采集 {len(result.candidates)} 个候选岗位。", "success")
@@ -641,7 +665,8 @@ async def open_manual_search(request: Request) -> RedirectResponse:
     try:
         search_url = open_manual_search_in_edge(platform, keyword, city)
     except Exception as exc:
-        return redirect_with_notice("/searches", f"打开 Edge 失败：{str(exc)[:160]}", "error")
+        run_id = save_search_failure(platform, keyword, city, "msedge", f"打开 Edge 失败：{str(exc)}")
+        return redirect_with_notice(f"/searches/{run_id}", f"打开 Edge 失败：{str(exc)[:160]}", "error")
     return redirect_with_notice("/searches", f"已打开 Edge 搜索页：{search_url}。完成登录或筛选后，点击“采集当前 Edge 页面”。", "success")
 
 
@@ -657,7 +682,8 @@ async def capture_current_search(request: Request) -> RedirectResponse:
     try:
         result = capture_current_search_page(platform, keyword, city, browser_channel=browser_channel)
     except Exception as exc:
-        return redirect_with_notice("/searches", f"当前页面采集失败：{str(exc)[:160]}", "error")
+        run_id = save_search_failure(platform, keyword, city, browser_channel, f"当前页面采集失败：{str(exc)}")
+        return redirect_with_notice(f"/searches/{run_id}", f"当前页面采集失败：{str(exc)[:160]}", "error")
     run_id = save_search_result(result)
     return redirect_with_notice(f"/searches/{run_id}", f"已从当前 Edge 页面采集 {len(result.candidates)} 个候选岗位。", "success")
 

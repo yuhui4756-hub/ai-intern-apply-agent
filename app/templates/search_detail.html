@@ -20,7 +20,9 @@
 <section class="panel">
   <div class="panel-title">
     <h2>候选岗位</h2>
+    {% if run.search_url %}
     <a href="{{ run.search_url }}" target="_blank" rel="noreferrer">打开搜索页</a>
+    {% endif %}
   </div>
   {% if candidates %}
   <div class="table-wrap">

@@ -262,6 +262,35 @@ def test_manual_edge_search_capture_flow(tmp_path, monkeypatch):
     assert count == 1
 
 
+def test_failed_auto_search_creates_failed_run(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "failed-search.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db
+
+    def fail_search(*_args, **_kwargs):
+        raise ValueError("Edge 未连接")
+
+    monkeypatch.setattr(main, "search_jobs_with_browser", fail_search)
+    init_db()
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/searches",
+        data={"platform": "Boss 直聘", "keyword": "AI Agent 实习", "city": "杭州", "browser_channel": "msedge"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert "/searches/" in response.headers["location"]
+    detail = client.get(response.headers["location"])
+    assert "Edge 未连接" in detail.text
+    with connect() as conn:
+        row = conn.execute("SELECT status, note FROM job_search_runs ORDER BY id DESC LIMIT 1").fetchone()
+    assert row["status"] == "失败"
+    assert "Edge 未连接" in row["note"]
+
+
 def test_model_profile_blank_api_key_env_uses_provider_suggestion(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "settings.sqlite3"))
 
