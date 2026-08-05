@@ -1,4 +1,4 @@
-from app.services.analyzer import clean_extracted, rule_extract_jd, score_job
+from app.services.analyzer import clean_extracted, extract_salary, looks_like_salary_text, rule_extract_jd, score_job
 
 
 def test_high_match_rag_agent_job_is_recommended():
@@ -62,3 +62,16 @@ def test_clean_unknown_placeholders():
     assert cleaned["city"] == ""
     assert cleaned["required_skills"] == ["Python", "RAG"]
     assert cleaned["risk_signals"] == []
+
+
+def test_extract_salary_handles_common_intern_formats():
+    assert extract_salary("实习薪资：150～250 元/天，每周 5 天") == "150～250元/天"
+    assert extract_salary("薪资 120-180/天，实习三个月") == "120-180/天"
+    assert extract_salary("月薪 2k-4k，13薪") == "2k-4k"
+    assert extract_salary("薪资：3-5K/月") == "3-5K/月"
+    assert extract_salary("补贴：100元/日") == "100元/日"
+
+
+def test_salary_guard_rejects_time_requirements():
+    assert not looks_like_salary_text("每周 5 天")
+    assert not looks_like_salary_text("3 个月以上")

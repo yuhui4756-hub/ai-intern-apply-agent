@@ -79,6 +79,8 @@ GOOD_GROWTH_KEYWORDS = [
 
 CITIES = ["北京", "上海", "广州", "深圳", "杭州", "重庆", "成都", "南京", "苏州", "厦门", "武汉", "长沙"]
 UNKNOWN_VALUES = {"?", "？", "未知", "未填写", "未填", "无", "暂无", "N/A", "n/a", "None", "null"}
+SALARY_NUMBER = r"\d+(?:\.\d+)?"
+SALARY_RANGE = r"(?:-|~|～|至|到|—|–|－)"
 
 
 def normalize(text: str) -> str:
@@ -103,17 +105,36 @@ def extract_city(text: str) -> str:
 
 def extract_salary(text: str) -> str:
     patterns = [
-        r"\d+\s*[-~]\s*\d+\s*元\s*/?\s*天",
-        r"\d+\s*[-~]\s*\d+\s*/\s*天",
-        r"\d+\s*元\s*/?\s*天",
-        r"\d+\s*[-~]\s*\d+\s*[kK]",
-        r"\d+\s*[kK]\s*[-~]\s*\d+\s*[kK]",
+        fr"{SALARY_NUMBER}\s*{SALARY_RANGE}\s*{SALARY_NUMBER}\s*元\s*/?\s*[天日]",
+        fr"{SALARY_NUMBER}\s*{SALARY_RANGE}\s*{SALARY_NUMBER}\s*/\s*[天日]",
+        fr"{SALARY_NUMBER}\s*元\s*/?\s*[天日]",
+        fr"{SALARY_NUMBER}\s*/\s*[天日]",
+        fr"{SALARY_NUMBER}\s*[kK]\s*{SALARY_RANGE}\s*{SALARY_NUMBER}\s*[kK]\s*(?:/[月年])?",
+        fr"{SALARY_NUMBER}\s*{SALARY_RANGE}\s*{SALARY_NUMBER}\s*[kK]\s*(?:/[月年])?",
+        fr"{SALARY_NUMBER}\s*千\s*{SALARY_RANGE}\s*{SALARY_NUMBER}\s*千\s*(?:/[月年])?",
+        fr"{SALARY_NUMBER}\s*{SALARY_RANGE}\s*{SALARY_NUMBER}\s*千\s*(?:/[月年])?",
+        r"(?:薪资|薪酬|工资|日薪|实习补贴|补贴)[:：]?\s*(?:面议|薪资面议)",
     ]
     for pattern in patterns:
         match = re.search(pattern, text)
         if match:
-            return match.group(0).replace(" ", "")
+            return clean_salary_text(match.group(0))
     return ""
+
+
+def clean_salary_text(value: str) -> str:
+    return re.sub(r"\s+", "", normalize(value)).strip(" -:：,，。；;")
+
+
+def looks_like_salary_text(value: str) -> bool:
+    text = clean_salary_text(value).lower()
+    if not text:
+        return False
+    if any(keyword in text for keyword in ["面议", "薪资待定", "薪酬待定"]):
+        return True
+    if not re.search(r"\d", text):
+        return False
+    return bool(re.search(r"[k千万元￥¥]", text) or "/天" in text or "/日" in text or "日薪" in text or "月薪" in text)
 
 
 def extract_company(text: str) -> str:

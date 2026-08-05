@@ -57,6 +57,7 @@ function collectPageData(captureType) {
       };
     })
     .filter((item) => item.href && !item.href.startsWith("javascript:"));
+  const cards = collectCandidateCards(clean);
 
   return {
     capture_type: captureType,
@@ -64,13 +65,49 @@ function collectPageData(captureType) {
     title: document.title || "",
     text: pageText,
     links,
+    cards,
     captured_at: new Date().toISOString(),
   };
 }
 
+function collectCandidateCards(clean) {
+  const selectors = [
+    "li",
+    "article",
+    "section",
+    "[class*='job']",
+    "[class*='position']",
+    "[class*='intern']",
+    "[class*='item']",
+    "[class*='card']",
+  ];
+  const seen = new Set();
+  return Array.from(document.querySelectorAll(selectors.join(",")))
+    .map((element) => {
+      const link = element.matches("a[href]") ? element : element.querySelector("a[href]");
+      const href = link ? link.href || "" : "";
+      const text = clean(element.innerText || element.textContent || "");
+      const title = clean(link ? link.innerText || link.textContent || link.title || "" : "");
+      return { href, title, text };
+    })
+    .filter((item) => {
+      if (!item.href || item.href.startsWith("javascript:") || item.text.length < 8) {
+        return false;
+      }
+      const key = `${item.href}::${item.text.slice(0, 80)}`;
+      if (seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    })
+    .slice(0, 500);
+}
+
 function renderSuccess(payload) {
   statusBadge.textContent = "已采集";
-  const label = payload.capture_type === "job" ? "岗位详情" : `搜索结果：${payload.candidate_count || 0} 个候选`;
+  const sourceText = payload.source_count ? `，读取 ${payload.source_count} 条当前页链接/卡片` : "";
+  const label = payload.capture_type === "job" ? "岗位详情" : `搜索结果：${payload.candidate_count || 0} 个候选${sourceText}`;
   const targetUrl = `${APP_BASE_URL}${payload.redirect_url}`;
   resultBox.className = "result";
   resultBox.innerHTML = `

@@ -169,12 +169,13 @@ def test_extension_capture_job_creates_analyzed_job(tmp_path, monkeypatch):
     assert payload["ok"] is True
     assert payload["redirect_url"].startswith("/jobs/")
     with connect() as conn:
-        row = conn.execute("SELECT platform, source_url, company, match_level FROM job_postings ORDER BY id DESC LIMIT 1").fetchone()
+        row = conn.execute("SELECT platform, source_url, company, match_level, generated_message FROM job_postings ORDER BY id DESC LIMIT 1").fetchone()
         event = conn.execute("SELECT event_type FROM application_events ORDER BY id DESC LIMIT 1").fetchone()
     assert row["platform"] == "Boss 直聘"
     assert row["source_url"] == "https://www.zhipin.com/job_detail/example.html"
     assert row["company"] == "深圳扩展智能科技有限公司"
     assert row["match_level"]
+    assert row["generated_message"] == ""
     assert event["event_type"] == "浏览器扩展采集"
 
 
@@ -223,6 +224,130 @@ def test_extension_capture_search_creates_candidates(tmp_path, monkeypatch):
     assert run["status"] == "完成"
     assert candidate["title"] == "AI 应用开发实习生"
     assert candidate["company"] == "深圳扩展智能科技有限公司"
+
+
+def test_extension_capture_search_uses_current_page_cards(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "extension-search-cards.sqlite3"))
+
+    from app import main  # noqa: F401
+    from app.db import connect, init_db
+
+    init_db()
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "search",
+            "url": "https://www.shixiseng.com/interns?keyword=Agent",
+            "title": "Agent 实习",
+            "text": "页面上的可见搜索结果",
+            "links": [],
+            "cards": [
+                {
+                    "href": "https://www.shixiseng.com/intern/inn_agent_1",
+                    "title": "大模型 Agent 开发实习生",
+                    "text": "大模型 Agent 开发实习生\n广州卡片智能科技有限公司\n150～250元/天\nPython FastAPI RAG",
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["candidate_count"] == 1
+    assert payload["source_count"] == 1
+    with connect() as conn:
+        candidate = conn.execute("SELECT title, company, summary FROM job_candidates ORDER BY id DESC LIMIT 1").fetchone()
+    assert candidate["title"] == "大模型 Agent 开发实习生"
+    assert candidate["company"] == "广州卡片智能科技有限公司"
+    assert "150～250元/天" in candidate["summary"]
+
+
+def test_extension_candidate_import_falls_back_to_search_summary(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "extension-candidate-fallback.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db
+
+    monkeypatch.setattr(main, "search_company", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        main,
+        "fetch_job_from_url",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("浏览器类型无效")),
+    )
+    init_db()
+    client = TestClient(main.app)
+
+    capture = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "search",
+            "url": "https://www.zhipin.com/web/geek/job?query=AI",
+            "title": "AI 招聘",
+            "text": "AI 应用开发实习生",
+            "cards": [
+                {
+                    "href": "https://www.zhipin.com/job_detail/fallback-1.html",
+                    "title": "AI 应用开发实习生",
+                    "text": "AI 应用开发实习生\n深圳摘要智能科技有限公司\n200-300元/天\nPython FastAPI RAG",
+                }
+            ],
+        },
+    )
+    assert capture.status_code == 200
+    with connect() as conn:
+        candidate_id = conn.execute("SELECT id FROM job_candidates ORDER BY id DESC LIMIT 1").fetchone()["id"]
+
+    imported = client.post(
+        f"/candidates/{candidate_id}/import",
+        data={"selected_resume_id": "1", "fetch_mode": "auto", "browser_channel": "extension"},
+        follow_redirects=False,
+    )
+
+    assert imported.status_code == 303
+    detail = client.get(imported.headers["location"])
+    assert "深圳摘要智能科技有限公司" in detail.text
+    assert "200-300元/天" in detail.text
+    assert "详情页抓取失败" in detail.text
+    with connect() as conn:
+        candidate = conn.execute("SELECT status, error_message FROM job_candidates WHERE id = ?", (candidate_id,)).fetchone()
+        job = conn.execute("SELECT salary_text, generated_message FROM job_postings ORDER BY id DESC LIMIT 1").fetchone()
+    assert candidate["status"] == "已导入"
+    assert "搜索结果摘要" in candidate["error_message"]
+    assert job["salary_text"] == "200-300元/天"
+    assert job["generated_message"] == ""
+
+
+def test_analysis_prefers_rule_salary_over_bad_llm_salary(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "salary-guard.sqlite3"))
+
+    from app import main
+    from app.db import init_db
+
+    init_db()
+    monkeypatch.setattr(
+        main,
+        "try_llm_jd_extract",
+        lambda _text: (
+            {
+                "title": "AI 应用开发实习生",
+                "company": "杭州薪资智能科技有限公司",
+                "salary_text": "每周 5 天",
+                "required_skills": ["Python", "RAG"],
+            },
+            "",
+        ),
+    )
+    result = main.analyze_job_payload(
+        "公司名称：杭州薪资智能科技有限公司\nAI 应用开发实习生\n薪资：150～250元/天，每周 5 天，要求 Python RAG。",
+        None,
+        generate_messages=False,
+    )
+
+    assert result["extracted"]["salary_text"] == "150～250元/天"
+    assert result["messages"] == {"message": "", "email": ""}
 
 
 def test_search_run_and_candidate_import_flow(tmp_path, monkeypatch):

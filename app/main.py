@@ -18,7 +18,9 @@ from .db import connect, dumps, get_setting, init_db, loads, set_setting, utc_no
 from .services.analyzer import (
     build_interview_review,
     clean_extracted,
+    extract_salary,
     generate_message,
+    looks_like_salary_text,
     rule_extract_jd,
     score_job,
 )
@@ -193,6 +195,7 @@ def analyze_job_payload(
     city: str = "",
     salary_text: str = "",
     search_depth: str = "auto",
+    generate_messages: bool = True,
 ) -> dict[str, Any]:
     _resume, resume_text = get_resume_text(resume_id)
     fallback_extract = rule_extract_jd(
@@ -207,10 +210,14 @@ def analyze_job_payload(
     extracted["required_skills"] = list(dict.fromkeys((llm_extract or {}).get("required_skills") or fallback_extract["required_skills"]))
     extracted["risk_signals"] = list(dict.fromkeys((llm_extract or {}).get("risk_signals") or fallback_extract["risk_signals"]))
     extracted["caution_signals"] = list(dict.fromkeys((llm_extract or {}).get("caution_signals") or fallback_extract["caution_signals"]))
+    if fallback_extract.get("salary_text"):
+        extracted["salary_text"] = fallback_extract["salary_text"]
+    elif extracted.get("salary_text") and not looks_like_salary_text(extracted["salary_text"]):
+        extracted["salary_text"] = ""
     apply_blacklists(extracted, jd_text)
 
     scoring = score_job(extracted, jd_text, resume_text)
-    messages = try_llm_message(extracted, scoring, generate_message(extracted, scoring))
+    messages = try_llm_message(extracted, scoring, generate_message(extracted, scoring)) if generate_messages and jd_text else {"message": "", "email": ""}
     final_depth = auto_search_depth(scoring, extracted) if search_depth == "auto" else search_depth
     source = "llm_plus_rules" if llm_extract else "local_rules"
     if not jd_text:
@@ -359,6 +366,7 @@ def create_job_record(
     city: str = "",
     salary_text: str = "",
     search_depth: str = "auto",
+    generate_messages: bool = True,
 ) -> tuple[int, dict[str, Any]]:
     analysis = analyze_job_payload(
         jd_text,
@@ -368,6 +376,7 @@ def create_job_record(
         city=city,
         salary_text=salary_text,
         search_depth=search_depth,
+        generate_messages=generate_messages,
     )
     extracted = analysis["extracted"]
     scoring = analysis["scoring"]
@@ -559,6 +568,27 @@ def extension_anchors(payload: dict[str, Any]) -> list[dict[str, str]]:
     return anchors
 
 
+def extension_cards(payload: dict[str, Any]) -> list[dict[str, str]]:
+    cards: list[dict[str, str]] = []
+    for item in list(payload.get("cards") or [])[:EXTENSION_LINK_LIMIT]:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text") or item.get("context") or "")
+        cards.append(
+            {
+                "href": str(item.get("href") or item.get("url") or ""),
+                "text": str(item.get("title") or ""),
+                "title": str(item.get("title") or ""),
+                "context": text,
+            }
+        )
+    return cards
+
+
+def extension_candidate_sources(payload: dict[str, Any]) -> list[dict[str, str]]:
+    return [*extension_cards(payload), *extension_anchors(payload)]
+
+
 def create_job_from_extension(payload: dict[str, Any]) -> dict[str, Any] | JSONResponse:
     raw_url = payload_text(payload, "url", 1000)
     if not raw_url:
@@ -585,6 +615,7 @@ def create_job_from_extension(payload: dict[str, Any]) -> dict[str, Any] | JSONR
             source_url=url,
             title=title,
             search_depth="auto",
+            generate_messages=False,
         )
         conn.execute(
             "INSERT INTO application_events (job_id, event_type, content, created_at) VALUES (?, ?, ?, ?)",
@@ -607,9 +638,9 @@ def create_search_from_extension(payload: dict[str, Any]) -> dict[str, Any] | JS
     platform = extension_platform(url, payload_text(payload, "platform", 80))
     keyword = payload_text(payload, "keyword", 80) or extension_keyword(url, title)
     city = payload_text(payload, "city", 80)
-    anchors = extension_anchors(payload)
-    candidates = extract_candidates_from_anchors(anchors, platform, city, url, limit=30)
-    note = "浏览器扩展采集搜索结果页。"
+    sources = extension_candidate_sources(payload)
+    candidates = extract_candidates_from_anchors(sources, platform, city, url, limit=30)
+    note = f"浏览器扩展基于当前页可见文本、{len(extension_anchors(payload))} 个链接和 {len(extension_cards(payload))} 个候选卡片采集搜索结果页。"
     if not candidates:
         note += " 没有识别到候选岗位，可尝试停留在岗位列表区域后重试。"
     result = SearchResult(
@@ -627,8 +658,30 @@ def create_search_from_extension(payload: dict[str, Any]) -> dict[str, Any] | JS
         "capture_type": "search",
         "search_run_id": run_id,
         "candidate_count": len(candidates),
+        "source_count": len(sources),
         "redirect_url": f"/searches/{run_id}",
     }
+
+
+def candidate_snapshot_jd(candidate: dict[str, Any]) -> str:
+    title = str(candidate.get("title") or "").strip()
+    company = str(candidate.get("company") or "").strip()
+    city = str(candidate.get("city") or "").strip()
+    source_url = str(candidate.get("source_url") or "").strip()
+    summary = normalize_visible_text(str(candidate.get("summary") or ""))
+    parts = [
+        "以下内容来自搜索结果页可见文本，详情页暂未抓取成功，需要后续补充完整 JD。",
+        f"岗位名称：{title}" if title else "",
+        f"公司名称：{company}" if company else "",
+        f"城市：{city}" if city else "",
+        f"岗位链接：{source_url}" if source_url else "",
+        f"搜索结果摘要：\n{summary}" if summary else "",
+    ]
+    return "\n\n".join(part for part in parts if part).strip()[:EXTENSION_TEXT_LIMIT]
+
+
+def fetch_browser_channel(value: str) -> str:
+    return "msedge" if value == "extension" else value or "msedge"
 
 
 @app.post("/api/extension/capture")
@@ -929,7 +982,7 @@ async def import_candidate(candidate_id: int, request: Request) -> RedirectRespo
 
     candidate = {key: row[key] for key in row.keys()}
     run_id = int(candidate["search_run_id"])
-    channel = browser_channel or candidate.get("run_browser_channel") or "msedge"
+    channel = fetch_browser_channel(browser_channel or candidate.get("run_browser_channel") or "msedge")
     try:
         fetched = await run_in_threadpool(fetch_job_from_url, candidate["source_url"], fetch_mode=fetch_mode, browser_channel=channel)
         with connect() as conn:
@@ -943,6 +996,7 @@ async def import_candidate(candidate_id: int, request: Request) -> RedirectRespo
                 company=candidate.get("company") or "",
                 city=candidate.get("city") or "",
                 search_depth=requested_depth,
+                generate_messages=candidate.get("run_browser_channel") != "extension",
             )
             now = utc_now()
             conn.execute(
@@ -955,6 +1009,34 @@ async def import_candidate(candidate_id: int, request: Request) -> RedirectRespo
             )
         return redirect_with_notice(f"/jobs/{job_id}", f"已从候选岗位导入并通过{fetch_mode_label(fetched.fetch_mode)}完成分析。", "success")
     except Exception as exc:
+        fallback_text = candidate_snapshot_jd(candidate)
+        if len(fallback_text) >= 40:
+            fetch_error = str(exc)[:300]
+            with connect() as conn:
+                job_id, _analysis = create_job_record(
+                    conn,
+                    jd_text=fallback_text,
+                    resume_id=resume_id,
+                    platform=candidate.get("platform") or infer_platform_from_url(candidate.get("source_url") or ""),
+                    source_url=candidate.get("source_url") or "",
+                    title=candidate.get("title") or "",
+                    company=candidate.get("company") or "",
+                    city=candidate.get("city") or "",
+                    salary_text=extract_salary(candidate.get("summary") or ""),
+                    search_depth=requested_depth,
+                    generate_messages=False,
+                )
+                now = utc_now()
+                conn.execute(
+                    "UPDATE job_candidates SET job_id = ?, status = ?, error_message = ?, updated_at = ? WHERE id = ?",
+                    (job_id, "已导入", f"详情页抓取失败，已使用搜索结果摘要：{fetch_error}", now, candidate_id),
+                )
+                conn.execute(
+                    "INSERT INTO application_events (job_id, event_type, content, created_at) VALUES (?, ?, ?, ?)",
+                    (job_id, "搜索候选摘要导入", f"详情页抓取失败，已用搜索结果摘要创建岗位。原始错误：{fetch_error}", now),
+                )
+            return redirect_with_notice(f"/jobs/{job_id}", "详情页抓取失败，已先用搜索结果摘要创建待补充岗位。建议打开岗位页后再用扩展采集当前岗位刷新详情。", "warning")
+
         with connect() as conn:
             conn.execute(
                 "UPDATE job_candidates SET status = ?, error_message = ?, updated_at = ? WHERE id = ?",
