@@ -260,3 +260,32 @@ def test_manual_edge_search_capture_flow(tmp_path, monkeypatch):
     with connect() as conn:
         count = conn.execute("SELECT COUNT(*) AS count FROM job_candidates").fetchone()["count"]
     assert count == 1
+
+
+def test_model_profile_blank_api_key_env_uses_provider_suggestion(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "settings.sqlite3"))
+
+    from app import main  # noqa: F401
+    from app.db import connect, init_db
+
+    init_db()
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/settings/model-profiles",
+        data={
+            "name": "DeepSeek",
+            "base_url": "https://api.deepseek.com/v1",
+            "api_key_env": "",
+            "model": "deepseek-v4-flash",
+            "temperature": "0.2",
+            "input_cost_per_million": "0",
+            "output_cost_per_million": "0",
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    with connect() as conn:
+        row = conn.execute("SELECT api_key_env FROM model_profiles WHERE name = ?", ("DeepSeek",)).fetchone()
+    assert row["api_key_env"] == "DEEPSEEK_API_KEY"

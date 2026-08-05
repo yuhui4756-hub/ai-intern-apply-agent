@@ -12,7 +12,7 @@ from fastapi.responses import RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from .config import ROOT_DIR, TASK_TYPES, looks_masked, mask_secret, set_env_value
+from .config import ROOT_DIR, TASK_TYPES, looks_masked, mask_secret, set_env_value, suggest_api_key_env
 from .db import connect, dumps, get_setting, init_db, loads, set_setting, utc_now
 from .services.analyzer import (
     build_interview_review,
@@ -1128,10 +1128,17 @@ def settings_page(request: Request) -> Any:
         ).fetchall()
         logs = conn.execute("SELECT * FROM model_call_logs ORDER BY created_at DESC LIMIT 20").fetchall()
     profiles = []
+    env_usage: dict[str, list[str]] = {}
+    for row in profile_rows:
+        key_name = row["api_key_env"] or suggest_api_key_env(row["name"], row["base_url"])
+        env_usage.setdefault(key_name, []).append(row["name"])
     for row in profile_rows:
         profile = {key: row[key] for key in row.keys()}
-        key_name = profile.get("api_key_env") or "OPENAI_COMPATIBLE_API_KEY"
+        key_name = profile.get("api_key_env") or suggest_api_key_env(profile.get("name") or "", profile.get("base_url") or "")
+        profile["api_key_env"] = key_name
         profile["api_key_mask"] = mask_secret(os.environ.get(key_name, ""))
+        profile["api_key_env_shared_with"] = [name for name in env_usage.get(key_name, []) if name != profile.get("name")]
+        profile["api_key_env_suggestion"] = suggest_api_key_env(profile.get("name") or "", profile.get("base_url") or "")
         profiles.append(profile)
     env_path = ROOT_DIR / ".env"
     return templates.TemplateResponse(
@@ -1149,6 +1156,7 @@ def settings_page(request: Request) -> Any:
             "blacklist_keywords": "\n".join(get_setting("blacklist_keywords", []) or []),
             "notice": request.query_params.get("notice", ""),
             "notice_type": request.query_params.get("notice_type", "info"),
+            "default_api_key_env": "OPENAI_COMPATIBLE_API_KEY",
         },
     )
 
@@ -1158,14 +1166,16 @@ async def upsert_model_profile(request: Request) -> RedirectResponse:
     form = await request.form()
     profile_id = str(form.get("profile_id") or "")
     action = str(form.get("action") or "save")
-    api_key_env = str(form.get("api_key_env") or "OPENAI_COMPATIBLE_API_KEY").strip()
+    name = str(form.get("name") or "未命名配置")
+    base_url = str(form.get("base_url") or "")
+    api_key_env = str(form.get("api_key_env") or "").strip() or suggest_api_key_env(name, base_url)
     api_key_value = str(form.get("api_key") or "").strip()
     if api_key_value and not looks_masked(api_key_value):
         set_env_value(api_key_env, api_key_value)
 
     values = (
-        str(form.get("name") or "未命名配置"),
-        str(form.get("base_url") or ""),
+        name,
+        base_url,
         api_key_env,
         str(form.get("model") or ""),
         float(form.get("temperature") or 0.2),
@@ -1199,6 +1209,14 @@ async def upsert_model_profile(request: Request) -> RedirectResponse:
                 """,
                 (*values, values[-1]),
             )
+        shared_rows = conn.execute(
+            "SELECT name FROM model_profiles WHERE api_key_env = ? AND name != ? ORDER BY id",
+            (api_key_env, name),
+        ).fetchall()
+    shared_names = [row["name"] for row in shared_rows]
+    save_message = f"模型配置已保存。API Key 变量名：{api_key_env}"
+    if shared_names:
+        save_message += f"；该变量也被 {', '.join(shared_names)} 使用，会共用同一个 Key。"
 
     if action == "test":
         profile = {
@@ -1223,7 +1241,7 @@ async def upsert_model_profile(request: Request) -> RedirectResponse:
             client.log_error(str(exc))
             return redirect_with_notice("/settings", f"模型连接失败：{str(exc)[:160]}", "error")
 
-    return redirect_with_notice("/settings", "模型配置已保存。", "success")
+    return redirect_with_notice("/settings", save_message, "success")
 
 
 @app.post("/settings/blacklists")

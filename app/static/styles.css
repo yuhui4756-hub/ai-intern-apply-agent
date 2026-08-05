@@ -130,6 +130,13 @@ p {
   background: #fff1ee;
 }
 
+.notice.compact {
+  display: inline-flex;
+  padding: 6px 8px;
+  margin: 0;
+  font-size: 12px;
+}
+
 .panel-title,
 .card-head {
   display: flex;

@@ -43,7 +43,10 @@
       </label>
       <label>API Key 环境变量名（可留空）
         <input name="api_key_env" value="{{ profile.api_key_env }}" placeholder="OPENAI_COMPATIBLE_API_KEY">
-        <span class="muted">留空会使用默认变量名；API Key 仍只保存到本地 .env。</span>
+        <span class="muted">留空会自动建议为 {{ profile.api_key_env_suggestion }}；API Key 仍只保存到本地 .env。</span>
+        {% if profile.api_key_env_shared_with %}
+        <span class="notice compact">与 {{ profile.api_key_env_shared_with | join("、") }} 共用同一个 Key。</span>
+        {% endif %}
       </label>
       <label>API Key
         <input name="api_key" type="password" placeholder="{{ '已设置：' ~ profile.api_key_mask if profile.api_key_mask else '未设置，填写后保存到本地 .env' }}">
@@ -76,7 +79,9 @@
   <form method="post" action="/settings/model-profiles" class="form-grid">
     <label>名称<input name="name" placeholder="低成本模型"></label>
     <label>Base URL<input name="base_url" placeholder="https://api.example.com/v1"></label>
-    <label>API Key 环境变量名（可留空）<input name="api_key_env" placeholder="OPENAI_COMPATIBLE_API_KEY"></label>
+    <label>API Key 环境变量名（可留空）
+      <input name="api_key_env" placeholder="留空自动生成，如 DEEPSEEK_API_KEY">
+    </label>
     <label>API Key<input name="api_key" type="password" placeholder="保存到本地 .env，页面不回显明文"></label>
     <label>模型<input name="model" placeholder="model-name"></label>
     <label>Temperature<input name="temperature" type="number" step="0.1" min="0" max="2" value="0.2"></label>

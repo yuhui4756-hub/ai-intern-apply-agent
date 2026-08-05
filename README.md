@@ -63,6 +63,7 @@ API Key 可以在设置页直接填写；应用会保存到本地 `.env` 并立�
 
 - `Temperature` 推荐先用 `0.2`。JD 抽取、评分解释这类任务越低越稳定；话术或面试题可以提高到 `0.4-0.6`，但更容易发散。
 - `API Key 环境变量名` 可以留空，应用会默认使用 `OPENAI_COMPATIBLE_API_KEY`。这个字段的作用是告诉应用把 Key 存到 `.env` 的哪个变量名下，以及调用模型时从哪里读取。
+- 新增模型配置时，如果环境变量名留空，应用会按服务商或配置名称自动建议，例如 DeepSeek -> `DEEPSEEK_API_KEY`，OpenAI -> `OPENAI_API_KEY`。
 
 ## Checks
 

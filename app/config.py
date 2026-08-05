@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 
@@ -81,6 +82,29 @@ def mask_secret(value: str | None) -> str:
 def looks_masked(value: str) -> bool:
     stripped = value.strip()
     return bool(stripped) and set(stripped) <= {"*"}
+
+
+def suggest_api_key_env(name: str = "", base_url: str = "") -> str:
+    source = f"{name} {base_url}".lower()
+    if "deepseek" in source:
+        return "DEEPSEEK_API_KEY"
+    if "openai" in source or "api.openai.com" in source:
+        return "OPENAI_API_KEY"
+    if "anthropic" in source:
+        return "ANTHROPIC_API_KEY"
+    if "qwen" in source or "dashscope" in source or "aliyun" in source:
+        return "QWEN_API_KEY"
+    if "siliconflow" in source:
+        return "SILICONFLOW_API_KEY"
+    if "localhost" in source or "127.0.0.1" in source:
+        return "LOCAL_PROXY_API_KEY"
+
+    token = re.sub(r"[^A-Za-z0-9]+", "_", name or "OPENAI_COMPATIBLE").strip("_").upper()
+    if not token:
+        token = "OPENAI_COMPATIBLE"
+    if not token.endswith("API_KEY"):
+        token = f"{token}_API_KEY"
+    return token
 
 
 def data_dir() -> Path:

@@ -60,7 +60,8 @@ class OpenAICompatibleClient:
                 headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
                 json=payload,
             )
-            response.raise_for_status()
+            if response.is_error:
+                raise RuntimeError(f"HTTP {response.status_code}: {response.text[:500]}")
         data = response.json()
         content = data["choices"][0]["message"].get("content", "")
         usage = data.get("usage") or {}
