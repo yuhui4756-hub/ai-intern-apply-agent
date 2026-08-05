@@ -37,3 +37,59 @@ def test_job_form_and_reanalysis_flow(tmp_path, monkeypatch):
     assert reanalyze.status_code == 303
     refreshed = client.get(reanalyze.headers["location"])
     assert "已重新分析岗位" in refreshed.text
+
+
+def test_bulk_import_and_status_update_flow(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "bulk.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db
+
+    monkeypatch.setattr(main, "search_company", lambda *args, **kwargs: [])
+    init_db()
+    client = TestClient(main.app)
+
+    batch_text = """
+    公司名称：杭州批量智能科技有限公司
+    AI 应用开发实习生
+    要求 Python、RAG、FastAPI，每周 5 天。
+
+    ---
+
+    公司名称：风险培训科技有限公司
+    AI 实习生
+    入职前需要缴纳培训费，可贷款。
+    """
+    response = client.post(
+        "/jobs/bulk-analyze",
+        data={
+            "platform": "batch-smoke",
+            "selected_resume_id": "1",
+            "search_depth": "quick",
+            "batch_jd_text": batch_text,
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    listing = client.get(response.headers["location"])
+    assert listing.status_code == 200
+    assert "已导入 2 条岗位" in listing.text
+    assert "杭州批量智能科技有限公司" in listing.text
+    assert "风险培训科技有限公司" in listing.text
+    assert "复制" in listing.text
+
+    with connect() as conn:
+        rows = conn.execute("SELECT id, recommendation, status FROM job_postings ORDER BY id").fetchall()
+    assert len(rows) == 2
+    assert {row["recommendation"] for row in rows} >= {"跳过"}
+
+    actionable_id = next(row["id"] for row in rows if row["recommendation"] != "跳过")
+    update = client.post(
+        "/jobs/bulk-status",
+        data={"job_ids": [str(actionable_id)], "status": "待投递"},
+        follow_redirects=False,
+    )
+    assert update.status_code == 303
+    with connect() as conn:
+        status = conn.execute("SELECT status FROM job_postings WHERE id = ?", (actionable_id,)).fetchone()["status"]
+    assert status == "待投递"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,13 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="简历投递 Agent", lifespan=lifespan)
 templates = Jinja2Templates(directory=str(ROOT_DIR / "app" / "templates"))
 app.mount("/static", StaticFiles(directory=str(ROOT_DIR / "app" / "static")), name="static")
+
+BULK_IMPORT_LIMIT = 20
+BATCH_SEPARATOR_RE = re.compile(r"(?m)^\s*(?:-{3,}|={3,}|#{3,}|岗位\s*\d+[:：]?)\s*$")
+BATCH_START_MARKERS = [
+    re.compile(r"(?m)^\s*公司名称\s*[:：]"),
+    re.compile(r"(?m)^\s*(?:岗位名称|职位名称)\s*[:：]"),
+]
 
 
 def redirect(path: str) -> RedirectResponse:
@@ -232,6 +240,104 @@ def insert_company_research(conn: Any, job_id: int, company: str, title: str, ci
         )
 
 
+def split_batch_jds(raw_text: str) -> list[str]:
+    text = (raw_text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return []
+
+    explicit_parts = [part.strip() for part in BATCH_SEPARATOR_RE.split(text) if part.strip()]
+    if len(explicit_parts) > 1:
+        return explicit_parts
+
+    for marker in BATCH_START_MARKERS:
+        starts = [match.start() for match in marker.finditer(text)]
+        if len(starts) > 1:
+            boundaries = [0] + starts[1:] + [len(text)]
+            return [text[boundaries[index] : boundaries[index + 1]].strip() for index in range(len(boundaries) - 1)]
+
+    return [text]
+
+
+def initial_job_status(jd_text: str, scoring: dict[str, Any]) -> str:
+    if not jd_text:
+        return "待分析"
+    if scoring["recommendation"] in {"必投", "可冲"}:
+        return "待确认"
+    return "已归档"
+
+
+def create_job_record(
+    conn: Any,
+    *,
+    jd_text: str,
+    resume_id: int | None,
+    platform: str = "",
+    source_url: str = "",
+    title: str = "",
+    company: str = "",
+    city: str = "",
+    salary_text: str = "",
+    search_depth: str = "auto",
+) -> tuple[int, dict[str, Any]]:
+    analysis = analyze_job_payload(
+        jd_text,
+        resume_id,
+        title=title,
+        company=company,
+        city=city,
+        salary_text=salary_text,
+        search_depth=search_depth,
+    )
+    extracted = analysis["extracted"]
+    scoring = analysis["scoring"]
+    messages = analysis["messages"]
+    final_depth = analysis["search_depth"]
+    now = utc_now()
+    status = initial_job_status(jd_text, scoring)
+    cursor = conn.execute(
+        """
+        INSERT INTO job_postings (
+            platform, source_url, title, company, city, salary_text,
+            internship_days, internship_duration, jd_text, extracted_json,
+            selected_resume_id, match_score, match_level, risk_level,
+            recommendation, status, skip_reason, generated_message,
+            generated_email, analysis_error, analysis_source, search_depth, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            platform,
+            source_url,
+            extracted.get("title") or "",
+            extracted.get("company") or company,
+            extracted.get("city") or "",
+            extracted.get("salary_text") or "",
+            extracted.get("internship_days") or "",
+            extracted.get("internship_duration") or "",
+            jd_text,
+            dumps({"extracted": extracted, "scoring": scoring}),
+            resume_id,
+            scoring["score"] if jd_text else 0,
+            scoring["level"] if jd_text else "",
+            scoring["risk_level"] if jd_text else "",
+            scoring["recommendation"] if jd_text else "",
+            status,
+            scoring["skip_reason"] if jd_text else "",
+            messages["message"] if jd_text else "",
+            messages["email"] if jd_text else "",
+            analysis["analysis_error"],
+            analysis["analysis_source"],
+            final_depth,
+            now,
+            now,
+        ),
+    )
+    job_id = cursor.lastrowid
+    company_name = extracted.get("company") or company
+    if jd_text and company_name:
+        insert_company_research(conn, job_id, company_name, extracted.get("title") or "", extracted.get("city") or "", final_depth)
+    return job_id, analysis
+
+
 def token_stats() -> dict[str, Any]:
     with connect() as conn:
         today = conn.execute(
@@ -354,7 +460,32 @@ def jobs_page(request: Request, status: str = "") -> Any:
     query += " ORDER BY created_at DESC"
     with connect() as conn:
         jobs = [parse_json_fields({key: row[key] for key in row.keys()}) for row in conn.execute(query, params).fetchall()]
-    return templates.TemplateResponse(request, "jobs.html", {"jobs": jobs, "status_filter": status})
+        recommendation_counts = {
+            row["recommendation"] or "未分析": row["count"]
+            for row in conn.execute(
+                """
+                SELECT recommendation, COUNT(*) AS count
+                FROM job_postings
+                GROUP BY recommendation
+                """
+            ).fetchall()
+        }
+        status_counts = {
+            row["status"]: row["count"]
+            for row in conn.execute("SELECT status, COUNT(*) AS count FROM job_postings GROUP BY status").fetchall()
+        }
+    return templates.TemplateResponse(
+        request,
+        "jobs.html",
+        {
+            "jobs": jobs,
+            "status_filter": status,
+            "recommendation_counts": recommendation_counts,
+            "status_counts": status_counts,
+            "notice": request.query_params.get("notice", ""),
+            "notice_type": request.query_params.get("notice_type", "info"),
+        },
+    )
 
 
 @app.get("/jobs/new")
@@ -368,6 +499,7 @@ def new_job_page(request: Request) -> Any:
         {
             "resumes": [{key: row[key] for key in row.keys()} for row in resumes],
             "model_configured": bool(jd_client and jd_client.configured),
+            "bulk_import_limit": BULK_IMPORT_LIMIT,
         },
     )
 
@@ -379,68 +511,93 @@ async def analyze_job(request: Request) -> RedirectResponse:
     resume_id_raw = str(form.get("selected_resume_id") or "")
     resume_id = int(resume_id_raw) if resume_id_raw.isdigit() else None
     requested_depth = str(form.get("search_depth") or "auto")
-    analysis = analyze_job_payload(
-        jd_text,
-        resume_id,
-        title=str(form.get("title") or ""),
-        company=str(form.get("company") or ""),
-        city=str(form.get("city") or ""),
-        salary_text=str(form.get("salary_text") or ""),
-        search_depth=requested_depth,
-    )
-    extracted = analysis["extracted"]
-    scoring = analysis["scoring"]
-    messages = analysis["messages"]
-    final_depth = analysis["search_depth"]
+    with connect() as conn:
+        job_id, _analysis = create_job_record(
+            conn,
+            jd_text=jd_text,
+            resume_id=resume_id,
+            platform=str(form.get("platform") or ""),
+            source_url=str(form.get("source_url") or ""),
+            title=str(form.get("title") or ""),
+            company=str(form.get("company") or ""),
+            city=str(form.get("city") or ""),
+            salary_text=str(form.get("salary_text") or ""),
+            search_depth=requested_depth,
+        )
+    return redirect(f"/jobs/{job_id}")
+
+
+@app.post("/jobs/bulk-analyze")
+async def bulk_analyze_jobs(request: Request) -> RedirectResponse:
+    form = await request.form()
+    jd_items = split_batch_jds(str(form.get("batch_jd_text") or ""))
+    if not jd_items:
+        return redirect_with_notice("/jobs/new", "没有找到可导入的 JD。", "error")
+
+    truncated = len(jd_items) > BULK_IMPORT_LIMIT
+    jd_items = jd_items[:BULK_IMPORT_LIMIT]
+    resume_id_raw = str(form.get("selected_resume_id") or "")
+    resume_id = int(resume_id_raw) if resume_id_raw.isdigit() else None
+    requested_depth = str(form.get("search_depth") or "auto")
+    platform = str(form.get("platform") or "").strip()
+    created: list[dict[str, Any]] = []
+
+    with connect() as conn:
+        for jd_text in jd_items:
+            job_id, analysis = create_job_record(
+                conn,
+                jd_text=jd_text,
+                resume_id=resume_id,
+                platform=platform,
+                search_depth=requested_depth,
+            )
+            created.append(
+                {
+                    "id": job_id,
+                    "recommendation": analysis["scoring"].get("recommendation") or "未分析",
+                }
+            )
+
+    counts = {label: sum(1 for item in created if item["recommendation"] == label) for label in ["必投", "可冲", "跳过"]}
+    message = f"已导入 {len(created)} 条岗位：必投 {counts['必投']}，可冲 {counts['可冲']}，跳过 {counts['跳过']}。"
+    if truncated:
+        message += f" 单次最多处理 {BULK_IMPORT_LIMIT} 条，其余内容未导入。"
+    return redirect_with_notice("/jobs", message, "success")
+
+
+@app.post("/jobs/bulk-status")
+async def bulk_update_jobs(request: Request) -> RedirectResponse:
+    form = await request.form()
+    job_ids = [int(value) for value in form.getlist("job_ids") if str(value).isdigit()]
+    status = str(form.get("status") or "").strip()
+    allowed_statuses = {"待确认", "待投递", "已投递", "已沟通", "待面试", "面试准备中", "已归档"}
+    if not job_ids:
+        return redirect_with_notice("/jobs", "请先选择岗位。", "error")
+    if status not in allowed_statuses:
+        return redirect_with_notice("/jobs", "状态无效，未更新。", "error")
 
     now = utc_now()
-    status = "待确认" if scoring["recommendation"] in {"必投", "可冲"} else "已归档"
-    if not jd_text:
-        status = "待分析"
+    placeholders = ",".join("?" for _ in job_ids)
     with connect() as conn:
-        cursor = conn.execute(
-            """
-            INSERT INTO job_postings (
-                platform, source_url, title, company, city, salary_text,
-                internship_days, internship_duration, jd_text, extracted_json,
-                selected_resume_id, match_score, match_level, risk_level,
-                recommendation, status, skip_reason, generated_message,
-                generated_email, analysis_error, analysis_source, search_depth, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                str(form.get("platform") or ""),
-                str(form.get("source_url") or ""),
-                extracted.get("title") or "",
-                extracted.get("company") or str(form.get("company") or ""),
-                extracted.get("city") or "",
-                extracted.get("salary_text") or "",
-                extracted.get("internship_days") or "",
-                extracted.get("internship_duration") or "",
-                jd_text,
-                dumps({"extracted": extracted, "scoring": scoring}),
-                resume_id,
-                scoring["score"] if jd_text else 0,
-                scoring["level"] if jd_text else "",
-                scoring["risk_level"] if jd_text else "",
-                scoring["recommendation"] if jd_text else "",
-                status,
-                scoring["skip_reason"] if jd_text else "",
-                messages["message"] if jd_text else "",
-                messages["email"] if jd_text else "",
-                analysis["analysis_error"],
-                analysis["analysis_source"],
-                final_depth,
-                now,
-                now,
-            ),
+        rows = conn.execute(
+            f"SELECT id, title, company FROM job_postings WHERE id IN ({placeholders})",
+            tuple(job_ids),
+        ).fetchall()
+        if not rows:
+            return redirect_with_notice("/jobs", "没有找到可更新的岗位。", "error")
+        valid_ids = [int(row["id"]) for row in rows]
+        valid_placeholders = ",".join("?" for _ in valid_ids)
+        conn.execute(
+            f"UPDATE job_postings SET status = ?, updated_at = ? WHERE id IN ({valid_placeholders})",
+            (status, now, *valid_ids),
         )
-        job_id = cursor.lastrowid
-
-        company = extracted.get("company") or str(form.get("company") or "")
-        if jd_text and company:
-            insert_company_research(conn, job_id, company, extracted.get("title") or "", extracted.get("city") or "", final_depth)
-    return redirect(f"/jobs/{job_id}")
+        for row in rows:
+            title = " - ".join(item for item in [row["company"], row["title"]] if item) or f"岗位 {row['id']}"
+            conn.execute(
+                "INSERT INTO application_events (job_id, event_type, content, created_at) VALUES (?, ?, ?, ?)",
+                (row["id"], "批量状态更新", f"{title} 已标记为 {status}。", now),
+            )
+    return redirect_with_notice("/jobs", f"已更新 {len(valid_ids)} 条岗位为「{status}」。", "success")
 
 
 @app.get("/jobs/{job_id}")

@@ -257,6 +257,16 @@ textarea {
   gap: 12px;
 }
 
+.table-actions {
+  flex-wrap: wrap;
+}
+
+.button.compact {
+  min-height: 30px;
+  padding: 5px 10px;
+  font-size: 13px;
+}
+
 .table-wrap {
   overflow-x: auto;
 }
@@ -278,6 +288,10 @@ th {
   color: var(--muted);
   font-weight: 600;
   font-size: 13px;
+}
+
+.row-check {
+  width: auto;
 }
 
 .badge {
@@ -308,6 +322,14 @@ th {
 
 .copy-area {
   min-height: 160px;
+}
+
+.copy-source {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
 }
 
 code {

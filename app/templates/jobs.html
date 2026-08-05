@@ -9,12 +9,34 @@
   <a class="button primary" href="/jobs/new">分析新 JD</a>
 </section>
 
+{% if notice %}
+<section class="notice {{ notice_type }}">{{ notice }}</section>
+{% endif %}
+
+<section class="metrics">
+  <div class="metric"><span>必投</span><strong>{{ recommendation_counts.get("必投", 0) }}</strong></div>
+  <div class="metric"><span>可冲</span><strong>{{ recommendation_counts.get("可冲", 0) }}</strong></div>
+  <div class="metric"><span>跳过</span><strong>{{ recommendation_counts.get("跳过", 0) }}</strong></div>
+  <div class="metric"><span>待投递</span><strong>{{ status_counts.get("待投递", 0) }}</strong></div>
+  <div class="metric"><span>已投递</span><strong>{{ status_counts.get("已投递", 0) }}</strong></div>
+</section>
+
 <section class="panel">
   {% if jobs %}
+  <form method="post" action="/jobs/bulk-status" class="form-stack">
+    <div class="form-actions table-actions">
+      <button class="button" type="submit" name="status" value="待投递">标记待投递</button>
+      <button class="button" type="submit" name="status" value="已投递">标记已投递</button>
+      <button class="button" type="submit" name="status" value="已归档">归档跳过</button>
+      <a class="button" href="/jobs">全部</a>
+      <a class="button" href="/jobs?status=待确认">待确认</a>
+      <a class="button" href="/jobs?status=待投递">待投递</a>
+    </div>
   <div class="table-wrap">
     <table>
       <thead>
         <tr>
+          <th>选择</th>
           <th>岗位</th>
           <th>公司</th>
           <th>城市</th>
@@ -22,11 +44,13 @@
           <th>风险</th>
           <th>建议</th>
           <th>状态</th>
+          <th>话术</th>
         </tr>
       </thead>
       <tbody>
         {% for job in jobs %}
         <tr>
+          <td><input class="row-check" type="checkbox" name="job_ids" value="{{ job.id }}"></td>
           <td><a href="/jobs/{{ job.id }}">{{ (job.company ~ " - " if job.company else "") ~ (job.title or "岗位待补充") }}</a></td>
           <td>{{ job.company or "公司待补充" }}</td>
           <td>{{ job.city or "-" }}</td>
@@ -34,11 +58,20 @@
           <td>{{ job.risk_level or "-" }}</td>
           <td>{{ job.recommendation or "-" }}</td>
           <td>{{ job.status }}</td>
+          <td>
+            {% if job.generated_message %}
+            <textarea class="copy-source" id="message-{{ job.id }}" readonly>{{ job.generated_message }}</textarea>
+            <button class="button compact copy-button" type="button" data-copy-target="message-{{ job.id }}">复制</button>
+            {% else %}
+            <span class="empty">-</span>
+            {% endif %}
+          </td>
         </tr>
         {% endfor %}
       </tbody>
     </table>
   </div>
+  </form>
   {% else %}
     <p class="empty">还没有岗位。先去分析一条 JD。</p>
   {% endif %}

@@ -57,4 +57,43 @@
     <button class="button primary" type="submit">分析并保存</button>
   </div>
 </form>
+
+<form method="post" action="/jobs/bulk-analyze" class="panel form-stack">
+  <div class="panel-title">
+    <h2>批量导入</h2>
+    <span class="badge">最多 {{ bulk_import_limit }} 条</span>
+  </div>
+  <div class="form-grid">
+    <label>平台
+      <input name="platform" placeholder="Boss 直聘 / 实习僧 / 牛客 / 公司官网">
+    </label>
+    <label>简历版本
+      <select name="selected_resume_id">
+        {% for resume in resumes %}
+        <option value="{{ resume.id }}">{{ resume.name }} - {{ resume.target_role }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>搜索深度
+      <select name="search_depth">
+        <option value="auto">自动分档</option>
+        <option value="quick">快速</option>
+        <option value="standard">标准</option>
+        <option value="deep">深度</option>
+      </select>
+    </label>
+  </div>
+  <label>多段 JD 文本
+    <textarea name="batch_jd_text" rows="14" placeholder="公司名称：...
+岗位名称：...
+
+---
+
+公司名称：...
+岗位名称：..."></textarea>
+  </label>
+  <div class="form-actions">
+    <button class="button primary" type="submit">批量分析并保存</button>
+  </div>
+</form>
 {% endblock %}
