@@ -27,11 +27,18 @@ Copy-Item .env.example .env
 
 API Key 可以在设置页直接填写；应用会保存到本地 `.env` 并立即生效，页面只显示打码状态。真实 `.env` 不要提交。
 
+如果要使用“浏览器渲染”抓取动态招聘页，需要额外安装一次 Chromium：
+
+```powershell
+.\.venv\Scripts\python -m playwright install chromium
+```
+
 ## V0.1 Includes
 
 - 本地 SQLite 数据库。
 - 候选人画像和多份简历版本管理。
 - JD 粘贴分析、岗位链接抓取导入、匹配评分、风险判断和一键复制话术。
+- 岗位链接支持普通网页抓取和可选 Playwright 浏览器渲染抓取。
 - 多段 JD 批量粘贴导入、自动分档和批量状态更新。
 - 岗位状态、跳过原因和公司搜索证据记录。
 - 面试准备、转写文本复盘和 Markdown 导出。

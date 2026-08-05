@@ -274,6 +274,14 @@ def infer_platform_from_url(url: str) -> str:
     return "岗位链接"
 
 
+def fetch_mode_label(value: str) -> str:
+    return {
+        "auto": "自动",
+        "http": "普通网页",
+        "browser": "浏览器渲染",
+    }.get(value or "", value or "自动")
+
+
 def initial_job_status(jd_text: str, scoring: dict[str, Any]) -> str:
     if not jd_text:
         return "待分析"
@@ -590,9 +598,10 @@ async def import_job_url(request: Request) -> RedirectResponse:
     resume_id_raw = str(form.get("selected_resume_id") or "")
     resume_id = int(resume_id_raw) if resume_id_raw.isdigit() else None
     requested_depth = str(form.get("search_depth") or "auto")
+    fetch_mode = str(form.get("fetch_mode") or "auto")
     platform = str(form.get("platform") or "").strip()
     try:
-        fetched = fetch_job_from_url(source_url)
+        fetched = fetch_job_from_url(source_url, fetch_mode=fetch_mode)
     except Exception as exc:
         return redirect_with_notice("/jobs/new", f"链接导入失败：{str(exc)[:160]}", "error")
 
@@ -608,9 +617,14 @@ async def import_job_url(request: Request) -> RedirectResponse:
         )
         conn.execute(
             "INSERT INTO application_events (job_id, event_type, content, created_at) VALUES (?, ?, ?, ?)",
-            (job_id, "链接导入", f"从 {fetched.final_url} 抓取页面文本并生成岗位记录。", utc_now()),
+            (
+                job_id,
+                "链接导入",
+                f"使用{fetch_mode_label(fetched.fetch_mode)}从 {fetched.final_url} 抓取页面文本并生成岗位记录。{fetched.note}",
+                utc_now(),
+            ),
         )
-    return redirect_with_notice(f"/jobs/{job_id}", "已从岗位链接导入并完成分析。", "success")
+    return redirect_with_notice(f"/jobs/{job_id}", f"已通过{fetch_mode_label(fetched.fetch_mode)}导入并完成分析。", "success")
 
 
 @app.post("/jobs/bulk-status")

@@ -30,6 +30,13 @@
     <label>岗位链接
       <input name="source_url" required placeholder="https://...">
     </label>
+    <label>抓取模式
+      <select name="fetch_mode">
+        <option value="auto">自动：普通网页失败后尝试浏览器</option>
+        <option value="http">普通网页：更快</option>
+        <option value="browser">浏览器渲染：适合动态页面</option>
+      </select>
+    </label>
     <label>简历版本
       <select name="selected_resume_id">
         {% for resume in resumes %}

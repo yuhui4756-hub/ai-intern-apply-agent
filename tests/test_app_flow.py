@@ -107,11 +107,12 @@ def test_import_job_from_url_flow(tmp_path, monkeypatch):
     monkeypatch.setattr(
         main,
         "fetch_job_from_url",
-        lambda _url: FetchResult(
+        lambda _url, fetch_mode="auto": FetchResult(
             url="https://jobs.example.com/ai-intern",
             final_url="https://jobs.example.com/ai-intern",
             title="AI 应用开发实习生 - 链接测试",
             text="公司名称：杭州链接智能科技有限公司\nAI 应用开发实习生\n要求 Python、RAG、FastAPI，每周 5 天。",
+            fetch_mode=fetch_mode,
         ),
     )
     init_db()
@@ -123,13 +124,14 @@ def test_import_job_from_url_flow(tmp_path, monkeypatch):
             "source_url": "https://jobs.example.com/ai-intern",
             "selected_resume_id": "1",
             "search_depth": "quick",
+            "fetch_mode": "browser",
         },
         follow_redirects=False,
     )
 
     assert response.status_code == 303
     detail = client.get(response.headers["location"])
-    assert "已从岗位链接导入并完成分析" in detail.text
+    assert "已通过浏览器渲染导入并完成分析" in detail.text
     assert "杭州链接智能科技有限公司" in detail.text
     with connect() as conn:
         row = conn.execute("SELECT source_url, platform FROM job_postings ORDER BY id DESC LIMIT 1").fetchone()

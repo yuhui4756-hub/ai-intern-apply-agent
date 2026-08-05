@@ -21,6 +21,8 @@ class FetchResult:
     final_url: str
     title: str
     text: str
+    fetch_mode: str = "http"
+    note: str = ""
 
 
 class VisibleTextParser(HTMLParser):
@@ -135,7 +137,34 @@ def extract_visible_text(html: str) -> tuple[str, str]:
     return parser.title, parser.text
 
 
-def fetch_job_from_url(url: str) -> FetchResult:
+def validate_fetched_text(text: str) -> str:
+    normalized = normalize_visible_text(text)
+    if len(normalized) < MIN_JD_TEXT_CHARS:
+        raise ValueError("页面文本太短，可能需要登录、验证码或浏览器渲染。")
+    return normalized[:20000]
+
+
+def fetch_job_from_url(url: str, fetch_mode: str = "auto") -> FetchResult:
+    mode = (fetch_mode or "auto").strip().lower()
+    if mode not in {"auto", "http", "browser"}:
+        raise ValueError("抓取模式无效。")
+    if mode == "http":
+        return fetch_job_with_http(url)
+    if mode == "browser":
+        return fetch_job_with_browser(url)
+
+    try:
+        return fetch_job_with_http(url)
+    except Exception as http_exc:
+        try:
+            result = fetch_job_with_browser(url)
+            result.note = f"HTTP 抓取失败后改用浏览器抓取：{str(http_exc)[:120]}"
+            return result
+        except Exception as browser_exc:
+            raise ValueError(f"HTTP 抓取失败：{str(http_exc)[:120]}；浏览器抓取失败：{str(browser_exc)[:120]}") from browser_exc
+
+
+def fetch_job_with_http(url: str) -> FetchResult:
     safe_url = ensure_public_http_url(url)
     headers = {
         "User-Agent": "Mozilla/5.0 (compatible; AIInternApplyAgent/0.1; +https://github.com/yuhui4756-hub/ai-intern-apply-agent)",
@@ -156,6 +185,44 @@ def fetch_job_from_url(url: str) -> FetchResult:
         text = normalize_visible_text(html)
     else:
         title, text = extract_visible_text(html)
-    if len(text) < MIN_JD_TEXT_CHARS:
-        raise ValueError("页面文本太短，可能需要登录、验证码或浏览器渲染。")
-    return FetchResult(url=safe_url, final_url=final_url, title=title, text=text[:20000])
+    return FetchResult(url=safe_url, final_url=final_url, title=title, text=validate_fetched_text(text), fetch_mode="http")
+
+
+def fetch_job_with_browser(url: str) -> FetchResult:
+    safe_url = ensure_public_http_url(url)
+    try:
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise ValueError("浏览器抓取需要安装 Playwright：pip install playwright，并运行 python -m playwright install chromium。") from exc
+
+    browser = None
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page(
+                user_agent="Mozilla/5.0 (compatible; AIInternApplyAgent/0.1; +https://github.com/yuhui4756-hub/ai-intern-apply-agent)",
+                viewport={"width": 1366, "height": 900},
+            )
+            page.goto(safe_url, wait_until="domcontentloaded", timeout=25000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=8000)
+            except PlaywrightTimeoutError:
+                pass
+            final_url = ensure_public_http_url(page.url)
+            title = normalize_text(page.title())[:120]
+            text = page.locator("body").inner_text(timeout=8000)
+            browser.close()
+            browser = None
+    except ValueError:
+        raise
+    except Exception as exc:
+        message = str(exc)
+        if "Executable doesn't exist" in message or "playwright install" in message:
+            raise ValueError("浏览器抓取需要先安装 Chromium：python -m playwright install chromium。") from exc
+        raise ValueError(f"浏览器抓取失败：{message[:180]}") from exc
+    finally:
+        if browser is not None:
+            browser.close()
+
+    return FetchResult(url=safe_url, final_url=final_url, title=title, text=validate_fetched_text(text), fetch_mode="browser")
