@@ -684,14 +684,30 @@ def fetch_browser_channel(value: str) -> str:
     return "msedge" if value == "extension" else value or "msedge"
 
 
+def normalize_extension_payload(payload: Any) -> dict[str, Any] | None:
+    if isinstance(payload, dict):
+        for key in ("result", "payload", "data"):
+            nested = payload.get(key)
+            if isinstance(nested, dict):
+                return nested
+        return payload
+    if isinstance(payload, list):
+        for item in payload:
+            normalized = normalize_extension_payload(item)
+            if normalized:
+                return normalized
+    return None
+
+
 @app.post("/api/extension/capture")
 async def extension_capture(request: Request) -> Any:
     try:
-        payload = await request.json()
+        raw_payload = await request.json()
     except Exception:
         return api_error("请求不是有效 JSON。")
-    if not isinstance(payload, dict):
-        return api_error("请求体必须是 JSON 对象。")
+    payload = normalize_extension_payload(raw_payload)
+    if payload is None:
+        return api_error("请求体必须是 JSON 对象，或 Chrome 脚本返回对象数组。")
 
     capture_type = payload_text(payload, "capture_type", 30) or payload_text(payload, "type", 30)
     if capture_type == "job":

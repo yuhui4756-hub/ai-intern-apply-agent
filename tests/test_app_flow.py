@@ -226,6 +226,46 @@ def test_extension_capture_search_creates_candidates(tmp_path, monkeypatch):
     assert candidate["company"] == "深圳扩展智能科技有限公司"
 
 
+def test_extension_capture_accepts_chrome_injection_result_array(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "extension-array.sqlite3"))
+
+    from app import main  # noqa: F401
+    from app.db import connect, init_db
+
+    init_db()
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/api/extension/capture",
+        json=[
+            {
+                "frameId": 0,
+                "result": {
+                    "capture_type": "search",
+                    "url": "https://www.zhipin.com/web/geek/job?query=AI",
+                    "title": "AI 招聘",
+                    "text": "AI 应用开发实习生",
+                    "cards": [
+                        {
+                            "href": "https://www.zhipin.com/job_detail/array-1.html",
+                            "title": "AI 应用开发实习生",
+                            "text": "AI 应用开发实习生\n深圳数组智能科技有限公司\n200-300元/天\nPython FastAPI RAG",
+                        }
+                    ],
+                },
+            }
+        ],
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["candidate_count"] == 1
+    with connect() as conn:
+        candidate = conn.execute("SELECT company FROM job_candidates ORDER BY id DESC LIMIT 1").fetchone()
+    assert candidate["company"] == "深圳数组智能科技有限公司"
+
+
 def test_extension_capture_search_uses_current_page_cards(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "extension-search-cards.sqlite3"))
 

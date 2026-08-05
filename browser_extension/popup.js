@@ -17,15 +17,16 @@ async function captureCurrentPage(captureType) {
       throw new Error("没有找到当前标签页。");
     }
 
-    const [{ result }] = await chrome.scripting.executeScript({
+    const injectionResults = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: collectPageData,
       args: [captureType],
     });
+    const pageData = normalizeInjectionResult(injectionResults);
     const response = await fetch(CAPTURE_API_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(result),
+      body: JSON.stringify(pageData),
     });
     const payload = await response.json();
     if (!response.ok || !payload.ok) {
@@ -38,6 +39,17 @@ async function captureCurrentPage(captureType) {
   } finally {
     setBusy(false);
   }
+}
+
+function normalizeInjectionResult(injectionResults) {
+  if (!Array.isArray(injectionResults) || injectionResults.length === 0) {
+    throw new Error("页面采集结果为空，请刷新招聘页面后重试。");
+  }
+  const result = injectionResults.find((item) => item && item.result && typeof item.result === "object")?.result;
+  if (!result || Array.isArray(result)) {
+    throw new Error("页面采集结果异常，请重新加载扩展后重试。");
+  }
+  return result;
 }
 
 function collectPageData(captureType) {
