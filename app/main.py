@@ -22,7 +22,7 @@ from .services.analyzer import (
     score_job,
 )
 from .services.job_fetcher import fetch_job_from_url
-from .services.job_searcher import search_jobs_with_browser
+from .services.job_searcher import capture_current_search_page, open_manual_search_in_edge, search_jobs_with_browser
 from .services.llm import OpenAICompatibleClient, client_for_task
 from .services.research import search_company
 from .services.resume import read_resume_text
@@ -394,6 +394,51 @@ def token_stats() -> dict[str, Any]:
     }
 
 
+def save_search_result(result: Any) -> int:
+    now = utc_now()
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO job_search_runs (
+                platform, keyword, city, search_url, browser_channel, status, note, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                result.platform,
+                result.keyword,
+                result.city,
+                result.search_url,
+                result.browser_channel,
+                "完成" if result.candidates else "无结果",
+                result.note,
+                now,
+            ),
+        )
+        run_id = cursor.lastrowid
+        for candidate in result.candidates:
+            conn.execute(
+                """
+                INSERT INTO job_candidates (
+                    search_run_id, platform, title, company, city, source_url,
+                    summary, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    result.platform,
+                    candidate.title,
+                    candidate.company,
+                    candidate.city,
+                    candidate.source_url,
+                    candidate.summary,
+                    "候选",
+                    now,
+                    now,
+                ),
+            )
+    return int(run_id)
+
+
 @app.get("/")
 def dashboard(request: Request) -> Any:
     with connect() as conn:
@@ -581,48 +626,40 @@ async def create_search_run(request: Request) -> RedirectResponse:
     except Exception as exc:
         return redirect_with_notice("/searches", f"搜索采集失败：{str(exc)[:160]}", "error")
 
-    now = utc_now()
-    with connect() as conn:
-        cursor = conn.execute(
-            """
-            INSERT INTO job_search_runs (
-                platform, keyword, city, search_url, browser_channel, status, note, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                result.platform,
-                result.keyword,
-                result.city,
-                result.search_url,
-                result.browser_channel,
-                "完成" if result.candidates else "无结果",
-                result.note,
-                now,
-            ),
-        )
-        run_id = cursor.lastrowid
-        for candidate in result.candidates:
-            conn.execute(
-                """
-                INSERT INTO job_candidates (
-                    search_run_id, platform, title, company, city, source_url,
-                    summary, status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    run_id,
-                    result.platform,
-                    candidate.title,
-                    candidate.company,
-                    candidate.city,
-                    candidate.source_url,
-                    candidate.summary,
-                    "候选",
-                    now,
-                    now,
-                ),
-            )
+    run_id = save_search_result(result)
     return redirect_with_notice(f"/searches/{run_id}", f"已采集 {len(result.candidates)} 个候选岗位。", "success")
+
+
+@app.post("/searches/open-manual")
+async def open_manual_search(request: Request) -> RedirectResponse:
+    form = await request.form()
+    platform = str(form.get("platform") or "Boss 直聘").strip()
+    keyword = str(form.get("keyword") or "").strip()
+    city = str(form.get("city") or "").strip()
+    if not keyword:
+        return redirect_with_notice("/searches", "请填写搜索关键词。", "error")
+    try:
+        search_url = open_manual_search_in_edge(platform, keyword, city)
+    except Exception as exc:
+        return redirect_with_notice("/searches", f"打开 Edge 失败：{str(exc)[:160]}", "error")
+    return redirect_with_notice("/searches", f"已打开 Edge 搜索页：{search_url}。完成登录或筛选后，点击“采集当前 Edge 页面”。", "success")
+
+
+@app.post("/searches/capture-current")
+async def capture_current_search(request: Request) -> RedirectResponse:
+    form = await request.form()
+    platform = str(form.get("platform") or "Boss 直聘").strip()
+    keyword = str(form.get("keyword") or "").strip()
+    city = str(form.get("city") or "").strip()
+    browser_channel = str(form.get("browser_channel") or "msedge").strip()
+    if not keyword:
+        return redirect_with_notice("/searches", "请填写搜索关键词。", "error")
+    try:
+        result = capture_current_search_page(platform, keyword, city, browser_channel=browser_channel)
+    except Exception as exc:
+        return redirect_with_notice("/searches", f"当前页面采集失败：{str(exc)[:160]}", "error")
+    run_id = save_search_result(result)
+    return redirect_with_notice(f"/searches/{run_id}", f"已从当前 Edge 页面采集 {len(result.candidates)} 个候选岗位。", "success")
 
 
 @app.get("/searches/{run_id}")

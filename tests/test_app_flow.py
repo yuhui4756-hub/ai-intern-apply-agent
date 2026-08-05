@@ -209,3 +209,54 @@ def test_search_run_and_candidate_import_flow(tmp_path, monkeypatch):
     with connect() as conn:
         status = conn.execute("SELECT status FROM job_candidates WHERE id = ?", (candidate_id,)).fetchone()["status"]
     assert status == "已导入"
+
+
+def test_manual_edge_search_capture_flow(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "manual-search.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db
+
+    monkeypatch.setattr(main, "open_manual_search_in_edge", lambda platform, keyword, city: "https://jobs.example.com/search?q=AI")
+    monkeypatch.setattr(
+        main,
+        "capture_current_search_page",
+        lambda platform, keyword, city, browser_channel="msedge": SearchResult(
+            platform=platform,
+            keyword=keyword,
+            city=city,
+            search_url="https://jobs.example.com/current",
+            browser_channel=browser_channel,
+            candidates=[
+                SearchCandidate(
+                    title="AI 应用开发实习生",
+                    company="当前页面智能科技有限公司",
+                    city=city,
+                    source_url="https://jobs.example.com/current/1",
+                    summary="AI 应用开发实习生 Python FastAPI RAG",
+                )
+            ],
+        ),
+    )
+    init_db()
+    client = TestClient(main.app)
+
+    opened = client.post(
+        "/searches/open-manual",
+        data={"platform": "Boss 直聘", "keyword": "AI 应用开发实习", "city": "杭州"},
+        follow_redirects=False,
+    )
+    assert opened.status_code == 303
+    assert "notice=" in opened.headers["location"]
+
+    captured = client.post(
+        "/searches/capture-current",
+        data={"platform": "Boss 直聘", "keyword": "AI 应用开发实习", "city": "杭州", "browser_channel": "msedge"},
+        follow_redirects=False,
+    )
+    assert captured.status_code == 303
+    detail = client.get(captured.headers["location"])
+    assert "当前页面智能科技有限公司" in detail.text
+    with connect() as conn:
+        count = conn.execute("SELECT COUNT(*) AS count FROM job_candidates").fetchone()["count"]
+    assert count == 1

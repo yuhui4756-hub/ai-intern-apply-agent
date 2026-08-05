@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import re
+import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import quote_plus, urljoin, urlparse
 
 from ..config import data_dir
@@ -19,6 +21,7 @@ CITY_CODES = {
     "重庆": "101040100",
     "成都": "101270100",
 }
+EDGE_DEBUG_PORT = 9222
 
 
 @dataclass
@@ -96,17 +99,7 @@ def search_jobs_with_browser(
                 pass
             page.wait_for_timeout(3000)
             final_url = ensure_public_http_url(page.url)
-            anchors = page.locator("a").evaluate_all(
-                """els => els.slice(0, 400).map(a => {
-                    const container = a.closest('li, article, section, div');
-                    return {
-                        href: a.href || '',
-                        text: a.innerText || a.textContent || '',
-                        title: a.title || '',
-                        context: container ? (container.innerText || '') : ''
-                    };
-                })"""
-            )
+            anchors = extract_anchor_dicts_from_page(page)
             context.close()
             context = None
     except ValueError:
@@ -123,6 +116,94 @@ def search_jobs_with_browser(
     candidates = extract_candidates_from_anchors(anchors, platform, city, final_url, limit=limit)
     note = "" if candidates else "没有从当前页面识别到岗位候选，可能需要登录、调整筛选条件或手动打开搜索结果。"
     return SearchResult(platform=platform, keyword=keyword, city=city, search_url=final_url, browser_channel=channel, candidates=candidates, note=note)
+
+
+def open_manual_search_in_edge(platform: str, keyword: str, city: str = "") -> str:
+    search_url = ensure_public_http_url(build_search_url(platform, keyword, city))
+    edge_path = find_edge_executable()
+    if not edge_path:
+        raise ValueError("未找到 Microsoft Edge。")
+    user_data_dir = data_dir() / "browser" / "manual-msedge"
+    user_data_dir.mkdir(parents=True, exist_ok=True)
+    subprocess.Popen(
+        [
+            str(edge_path),
+            f"--remote-debugging-port={EDGE_DEBUG_PORT}",
+            f"--user-data-dir={user_data_dir}",
+            "--no-first-run",
+            search_url,
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return search_url
+
+
+def capture_current_search_page(
+    platform: str,
+    keyword: str,
+    city: str = "",
+    browser_channel: str = "msedge",
+    limit: int = 30,
+) -> SearchResult:
+    channel = normalize_browser_channel(browser_channel)
+    if channel != "msedge":
+        raise ValueError("当前页面采集先支持 Microsoft Edge。")
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise ValueError("当前页面采集需要安装 Playwright：pip install playwright。") from exc
+
+    browser = None
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{EDGE_DEBUG_PORT}")
+            pages = [page for context in browser.contexts for page in context.pages if page.url and page.url != "about:blank"]
+            if not pages:
+                raise ValueError("没有找到可采集的 Edge 页面，请先从应用打开搜索页。")
+            page = pages[-1]
+            final_url = ensure_public_http_url(page.url)
+            anchors = extract_anchor_dicts_from_page(page)
+            browser.close()
+            browser = None
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError("无法连接当前 Edge 页面，请先点击“打开 Edge 搜索页”，完成登录或筛选后再采集。") from exc
+    finally:
+        if browser is not None:
+            browser.close()
+
+    candidates = extract_candidates_from_anchors(anchors, platform, city, final_url, limit=limit)
+    note = "" if candidates else "没有从当前页面识别到岗位候选，可尝试打开搜索结果页或岗位列表页后再采集。"
+    return SearchResult(platform=platform, keyword=keyword, city=city, search_url=final_url, browser_channel=channel, candidates=candidates, note=note)
+
+
+def extract_anchor_dicts_from_page(page) -> list[dict]:
+    return page.locator("a").evaluate_all(
+        """els => els.slice(0, 400).map(a => {
+            const container = a.closest('li, article, section, div');
+            return {
+                href: a.href || '',
+                text: a.innerText || a.textContent || '',
+                title: a.title || '',
+                context: container ? (container.innerText || '') : ''
+            };
+        })"""
+    )
+
+
+def find_edge_executable() -> Path | None:
+    candidates = [
+        Path("C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe"),
+        Path("C:/Program Files/Microsoft/Edge/Application/msedge.exe"),
+    ]
+    local_app_data = Path.home() / "AppData" / "Local" / "Microsoft" / "Edge" / "Application" / "msedge.exe"
+    candidates.append(local_app_data)
+    for path in candidates:
+        if path.exists():
+            return path
+    return None
 
 
 def extract_candidates_from_anchors(
