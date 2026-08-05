@@ -21,18 +21,18 @@
   <div class="form-grid">
     <label>平台
       <select name="platform">
-        <option value="Boss 直聘">Boss 直聘</option>
-        <option value="实习僧">实习僧</option>
-        <option value="猎聘">猎聘</option>
-        <option value="智联招聘">智联招聘</option>
-        <option value="前程无忧">前程无忧</option>
+        <option value="Boss 直聘" {% if search_form.platform == "Boss 直聘" %}selected{% endif %}>Boss 直聘</option>
+        <option value="实习僧" {% if search_form.platform == "实习僧" %}selected{% endif %}>实习僧</option>
+        <option value="猎聘" {% if search_form.platform == "猎聘" %}selected{% endif %}>猎聘</option>
+        <option value="智联招聘" {% if search_form.platform == "智联招聘" %}selected{% endif %}>智联招聘</option>
+        <option value="前程无忧" {% if search_form.platform == "前程无忧" %}selected{% endif %}>前程无忧</option>
       </select>
     </label>
     <label>关键词
-      <input name="keyword" required placeholder="AI 应用开发实习 / Agent 开发实习 / Python RAG">
+      <input name="keyword" required value="{{ search_form.keyword }}" placeholder="AI 应用开发实习 / Agent 开发实习 / Python RAG">
     </label>
     <label>城市
-      <input name="city" placeholder="杭州 / 深圳 / 成都">
+      <input name="city" value="{{ search_form.city }}" placeholder="杭州 / 深圳 / 成都">
     </label>
     <label>浏览器
       <select name="browser_channel">
@@ -44,6 +44,9 @@
     <button class="button" type="submit" formaction="/searches/open-manual">1. 打开 Edge 搜索页</button>
     <button class="button primary" type="submit" formaction="/searches/capture-current">2. 采集当前 Edge 页面</button>
   </div>
+  {% if search_form.search_url %}
+  <p class="muted">上次打开：<a href="{{ search_form.search_url }}" target="_blank" rel="noreferrer">{{ search_form.search_url }}</a></p>
+  {% endif %}
 </form>
 
 <form method="post" action="/searches" class="panel form-stack">
@@ -54,23 +57,23 @@
   <div class="form-grid">
     <label>平台
       <select name="platform">
-        <option value="Boss 直聘">Boss 直聘</option>
-        <option value="实习僧">实习僧</option>
-        <option value="猎聘">猎聘</option>
-        <option value="智联招聘">智联招聘</option>
-        <option value="前程无忧">前程无忧</option>
+        <option value="Boss 直聘" {% if search_form.platform == "Boss 直聘" %}selected{% endif %}>Boss 直聘</option>
+        <option value="实习僧" {% if search_form.platform == "实习僧" %}selected{% endif %}>实习僧</option>
+        <option value="猎聘" {% if search_form.platform == "猎聘" %}selected{% endif %}>猎聘</option>
+        <option value="智联招聘" {% if search_form.platform == "智联招聘" %}selected{% endif %}>智联招聘</option>
+        <option value="前程无忧" {% if search_form.platform == "前程无忧" %}selected{% endif %}>前程无忧</option>
       </select>
     </label>
     <label>关键词
-      <input name="keyword" required placeholder="AI 应用开发实习 / Agent 开发实习 / Python RAG">
+      <input name="keyword" required value="{{ search_form.keyword }}" placeholder="AI 应用开发实习 / Agent 开发实习 / Python RAG">
     </label>
     <label>城市
-      <input name="city" placeholder="杭州 / 深圳 / 成都">
+      <input name="city" value="{{ search_form.city }}" placeholder="杭州 / 深圳 / 成都">
     </label>
     <label>浏览器
       <select name="browser_channel">
-        <option value="msedge">Microsoft Edge</option>
-        <option value="chromium">Chromium</option>
+        <option value="msedge" {% if search_form.browser_channel == "msedge" %}selected{% endif %}>Microsoft Edge</option>
+        <option value="chromium" {% if search_form.browser_channel == "chromium" %}selected{% endif %}>Chromium</option>
       </select>
     </label>
   </div>

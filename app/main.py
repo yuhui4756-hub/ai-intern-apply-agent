@@ -39,6 +39,7 @@ templates = Jinja2Templates(directory=str(ROOT_DIR / "app" / "templates"))
 app.mount("/static", StaticFiles(directory=str(ROOT_DIR / "app" / "static")), name="static")
 
 BULK_IMPORT_LIMIT = 20
+LAST_MANUAL_SEARCH_KEY = "last_manual_search"
 BATCH_SEPARATOR_RE = re.compile(r"(?m)^\s*(?:-{3,}|={3,}|#{3,}|岗位\s*\d+[:：]?)\s*$")
 BATCH_START_MARKERS = [
     re.compile(r"(?m)^\s*公司名称\s*[:：]"),
@@ -289,6 +290,43 @@ def browser_channel_label(value: str) -> str:
         "edge": "Microsoft Edge",
         "chromium": "Chromium",
     }.get(value or "", value or "Microsoft Edge")
+
+
+def search_form_value(form: Any, field: str, fallback: str = "") -> str:
+    raw = form.get(field)
+    if raw is None:
+        return fallback
+    return str(raw).strip()
+
+
+def default_search_form() -> dict[str, str]:
+    saved = get_setting(LAST_MANUAL_SEARCH_KEY, {}) or {}
+    return {
+        "platform": str(saved.get("platform") or "Boss 直聘"),
+        "keyword": str(saved.get("keyword") or ""),
+        "city": str(saved.get("city") or ""),
+        "browser_channel": str(saved.get("browser_channel") or "msedge"),
+        "search_url": str(saved.get("search_url") or ""),
+    }
+
+
+def save_last_manual_search(
+    platform: str,
+    keyword: str,
+    city: str,
+    browser_channel: str = "msedge",
+    search_url: str = "",
+) -> None:
+    set_setting(
+        LAST_MANUAL_SEARCH_KEY,
+        {
+            "platform": platform,
+            "keyword": keyword,
+            "city": city,
+            "browser_channel": browser_channel or "msedge",
+            "search_url": search_url,
+        },
+    )
 
 
 def initial_job_status(jd_text: str, scoring: dict[str, Any]) -> str:
@@ -609,6 +647,7 @@ def new_job_page(request: Request) -> Any:
 
 @app.get("/searches")
 def searches_page(request: Request) -> Any:
+    search_form = default_search_form()
     with connect() as conn:
         runs = conn.execute(
             """
@@ -627,6 +666,7 @@ def searches_page(request: Request) -> Any:
         "searches.html",
         {
             "runs": [{key: row[key] for key in row.keys()} for row in runs],
+            "search_form": search_form,
             "notice": request.query_params.get("notice", ""),
             "notice_type": request.query_params.get("notice_type", "info"),
             "browser_channel_label": browser_channel_label,
@@ -643,6 +683,7 @@ async def create_search_run(request: Request) -> RedirectResponse:
     browser_channel = str(form.get("browser_channel") or "msedge").strip()
     if not keyword:
         return redirect_with_notice("/searches", "请填写搜索关键词。", "error")
+    save_last_manual_search(platform, keyword, city, browser_channel)
 
     try:
         result = search_jobs_with_browser(platform, keyword, city, browser_channel=browser_channel)
@@ -662,23 +703,27 @@ async def open_manual_search(request: Request) -> RedirectResponse:
     city = str(form.get("city") or "").strip()
     if not keyword:
         return redirect_with_notice("/searches", "请填写搜索关键词。", "error")
+    save_last_manual_search(platform, keyword, city, "msedge")
     try:
         search_url = open_manual_search_in_edge(platform, keyword, city)
     except Exception as exc:
         run_id = save_search_failure(platform, keyword, city, "msedge", f"打开 Edge 失败：{str(exc)}")
         return redirect_with_notice(f"/searches/{run_id}", f"打开 Edge 失败：{str(exc)[:160]}", "error")
+    save_last_manual_search(platform, keyword, city, "msedge", search_url)
     return redirect_with_notice("/searches", f"已打开 Edge 搜索页：{search_url}。完成登录或筛选后，点击“采集当前 Edge 页面”。", "success")
 
 
 @app.post("/searches/capture-current")
 async def capture_current_search(request: Request) -> RedirectResponse:
     form = await request.form()
-    platform = str(form.get("platform") or "Boss 直聘").strip()
-    keyword = str(form.get("keyword") or "").strip()
-    city = str(form.get("city") or "").strip()
-    browser_channel = str(form.get("browser_channel") or "msedge").strip()
+    saved = default_search_form()
+    platform = search_form_value(form, "platform", saved["platform"]) or "Boss 直聘"
+    keyword = search_form_value(form, "keyword", saved["keyword"])
+    city = search_form_value(form, "city", saved["city"])
+    browser_channel = search_form_value(form, "browser_channel", saved["browser_channel"]) or "msedge"
     if not keyword:
         return redirect_with_notice("/searches", "请填写搜索关键词。", "error")
+    save_last_manual_search(platform, keyword, city, browser_channel, saved.get("search_url", ""))
     try:
         result = capture_current_search_page(platform, keyword, city, browser_channel=browser_channel)
     except Exception as exc:

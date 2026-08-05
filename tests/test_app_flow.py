@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from fastapi.testclient import TestClient
 
 from app.services.job_fetcher import FetchResult
@@ -248,10 +250,13 @@ def test_manual_edge_search_capture_flow(tmp_path, monkeypatch):
     )
     assert opened.status_code == 303
     assert "notice=" in opened.headers["location"]
+    page_after_open = client.get("/searches")
+    assert 'value="AI 应用开发实习"' in page_after_open.text
+    assert 'value="杭州"' in page_after_open.text
 
     captured = client.post(
         "/searches/capture-current",
-        data={"platform": "Boss 直聘", "keyword": "AI 应用开发实习", "city": "杭州", "browser_channel": "msedge"},
+        data={"browser_channel": "msedge"},
         follow_redirects=False,
     )
     assert captured.status_code == 303
@@ -259,7 +264,39 @@ def test_manual_edge_search_capture_flow(tmp_path, monkeypatch):
     assert "当前页面智能科技有限公司" in detail.text
     with connect() as conn:
         count = conn.execute("SELECT COUNT(*) AS count FROM job_candidates").fetchone()["count"]
+        run = conn.execute("SELECT keyword, city FROM job_search_runs ORDER BY id DESC LIMIT 1").fetchone()
     assert count == 1
+    assert run["keyword"] == "AI 应用开发实习"
+    assert run["city"] == "杭州"
+
+
+def test_manual_edge_search_launch_uses_debug_profile(tmp_path, monkeypatch):
+    from app.services import job_searcher
+
+    launched = []
+
+    class DummyProcess:
+        pass
+
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.setattr(job_searcher, "find_edge_executable", lambda: Path("C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe"))
+    monkeypatch.setattr(job_searcher, "is_debug_endpoint_ready", lambda timeout_seconds=1: False)
+    monkeypatch.setattr(job_searcher, "wait_for_debug_endpoint", lambda timeout_seconds=8: True)
+    monkeypatch.setattr(
+        job_searcher.subprocess,
+        "Popen",
+        lambda args, **kwargs: launched.append((args, kwargs)) or DummyProcess(),
+    )
+
+    search_url = job_searcher.open_manual_search_in_edge("Boss 直聘", "AI 应用开发实习", "深圳")
+
+    assert search_url.startswith("https://www.zhipin.com/")
+    args, kwargs = launched[0]
+    assert f"--remote-debugging-port={job_searcher.EDGE_DEBUG_PORT}" in args
+    assert "--remote-allow-origins=*" in args
+    assert "--new-window" in args
+    assert any(str(tmp_path / "AIInternApplyAgent" / "browser" / "manual-msedge") in arg for arg in args)
+    assert kwargs["stdout"] == job_searcher.subprocess.DEVNULL
 
 
 def test_failed_auto_search_creates_failed_run(tmp_path, monkeypatch):

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import os
 import re
 import subprocess
+import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote_plus, urljoin, urlparse
@@ -123,19 +127,30 @@ def open_manual_search_in_edge(platform: str, keyword: str, city: str = "") -> s
     edge_path = find_edge_executable()
     if not edge_path:
         raise ValueError("未找到 Microsoft Edge。")
-    user_data_dir = data_dir() / "browser" / "manual-msedge"
+
+    if is_debug_endpoint_ready():
+        open_url_in_debug_browser(search_url)
+        return search_url
+
+    user_data_dir = browser_profile_dir("manual-msedge")
     user_data_dir.mkdir(parents=True, exist_ok=True)
+    launch_args = [
+        str(edge_path),
+        f"--remote-debugging-port={EDGE_DEBUG_PORT}",
+        "--remote-allow-origins=*",
+        f"--user-data-dir={user_data_dir}",
+        "--no-first-run",
+        "--new-window",
+        search_url,
+    ]
     subprocess.Popen(
-        [
-            str(edge_path),
-            f"--remote-debugging-port={EDGE_DEBUG_PORT}",
-            f"--user-data-dir={user_data_dir}",
-            "--no-first-run",
-            search_url,
-        ],
+        launch_args,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
     )
+    if not wait_for_debug_endpoint():
+        raise ValueError("Edge 已尝试打开，但 9222 调试端口没有响应。请关闭刚打开的专用 Edge 窗口后再试。")
     return search_url
 
 
@@ -157,11 +172,17 @@ def capture_current_search_page(
     browser = None
     try:
         with sync_playwright() as playwright:
-            browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{EDGE_DEBUG_PORT}")
+            if not wait_for_debug_endpoint(timeout_seconds=3):
+                raise ValueError("没有检测到应用打开的 Edge 调试窗口，请先点击“打开 Edge 搜索页”。")
+            browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{EDGE_DEBUG_PORT}", timeout=8000)
             pages = [page for context in browser.contexts for page in context.pages if page.url and page.url != "about:blank"]
             if not pages:
                 raise ValueError("没有找到可采集的 Edge 页面，请先从应用打开搜索页。")
-            page = pages[-1]
+            page = pick_search_page(pages, platform)
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=3000)
+            except Exception:
+                pass
             final_url = ensure_public_http_url(page.url)
             anchors = extract_anchor_dicts_from_page(page)
             browser.close()
@@ -169,7 +190,8 @@ def capture_current_search_page(
     except ValueError:
         raise
     except Exception as exc:
-        raise ValueError("无法连接当前 Edge 页面，请先点击“打开 Edge 搜索页”，完成登录或筛选后再采集。") from exc
+        message = str(exc).strip() or exc.__class__.__name__
+        raise ValueError(f"无法连接当前 Edge 页面：{message[:160]}。请先点击“打开 Edge 搜索页”，完成登录或筛选后再采集。") from exc
     finally:
         if browser is not None:
             browser.close()
@@ -177,6 +199,66 @@ def capture_current_search_page(
     candidates = extract_candidates_from_anchors(anchors, platform, city, final_url, limit=limit)
     note = "" if candidates else "没有从当前页面识别到岗位候选，可尝试打开搜索结果页或岗位列表页后再采集。"
     return SearchResult(platform=platform, keyword=keyword, city=city, search_url=final_url, browser_channel=channel, candidates=candidates, note=note)
+
+
+def browser_profile_dir(name: str) -> Path:
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        return Path(local_app_data) / "AIInternApplyAgent" / "browser" / name
+    return data_dir() / "browser" / name
+
+
+def debug_endpoint_url(path: str = "/json/version") -> str:
+    return f"http://127.0.0.1:{EDGE_DEBUG_PORT}{path}"
+
+
+def is_debug_endpoint_ready(timeout_seconds: float = 1) -> bool:
+    try:
+        with urllib.request.urlopen(debug_endpoint_url(), timeout=timeout_seconds) as response:
+            return response.status == 200
+    except (OSError, urllib.error.URLError, TimeoutError):
+        return False
+
+
+def wait_for_debug_endpoint(timeout_seconds: float = 8) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if is_debug_endpoint_ready(timeout_seconds=0.5):
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def open_url_in_debug_browser(url: str) -> None:
+    request = urllib.request.Request(debug_endpoint_url(f"/json/new?{quote_plus(url)}"), method="PUT")
+    try:
+        urllib.request.urlopen(request, timeout=2).close()
+    except (OSError, urllib.error.URLError, TimeoutError):
+        pass
+
+
+def pick_search_page(pages: list, platform: str):
+    signals = platform_url_signals(platform)
+    for page in reversed(pages):
+        lowered = (page.url or "").lower()
+        if any(signal in lowered for signal in signals):
+            return page
+    return pages[-1]
+
+
+def platform_url_signals(platform: str) -> list[str]:
+    platform_key = (platform or "").strip().lower()
+    if platform_key in {"boss", "boss直聘", "zhipin", "boss 直聘"}:
+        return ["zhipin.com"]
+    if platform_key in {"实习僧", "shixiseng"}:
+        return ["shixiseng.com"]
+    if platform_key in {"猎聘", "liepin"}:
+        return ["liepin.com"]
+    if platform_key in {"智联招聘", "zhaopin"}:
+        return ["zhaopin.com"]
+    if platform_key in {"前程无忧", "51job"}:
+        return ["51job.com"]
+    return []
 
 
 def extract_anchor_dicts_from_page(page) -> list[dict]:
