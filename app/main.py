@@ -5,7 +5,7 @@ import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
@@ -428,6 +428,124 @@ def create_job_record(
     return job_id, analysis
 
 
+def comparable_source_url(url: str) -> set[str]:
+    parsed = urlparse((url or "").strip())
+    if not parsed.scheme or not parsed.netloc:
+        return set()
+    path = parsed.path.rstrip("/") or parsed.path or "/"
+    exact = urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path.rstrip("/") or parsed.path, "", parsed.query, ""))
+    without_query = urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), path, "", "", ""))
+    return {exact, without_query}
+
+
+def same_source_url(left: str, right: str) -> bool:
+    return bool(comparable_source_url(left) & comparable_source_url(right))
+
+
+def find_existing_job_by_source_url(conn: Any, source_url: str) -> Any | None:
+    for row in conn.execute("SELECT * FROM job_postings WHERE source_url != '' ORDER BY id DESC LIMIT 500").fetchall():
+        if same_source_url(row["source_url"], source_url):
+            return row
+    return None
+
+
+def link_candidates_to_job(conn: Any, source_url: str, job_id: int) -> int:
+    now = utc_now()
+    matched_ids = [
+        int(row["id"])
+        for row in conn.execute("SELECT id, source_url FROM job_candidates WHERE source_url != '' ORDER BY id DESC LIMIT 1000").fetchall()
+        if same_source_url(row["source_url"], source_url)
+    ]
+    if not matched_ids:
+        return 0
+    placeholders = ",".join("?" for _ in matched_ids)
+    conn.execute(
+        f"UPDATE job_candidates SET job_id = ?, status = ?, error_message = '', updated_at = ? WHERE id IN ({placeholders})",
+        (job_id, "已导入", now, *matched_ids),
+    )
+    return len(matched_ids)
+
+
+def refresh_job_record(
+    conn: Any,
+    job_id: int,
+    *,
+    jd_text: str,
+    resume_id: int | None,
+    platform: str = "",
+    source_url: str = "",
+    title: str = "",
+    company: str = "",
+    city: str = "",
+    salary_text: str = "",
+    search_depth: str = "auto",
+    generate_messages: bool = True,
+) -> dict[str, Any]:
+    existing = conn.execute("SELECT * FROM job_postings WHERE id = ?", (job_id,)).fetchone()
+    if not existing:
+        raise ValueError("没有找到要刷新的岗位。")
+    analysis = analyze_job_payload(
+        jd_text,
+        resume_id,
+        title=title,
+        company=company,
+        city=city,
+        salary_text=salary_text,
+        search_depth=search_depth,
+        generate_messages=generate_messages,
+    )
+    extracted = analysis["extracted"]
+    scoring = analysis["scoring"]
+    messages = analysis["messages"]
+    status = existing["status"] or "待确认"
+    if status in {"待分析", "待确认", "已归档"}:
+        status = initial_job_status(jd_text, scoring)
+
+    now = utc_now()
+    conn.execute("DELETE FROM company_research WHERE job_id = ?", (job_id,))
+    conn.execute(
+        """
+        UPDATE job_postings
+        SET platform = ?, source_url = ?, title = ?, company = ?, city = ?, salary_text = ?,
+            internship_days = ?, internship_duration = ?, jd_text = ?, extracted_json = ?,
+            selected_resume_id = ?, match_score = ?, match_level = ?, risk_level = ?,
+            recommendation = ?, status = ?, skip_reason = ?, generated_message = ?,
+            generated_email = ?, analysis_error = ?, analysis_source = ?, search_depth = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (
+            platform or existing["platform"],
+            source_url or existing["source_url"],
+            extracted.get("title") or "",
+            extracted.get("company") or company,
+            extracted.get("city") or "",
+            extracted.get("salary_text") or "",
+            extracted.get("internship_days") or "",
+            extracted.get("internship_duration") or "",
+            jd_text,
+            dumps({"extracted": extracted, "scoring": scoring}),
+            resume_id or existing["selected_resume_id"],
+            scoring["score"] if jd_text else 0,
+            scoring["level"] if jd_text else "",
+            scoring["risk_level"] if jd_text else "",
+            scoring["recommendation"] if jd_text else "",
+            status,
+            scoring["skip_reason"] if jd_text else "",
+            messages["message"] if jd_text else "",
+            messages["email"] if jd_text else "",
+            analysis["analysis_error"],
+            analysis["analysis_source"],
+            analysis["search_depth"],
+            now,
+            job_id,
+        ),
+    )
+    company_name = extracted.get("company") or company
+    if jd_text and company_name:
+        insert_company_research(conn, job_id, company_name, extracted.get("title") or "", extracted.get("city") or "", analysis["search_depth"])
+    return analysis
+
+
 def token_stats() -> dict[str, Any]:
     with connect() as conn:
         today = conn.execute(
@@ -607,22 +725,49 @@ def create_job_from_extension(payload: dict[str, Any]) -> dict[str, Any] | JSONR
     with connect() as conn:
         default_resume = conn.execute("SELECT id FROM resume_versions WHERE is_default = 1 ORDER BY id LIMIT 1").fetchone()
         resume_id = int(default_resume["id"]) if default_resume else None
-        job_id, _analysis = create_job_record(
-            conn,
-            jd_text=jd_text,
-            resume_id=resume_id,
-            platform=platform,
-            source_url=url,
-            title=title,
-            search_depth="auto",
-            generate_messages=False,
-        )
+        existing_job = find_existing_job_by_source_url(conn, url)
+        if existing_job:
+            job_id = int(existing_job["id"])
+            refresh_job_record(
+                conn,
+                job_id,
+                jd_text=jd_text,
+                resume_id=resume_id,
+                platform=platform,
+                source_url=url,
+                title=title,
+                search_depth="auto",
+                generate_messages=False,
+            )
+            event_type = "浏览器扩展刷新"
+            event_content = f"从浏览器扩展采集当前岗位详情并刷新已有岗位：{url}"
+        else:
+            job_id, _analysis = create_job_record(
+                conn,
+                jd_text=jd_text,
+                resume_id=resume_id,
+                platform=platform,
+                source_url=url,
+                title=title,
+                search_depth="auto",
+                generate_messages=False,
+            )
+            event_type = "浏览器扩展采集"
+            event_content = f"从浏览器扩展采集当前岗位页面：{url}"
+        linked_count = link_candidates_to_job(conn, url, job_id)
         conn.execute(
             "INSERT INTO application_events (job_id, event_type, content, created_at) VALUES (?, ?, ?, ?)",
-            (job_id, "浏览器扩展采集", f"从浏览器扩展采集当前岗位页面：{url}", utc_now()),
+            (job_id, event_type, event_content, utc_now()),
         )
 
-    return {"ok": True, "capture_type": "job", "job_id": job_id, "redirect_url": f"/jobs/{job_id}"}
+    return {
+        "ok": True,
+        "capture_type": "job",
+        "job_id": job_id,
+        "updated": bool(existing_job),
+        "linked_candidate_count": linked_count,
+        "redirect_url": f"/jobs/{job_id}",
+    }
 
 
 def create_search_from_extension(payload: dict[str, Any]) -> dict[str, Any] | JSONResponse:
@@ -1002,18 +1147,39 @@ async def import_candidate(candidate_id: int, request: Request) -> RedirectRespo
     try:
         fetched = await run_in_threadpool(fetch_job_from_url, candidate["source_url"], fetch_mode=fetch_mode, browser_channel=channel)
         with connect() as conn:
-            job_id, _analysis = create_job_record(
-                conn,
-                jd_text=fetched.text,
-                resume_id=resume_id,
-                platform=candidate.get("platform") or infer_platform_from_url(fetched.final_url),
-                source_url=fetched.final_url,
-                title=fetched.title or candidate.get("title") or "",
-                company=candidate.get("company") or "",
-                city=candidate.get("city") or "",
-                search_depth=requested_depth,
-                generate_messages=candidate.get("run_browser_channel") != "extension",
-            )
+            existing_job = find_existing_job_by_source_url(conn, fetched.final_url)
+            if existing_job:
+                job_id = int(existing_job["id"])
+                refresh_job_record(
+                    conn,
+                    job_id,
+                    jd_text=fetched.text,
+                    resume_id=resume_id,
+                    platform=candidate.get("platform") or infer_platform_from_url(fetched.final_url),
+                    source_url=fetched.final_url,
+                    title=fetched.title or candidate.get("title") or "",
+                    company=candidate.get("company") or "",
+                    city=candidate.get("city") or "",
+                    search_depth=requested_depth,
+                    generate_messages=candidate.get("run_browser_channel") != "extension",
+                )
+                event_type = "搜索候选刷新"
+                event_content = f"从搜索候选 {candidate.get('source_url')} 刷新已有岗位详情。"
+            else:
+                job_id, _analysis = create_job_record(
+                    conn,
+                    jd_text=fetched.text,
+                    resume_id=resume_id,
+                    platform=candidate.get("platform") or infer_platform_from_url(fetched.final_url),
+                    source_url=fetched.final_url,
+                    title=fetched.title or candidate.get("title") or "",
+                    company=candidate.get("company") or "",
+                    city=candidate.get("city") or "",
+                    search_depth=requested_depth,
+                    generate_messages=candidate.get("run_browser_channel") != "extension",
+                )
+                event_type = "搜索候选导入"
+                event_content = f"从搜索候选 {candidate.get('source_url')} 导入岗位详情。"
             now = utc_now()
             conn.execute(
                 "UPDATE job_candidates SET job_id = ?, status = ?, error_message = '', updated_at = ? WHERE id = ?",
@@ -1021,7 +1187,7 @@ async def import_candidate(candidate_id: int, request: Request) -> RedirectRespo
             )
             conn.execute(
                 "INSERT INTO application_events (job_id, event_type, content, created_at) VALUES (?, ?, ?, ?)",
-                (job_id, "搜索候选导入", f"从搜索候选 {candidate.get('source_url')} 导入岗位详情。", now),
+                (job_id, event_type, event_content, now),
             )
         return redirect_with_notice(f"/jobs/{job_id}", f"已从候选岗位导入并通过{fetch_mode_label(fetched.fetch_mode)}完成分析。", "success")
     except Exception as exc:
@@ -1029,19 +1195,37 @@ async def import_candidate(candidate_id: int, request: Request) -> RedirectRespo
         if len(fallback_text) >= 40:
             fetch_error = str(exc)[:300]
             with connect() as conn:
-                job_id, _analysis = create_job_record(
-                    conn,
-                    jd_text=fallback_text,
-                    resume_id=resume_id,
-                    platform=candidate.get("platform") or infer_platform_from_url(candidate.get("source_url") or ""),
-                    source_url=candidate.get("source_url") or "",
-                    title=candidate.get("title") or "",
-                    company=candidate.get("company") or "",
-                    city=candidate.get("city") or "",
-                    salary_text=extract_salary(candidate.get("summary") or ""),
-                    search_depth=requested_depth,
-                    generate_messages=False,
-                )
+                existing_job = find_existing_job_by_source_url(conn, candidate.get("source_url") or "")
+                if existing_job:
+                    job_id = int(existing_job["id"])
+                    refresh_job_record(
+                        conn,
+                        job_id,
+                        jd_text=fallback_text,
+                        resume_id=resume_id,
+                        platform=candidate.get("platform") or infer_platform_from_url(candidate.get("source_url") or ""),
+                        source_url=candidate.get("source_url") or "",
+                        title=candidate.get("title") or "",
+                        company=candidate.get("company") or "",
+                        city=candidate.get("city") or "",
+                        salary_text=extract_salary(candidate.get("summary") or ""),
+                        search_depth=requested_depth,
+                        generate_messages=False,
+                    )
+                else:
+                    job_id, _analysis = create_job_record(
+                        conn,
+                        jd_text=fallback_text,
+                        resume_id=resume_id,
+                        platform=candidate.get("platform") or infer_platform_from_url(candidate.get("source_url") or ""),
+                        source_url=candidate.get("source_url") or "",
+                        title=candidate.get("title") or "",
+                        company=candidate.get("company") or "",
+                        city=candidate.get("city") or "",
+                        salary_text=extract_salary(candidate.get("summary") or ""),
+                        search_depth=requested_depth,
+                        generate_messages=False,
+                    )
                 now = utc_now()
                 conn.execute(
                     "UPDATE job_candidates SET job_id = ?, status = ?, error_message = ?, updated_at = ? WHERE id = ?",

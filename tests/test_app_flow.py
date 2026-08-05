@@ -360,6 +360,83 @@ def test_extension_candidate_import_falls_back_to_search_summary(tmp_path, monke
     assert job["generated_message"] == ""
 
 
+def test_extension_job_capture_refreshes_existing_candidate_job(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "extension-refresh-existing.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db
+
+    monkeypatch.setattr(main, "search_company", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        main,
+        "fetch_job_from_url",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("详情页需要登录")),
+    )
+    init_db()
+    client = TestClient(main.app)
+    source_url = "https://www.zhipin.com/job_detail/refresh-1.html"
+
+    capture = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "search",
+            "url": "https://www.zhipin.com/web/geek/job?query=AI",
+            "title": "AI 招聘",
+            "text": "AI 应用开发实习生",
+            "cards": [
+                {
+                    "href": source_url,
+                    "title": "AI 应用开发实习生",
+                    "text": "AI 应用开发实习生\n深圳回填智能科技有限公司\n200-300元/天\nPython FastAPI RAG",
+                }
+            ],
+        },
+    )
+    assert capture.status_code == 200
+    with connect() as conn:
+        candidate_id = conn.execute("SELECT id FROM job_candidates ORDER BY id DESC LIMIT 1").fetchone()["id"]
+
+    fallback_import = client.post(
+        f"/candidates/{candidate_id}/import",
+        data={"selected_resume_id": "1", "fetch_mode": "auto", "browser_channel": "extension"},
+        follow_redirects=False,
+    )
+    assert fallback_import.status_code == 303
+    with connect() as conn:
+        first_job = conn.execute("SELECT id, jd_text FROM job_postings WHERE source_url = ?", (source_url,)).fetchone()
+    assert "搜索结果摘要" in first_job["jd_text"]
+
+    refresh = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "job",
+            "url": source_url + "?securityId=abc",
+            "title": "AI 应用开发实习生",
+            "text": "公司名称：深圳回填智能科技有限公司\n岗位职责：负责 RAG 知识库和 Agent 工具调用。\n任职要求：Python、FastAPI、SQLite，每周 5 天。",
+            "links": [],
+        },
+    )
+
+    assert refresh.status_code == 200
+    payload = refresh.json()
+    assert payload["ok"] is True
+    assert payload["job_id"] == first_job["id"]
+    assert payload["updated"] is True
+    assert payload["linked_candidate_count"] == 1
+    with connect() as conn:
+        job_count = conn.execute("SELECT COUNT(*) AS count FROM job_postings WHERE source_url LIKE ?", ("https://www.zhipin.com/job_detail/refresh-1.html%",)).fetchone()["count"]
+        job = conn.execute("SELECT jd_text, generated_message FROM job_postings WHERE id = ?", (first_job["id"],)).fetchone()
+        candidate = conn.execute("SELECT job_id, status, error_message FROM job_candidates WHERE id = ?", (candidate_id,)).fetchone()
+        event = conn.execute("SELECT event_type FROM application_events WHERE job_id = ? ORDER BY id DESC LIMIT 1", (first_job["id"],)).fetchone()
+    assert job_count == 1
+    assert "岗位职责：负责 RAG 知识库和 Agent 工具调用" in job["jd_text"]
+    assert job["generated_message"] == ""
+    assert candidate["job_id"] == first_job["id"]
+    assert candidate["status"] == "已导入"
+    assert candidate["error_message"] == ""
+    assert event["event_type"] == "浏览器扩展刷新"
+
+
 def test_analysis_prefers_rule_salary_over_bad_llm_salary(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "salary-guard.sqlite3"))
 
