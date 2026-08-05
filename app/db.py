@@ -169,6 +169,36 @@ def init_db() -> None:
                 FOREIGN KEY(job_id) REFERENCES job_postings(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS conversation_captures (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER,
+                platform TEXT NOT NULL DEFAULT '',
+                source_url TEXT NOT NULL DEFAULT '',
+                page_title TEXT NOT NULL DEFAULT '',
+                conversation_text TEXT NOT NULL DEFAULT '',
+                message_type TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                action_required INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(job_id) REFERENCES job_postings(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS message_drafts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                capture_id INTEGER,
+                job_id INTEGER,
+                platform TEXT NOT NULL DEFAULT '',
+                draft_type TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT '待确认',
+                reason TEXT NOT NULL DEFAULT '',
+                message TEXT NOT NULL DEFAULT '',
+                risk_flags_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(capture_id) REFERENCES conversation_captures(id) ON DELETE SET NULL,
+                FOREIGN KEY(job_id) REFERENCES job_postings(id) ON DELETE SET NULL
+            );
+
             CREATE TABLE IF NOT EXISTS interview_preparations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 job_id INTEGER,

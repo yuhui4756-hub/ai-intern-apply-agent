@@ -24,6 +24,7 @@ from .services.analyzer import (
     rule_extract_jd,
     score_job,
 )
+from .services.conversation import classify_conversation, compact_conversation_text
 from .services.job_fetcher import ensure_public_http_url, fetch_job_from_url, normalize_visible_text
 from .services.job_searcher import (
     SearchResult,
@@ -707,6 +708,145 @@ def extension_candidate_sources(payload: dict[str, Any]) -> list[dict[str, str]]
     return [*extension_cards(payload), *extension_anchors(payload)]
 
 
+def find_job_for_conversation(conn: Any, source_url: str, text: str) -> dict[str, Any] | None:
+    existing = find_existing_job_by_source_url(conn, source_url)
+    if existing:
+        return {key: existing[key] for key in existing.keys()}
+    clean_text = text or ""
+    rows = conn.execute("SELECT * FROM job_postings ORDER BY updated_at DESC, id DESC LIMIT 300").fetchall()
+    for row in rows:
+        title = str(row["title"] or "")
+        company = str(row["company"] or "")
+        if title and title in clean_text:
+            return {key: row[key] for key in row.keys()}
+        if company and company in clean_text:
+            return {key: row[key] for key in row.keys()}
+    return None
+
+
+def try_llm_conversation_decision(text: str, job: dict[str, Any] | None, fallback: dict[str, Any]) -> dict[str, Any]:
+    client = client_for_task("hr_reply_classify")
+    if not client or not client.configured:
+        return fallback
+    prompt = (
+        "你是求职 Agent 的 HR 对话分类器。只输出 JSON。"
+        "字段：message_type, summary, action_required(boolean), reason, draft_message, risk_flags(array)。"
+        "如果涉及面试/笔试/约时间，message_type=面试邀请，不要替候选人约时间。"
+        "如果涉及简历、联系方式、身份证、银行卡、押金、培训费、贷款、薪资谈判或无关内容，action_required=true 且 draft_message 为空。"
+        "普通岗位相关问题可生成礼貌、学生真诚、不夸大的中文草稿。"
+    )
+    try:
+        result = client.complete_json(
+            [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": dumps({"job": job or {}, "conversation": text[:12000], "fallback": fallback})},
+            ]
+        )
+    except Exception as exc:
+        client.log_error(str(exc))
+        return fallback
+
+    merged = dict(fallback)
+    allowed_types = {"岗位沟通", "面试邀请", "需要我处理", "无关内容"}
+    result_type = str(result.get("message_type") or "").strip()
+    if result_type and result_type not in allowed_types:
+        return fallback
+    for key in ["message_type", "summary", "reason", "draft_message"]:
+        if isinstance(result.get(key), str):
+            merged[key] = result[key].strip()
+    if isinstance(result.get("action_required"), bool):
+        merged["action_required"] = result["action_required"]
+    if isinstance(result.get("risk_flags"), list):
+        merged["risk_flags"] = [str(item).strip() for item in result["risk_flags"] if str(item).strip()]
+    if merged.get("action_required") and merged.get("message_type") != "岗位沟通":
+        merged["draft_message"] = ""
+    return merged
+
+
+def create_conversation_from_extension(payload: dict[str, Any]) -> dict[str, Any] | JSONResponse:
+    raw_url = payload_text(payload, "url", 1000)
+    if not raw_url:
+        return api_error("缺少当前对话页面 URL。")
+    try:
+        url = ensure_public_http_url(raw_url)
+    except ValueError as exc:
+        return api_error(str(exc))
+
+    title = payload_text(payload, "title", 300)
+    platform = extension_platform(url, payload_text(payload, "platform", 80))
+    conversation_text = compact_conversation_text(str(payload.get("text") or ""))
+    if len(conversation_text) < 20:
+        return api_error("当前页面可见对话文本太短，无法分析。")
+
+    with connect() as conn:
+        job = find_job_for_conversation(conn, url, conversation_text)
+        decision = classify_conversation(conversation_text, job)
+        decision = try_llm_conversation_decision(conversation_text, job, decision)
+        now = utc_now()
+        job_id = int(job["id"]) if job else None
+        cursor = conn.execute(
+            """
+            INSERT INTO conversation_captures (
+                job_id, platform, source_url, page_title, conversation_text,
+                message_type, summary, action_required, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                job_id,
+                platform,
+                url,
+                title,
+                conversation_text,
+                str(decision.get("message_type") or ""),
+                str(decision.get("summary") or ""),
+                1 if decision.get("action_required") else 0,
+                now,
+            ),
+        )
+        capture_id = int(cursor.lastrowid)
+        draft_id = None
+        draft_message = str(decision.get("draft_message") or "").strip()
+        risk_flags = list(decision.get("risk_flags") or [])
+        draft_status = "待确认" if draft_message else "需要我处理"
+        if draft_message or decision.get("action_required"):
+            draft_cursor = conn.execute(
+                """
+                INSERT INTO message_drafts (
+                    capture_id, job_id, platform, draft_type, status, reason,
+                    message, risk_flags_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    capture_id,
+                    job_id,
+                    platform,
+                    str(decision.get("message_type") or "岗位沟通"),
+                    draft_status,
+                    str(decision.get("reason") or ""),
+                    draft_message,
+                    dumps(risk_flags),
+                    now,
+                    now,
+                ),
+            )
+            draft_id = int(draft_cursor.lastrowid)
+        if job_id and decision.get("message_type") == "面试邀请":
+            conn.execute("UPDATE job_postings SET status = ?, updated_at = ? WHERE id = ?", ("面试邀请", now, job_id))
+            conn.execute(
+                "INSERT INTO application_events (job_id, event_type, content, created_at) VALUES (?, ?, ?, ?)",
+                (job_id, "面试邀请识别", str(decision.get("summary") or "HR 对话中提到面试或笔试。"), now),
+            )
+
+    return {
+        "ok": True,
+        "capture_type": "conversation",
+        "capture_id": capture_id,
+        "draft_id": draft_id,
+        "message_type": decision.get("message_type"),
+        "redirect_url": "/communications",
+    }
+
+
 def create_job_from_extension(payload: dict[str, Any]) -> dict[str, Any] | JSONResponse:
     raw_url = payload_text(payload, "url", 1000)
     if not raw_url:
@@ -859,7 +999,9 @@ async def extension_capture(request: Request) -> Any:
         return create_job_from_extension(payload)
     if capture_type == "search":
         return create_search_from_extension(payload)
-    return api_error("capture_type 必须是 job 或 search。")
+    if capture_type == "conversation":
+        return create_conversation_from_extension(payload)
+    return api_error("capture_type 必须是 job、search 或 conversation。")
 
 
 @app.get("/")
@@ -987,6 +1129,66 @@ def jobs_page(request: Request, status: str = "") -> Any:
             "notice_type": request.query_params.get("notice_type", "info"),
         },
     )
+
+
+@app.get("/communications")
+def communications_page(request: Request) -> Any:
+    with connect() as conn:
+        drafts = conn.execute(
+            """
+            SELECT d.*, j.title AS job_title, j.company AS company, j.status AS job_status
+            FROM message_drafts d
+            LEFT JOIN job_postings j ON j.id = d.job_id
+            ORDER BY d.created_at DESC
+            LIMIT 100
+            """
+        ).fetchall()
+        captures = conn.execute(
+            """
+            SELECT c.*, j.title AS job_title, j.company AS company
+            FROM conversation_captures c
+            LEFT JOIN job_postings j ON j.id = c.job_id
+            ORDER BY c.created_at DESC
+            LIMIT 50
+            """
+        ).fetchall()
+        draft_counts = conn.execute("SELECT status, COUNT(*) AS count FROM message_drafts GROUP BY status").fetchall()
+    return templates.TemplateResponse(
+        request,
+        "communications.html",
+        {
+            "drafts": [{key: row[key] for key in row.keys()} for row in drafts],
+            "captures": [{key: row[key] for key in row.keys()} for row in captures],
+            "draft_counts": {row["status"]: row["count"] for row in draft_counts},
+            "loads": loads,
+            "notice": request.query_params.get("notice", ""),
+            "notice_type": request.query_params.get("notice_type", "info"),
+        },
+    )
+
+
+@app.post("/message-drafts/{draft_id}")
+async def update_message_draft(draft_id: int, request: Request) -> RedirectResponse:
+    form = await request.form()
+    status = str(form.get("status") or "待确认").strip()
+    message = str(form.get("message") or "").strip()
+    allowed = {"待确认", "已发送", "已驳回", "需要我处理"}
+    if status not in allowed:
+        return redirect_with_notice("/communications", "草稿状态无效。", "error")
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM message_drafts WHERE id = ?", (draft_id,)).fetchone()
+        if not row:
+            return redirect_with_notice("/communications", "没有找到草稿。", "error")
+        conn.execute(
+            "UPDATE message_drafts SET status = ?, message = ?, updated_at = ? WHERE id = ?",
+            (status, message, utc_now(), draft_id),
+        )
+        if row["job_id"] and status == "已发送":
+            conn.execute(
+                "INSERT INTO application_events (job_id, event_type, content, created_at) VALUES (?, ?, ?, ?)",
+                (row["job_id"], "沟通草稿已发送", message[:500], utc_now()),
+            )
+    return redirect_with_notice("/communications", "草稿已更新。", "success")
 
 
 @app.get("/jobs/new")
@@ -1348,7 +1550,7 @@ async def bulk_update_jobs(request: Request) -> RedirectResponse:
     form = await request.form()
     job_ids = [int(value) for value in form.getlist("job_ids") if str(value).isdigit()]
     status = str(form.get("status") or "").strip()
-    allowed_statuses = {"待确认", "待投递", "已投递", "已沟通", "待面试", "面试准备中", "已归档"}
+    allowed_statuses = {"待确认", "待投递", "已投递", "已沟通", "面试邀请", "待面试", "面试准备中", "已归档"}
     if not job_ids:
         return redirect_with_notice("/jobs", "请先选择岗位。", "error")
     if status not in allowed_statuses:

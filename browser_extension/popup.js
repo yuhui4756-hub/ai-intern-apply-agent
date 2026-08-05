@@ -5,9 +5,11 @@ const statusBadge = document.getElementById("statusBadge");
 const resultBox = document.getElementById("result");
 const captureJobButton = document.getElementById("captureJob");
 const captureSearchButton = document.getElementById("captureSearch");
+const captureConversationButton = document.getElementById("captureConversation");
 
 captureJobButton.addEventListener("click", () => captureCurrentPage("job"));
 captureSearchButton.addEventListener("click", () => captureCurrentPage("search"));
+captureConversationButton.addEventListener("click", () => captureCurrentPage("conversation"));
 
 async function captureCurrentPage(captureType) {
   setBusy(true, "采集中");
@@ -145,7 +147,11 @@ function collectPageData(captureType) {
 function renderSuccess(payload) {
   statusBadge.textContent = "已采集";
   const sourceText = payload.source_count ? `，读取 ${payload.source_count} 条当前页链接/卡片` : "";
-  const label = payload.capture_type === "job" ? "岗位详情" : `搜索结果：${payload.candidate_count || 0} 个候选${sourceText}`;
+  const labels = {
+    job: "岗位详情",
+    conversation: `当前对话：${payload.message_type || "已分析"}`,
+  };
+  const label = labels[payload.capture_type] || `搜索结果：${payload.candidate_count || 0} 个候选${sourceText}`;
   const targetUrl = `${APP_BASE_URL}${payload.redirect_url}`;
   resultBox.className = "result";
   resultBox.innerHTML = `
@@ -163,6 +169,7 @@ function renderError(message) {
 function setBusy(isBusy, label = "未采集") {
   captureJobButton.disabled = isBusy;
   captureSearchButton.disabled = isBusy;
+  captureConversationButton.disabled = isBusy;
   if (isBusy) {
     statusBadge.textContent = label;
   }

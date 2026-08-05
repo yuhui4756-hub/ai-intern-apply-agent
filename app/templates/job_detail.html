@@ -106,7 +106,7 @@
     <h2>推进状态</h2>
     <label>状态
       <select name="status">
-        {% for status in ["待确认","待投递","已投递","已沟通","待笔试","待面试","面试准备中","已面试","已拒绝","已通过","已归档"] %}
+        {% for status in ["待确认","待投递","已投递","已沟通","面试邀请","待笔试","待面试","面试准备中","已面试","已拒绝","已通过","已归档"] %}
         <option value="{{ status }}" {% if job.status == status %}selected{% endif %}>{{ status }}</option>
         {% endfor %}
       </select>

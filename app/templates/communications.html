@@ -1,0 +1,120 @@
+{% extends "layout.html" %}
+{% block title %}沟通草稿 - 简历投递 Agent{% endblock %}
+{% block content %}
+<section class="page-head">
+  <div>
+    <h1>沟通草稿</h1>
+    <p>从当前 HR 对话采集可见文本，生成待确认草稿或转人工提示。</p>
+  </div>
+  <a class="button" href="/jobs">岗位列表</a>
+</section>
+
+{% if notice %}
+<section class="notice {{ notice_type }}">{{ notice }}</section>
+{% endif %}
+
+<section class="metrics">
+  <div class="metric"><span>待确认</span><strong>{{ draft_counts.get("待确认", 0) }}</strong></div>
+  <div class="metric"><span>需要我处理</span><strong>{{ draft_counts.get("需要我处理", 0) }}</strong></div>
+  <div class="metric"><span>已发送</span><strong>{{ draft_counts.get("已发送", 0) }}</strong></div>
+  <div class="metric"><span>已驳回</span><strong>{{ draft_counts.get("已驳回", 0) }}</strong></div>
+</section>
+
+<section class="panel">
+  <div class="panel-title">
+    <h2>待发送队列</h2>
+    <span class="muted">只生成草稿，不自动发送。</span>
+  </div>
+  {% if drafts %}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>岗位</th>
+          <th>类型</th>
+          <th>状态</th>
+          <th>原因 / 风险</th>
+          <th>草稿</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for draft in drafts %}
+        <tr>
+          <td>
+            {% if draft.job_id %}
+            <a href="/jobs/{{ draft.job_id }}">{{ (draft.company ~ " - " if draft.company else "") ~ (draft.job_title or "岗位") }}</a>
+            <div class="muted">{{ draft.job_status or "-" }}</div>
+            {% else %}
+            <span class="empty">未匹配岗位</span>
+            {% endif %}
+          </td>
+          <td>{{ draft.draft_type or "-" }}</td>
+          <td>{{ draft.status }}</td>
+          <td>
+            <p>{{ draft.reason or "-" }}</p>
+            {% set flags = loads(draft.risk_flags_json, []) %}
+            {% for flag in flags %}
+            <div class="notice compact">{{ flag }}</div>
+            {% endfor %}
+          </td>
+          <td>
+            <form method="post" action="/message-drafts/{{ draft.id }}" class="form-stack">
+              <textarea id="draft-{{ draft.id }}" name="message" rows="5">{{ draft.message }}</textarea>
+              <div class="form-actions table-actions">
+                <button class="button compact copy-button" type="button" data-copy-target="draft-{{ draft.id }}">复制</button>
+                <button class="button compact primary" type="submit" name="status" value="已发送">标记已发送</button>
+                <button class="button compact" type="submit" name="status" value="待确认">保存编辑</button>
+                <button class="button compact" type="submit" name="status" value="需要我处理">需要我处理</button>
+                <button class="button compact" type="submit" name="status" value="已驳回">驳回</button>
+              </div>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">还没有草稿。打开招聘平台当前 HR 对话页后，用扩展点击“采集当前对话”。</p>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <div class="panel-title">
+    <h2>最近对话采集</h2>
+  </div>
+  {% if captures %}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>时间</th>
+          <th>岗位</th>
+          <th>类型</th>
+          <th>摘要</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for capture in captures %}
+        <tr>
+          <td>{{ capture.created_at }}</td>
+          <td>
+            {% if capture.job_id %}
+            <a href="/jobs/{{ capture.job_id }}">{{ (capture.company ~ " - " if capture.company else "") ~ (capture.job_title or "岗位") }}</a>
+            {% else %}
+            <span class="empty">未匹配岗位</span>
+            {% endif %}
+            <div class="muted">{{ capture.platform or "-" }}</div>
+          </td>
+          <td>{{ capture.message_type or "-" }}</td>
+          <td>{{ capture.summary or "-" }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">暂无对话采集记录。</p>
+  {% endif %}
+</section>
+{% endblock %}

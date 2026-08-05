@@ -124,6 +124,8 @@ TASK_TYPES = [
     ("jd_extract", "JD 初步抽取"),
     ("job_match", "岗位匹配解释"),
     ("message_draft", "投递话术生成"),
+    ("hr_reply_classify", "HR 回复分类"),
+    ("hr_reply_draft", "HR 回复草稿"),
     ("company_research", "公司搜索摘要"),
     ("interview_prep", "面试准备"),
     ("interview_review", "面试复盘"),

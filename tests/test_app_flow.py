@@ -437,6 +437,125 @@ def test_extension_job_capture_refreshes_existing_candidate_job(tmp_path, monkey
     assert event["event_type"] == "浏览器扩展刷新"
 
 
+def test_extension_conversation_capture_creates_safe_draft(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "conversation-draft.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db
+
+    monkeypatch.setattr(main, "search_company", lambda *args, **kwargs: [])
+    init_db()
+    client = TestClient(main.app)
+
+    job_response = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "job",
+            "url": "https://www.zhipin.com/job_detail/chat-safe.html",
+            "title": "AI 应用开发实习生",
+            "text": "公司名称：深圳对话智能科技有限公司\nAI 应用开发实习生\n要求 Python、FastAPI、RAG，每周 5 天。",
+        },
+    )
+    assert job_response.status_code == 200
+
+    response = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "conversation",
+            "url": "https://www.zhipin.com/web/geek/chat",
+            "title": "深圳对话智能科技有限公司 HR 对话",
+            "text": "HR：您好，请问想了解什么？\n我：您好，我想了解 AI 应用开发实习生。\nHR：可以的，你想了解工作内容还是实习周期？",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["capture_type"] == "conversation"
+    assert payload["message_type"] == "岗位沟通"
+    with connect() as conn:
+        capture = conn.execute("SELECT message_type, action_required FROM conversation_captures ORDER BY id DESC LIMIT 1").fetchone()
+        draft = conn.execute("SELECT status, message, draft_type FROM message_drafts ORDER BY id DESC LIMIT 1").fetchone()
+    assert capture["message_type"] == "岗位沟通"
+    assert capture["action_required"] == 0
+    assert draft["status"] == "待确认"
+    assert draft["draft_type"] == "岗位沟通"
+    assert "主要工作内容" in draft["message"]
+
+
+def test_extension_conversation_capture_marks_interview_invite(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "conversation-interview.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db
+
+    monkeypatch.setattr(main, "search_company", lambda *args, **kwargs: [])
+    init_db()
+    client = TestClient(main.app)
+
+    job_response = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "job",
+            "url": "https://www.zhipin.com/job_detail/chat-interview.html",
+            "title": "AI Agent 开发实习生",
+            "text": "公司名称：杭州面试智能科技有限公司\nAI Agent 开发实习生\n要求 Python、RAG、FastAPI。",
+        },
+    )
+    job_id = job_response.json()["job_id"]
+
+    response = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "conversation",
+            "url": "https://www.zhipin.com/web/geek/chat",
+            "title": "杭州面试智能科技有限公司 HR 对话",
+            "text": "HR：你对 AI Agent 开发实习生感兴趣的话，我们可以约一个线上面试时间，你什么时候方便？",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["message_type"] == "面试邀请"
+    with connect() as conn:
+        job = conn.execute("SELECT status FROM job_postings WHERE id = ?", (job_id,)).fetchone()
+        draft = conn.execute("SELECT status, message, draft_type FROM message_drafts ORDER BY id DESC LIMIT 1").fetchone()
+        event = conn.execute("SELECT event_type FROM application_events WHERE job_id = ? ORDER BY id DESC LIMIT 1", (job_id,)).fetchone()
+    assert job["status"] == "面试邀请"
+    assert draft["status"] == "需要我处理"
+    assert draft["message"] == ""
+    assert draft["draft_type"] == "面试邀请"
+    assert event["event_type"] == "面试邀请识别"
+
+
+def test_conversation_llm_unknown_type_falls_back(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "conversation-llm-guard.sqlite3"))
+
+    from app import main
+    from app.db import init_db
+
+    class FakeClient:
+        configured = True
+
+        def complete_json(self, _messages):
+            return {"message_type": "乱码类型", "draft_message": "不应该使用"}
+
+    init_db()
+    monkeypatch.setattr(main, "client_for_task", lambda _task: FakeClient())
+    fallback = {
+        "message_type": "岗位沟通",
+        "summary": "本地摘要",
+        "action_required": False,
+        "reason": "本地规则",
+        "draft_message": "本地草稿",
+        "risk_flags": [],
+    }
+
+    result = main.try_llm_conversation_decision("HR：想了解工作内容吗？", None, fallback)
+
+    assert result == fallback
+
+
 def test_analysis_prefers_rule_salary_over_bad_llm_salary(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "salary-guard.sqlite3"))
 
