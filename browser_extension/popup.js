@@ -54,6 +54,39 @@ function normalizeInjectionResult(injectionResults) {
 
 function collectPageData(captureType) {
   const clean = (value) => String(value || "").replace(/\s+/g, " ").trim();
+  const collectCandidateCards = () => {
+    const selectors = [
+      "li",
+      "article",
+      "section",
+      "[class*='job']",
+      "[class*='position']",
+      "[class*='intern']",
+      "[class*='item']",
+      "[class*='card']",
+    ];
+    const seen = new Set();
+    return Array.from(document.querySelectorAll(selectors.join(",")))
+      .map((element) => {
+        const link = element.matches("a[href]") ? element : element.querySelector("a[href]");
+        const href = link ? link.href || "" : "";
+        const text = clean(element.innerText || element.textContent || "");
+        const title = clean(link ? link.innerText || link.textContent || link.title || "" : "");
+        return { href, title, text };
+      })
+      .filter((item) => {
+        if (!item.href || item.href.startsWith("javascript:") || item.text.length < 8) {
+          return false;
+        }
+        const key = `${item.href}::${item.text.slice(0, 80)}`;
+        if (seen.has(key)) {
+          return false;
+        }
+        seen.add(key);
+        return true;
+      })
+      .slice(0, 500);
+  };
   const pageText = (document.body && document.body.innerText ? document.body.innerText : "")
     .replace(/\n{3,}/g, "\n\n")
     .slice(0, 20000);
@@ -69,7 +102,7 @@ function collectPageData(captureType) {
       };
     })
     .filter((item) => item.href && !item.href.startsWith("javascript:"));
-  const cards = collectCandidateCards(clean);
+  const cards = collectCandidateCards();
 
   return {
     capture_type: captureType,
@@ -80,40 +113,6 @@ function collectPageData(captureType) {
     cards,
     captured_at: new Date().toISOString(),
   };
-}
-
-function collectCandidateCards(clean) {
-  const selectors = [
-    "li",
-    "article",
-    "section",
-    "[class*='job']",
-    "[class*='position']",
-    "[class*='intern']",
-    "[class*='item']",
-    "[class*='card']",
-  ];
-  const seen = new Set();
-  return Array.from(document.querySelectorAll(selectors.join(",")))
-    .map((element) => {
-      const link = element.matches("a[href]") ? element : element.querySelector("a[href]");
-      const href = link ? link.href || "" : "";
-      const text = clean(element.innerText || element.textContent || "");
-      const title = clean(link ? link.innerText || link.textContent || link.title || "" : "");
-      return { href, title, text };
-    })
-    .filter((item) => {
-      if (!item.href || item.href.startsWith("javascript:") || item.text.length < 8) {
-        return false;
-      }
-      const key = `${item.href}::${item.text.slice(0, 80)}`;
-      if (seen.has(key)) {
-        return false;
-      }
-      seen.add(key);
-      return true;
-    })
-    .slice(0, 500);
 }
 
 function renderSuccess(payload) {
