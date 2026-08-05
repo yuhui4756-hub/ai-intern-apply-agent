@@ -53,32 +53,59 @@ function normalizeInjectionResult(injectionResults) {
 }
 
 function collectPageData(captureType) {
-  const clean = (value) => String(value || "").replace(/\s+/g, " ").trim();
+  const cleanInline = (value) => String(value || "").replace(/\s+/g, " ").trim();
+  const cleanBlock = (value) =>
+    String(value || "")
+      .replace(/\r/g, "\n")
+      .split(/\n+/)
+      .map((line) => cleanInline(line))
+      .filter(Boolean)
+      .join("\n");
+  const isJobHref = (href, text = "") => {
+    const value = `${href || ""} ${text || ""}`.toLowerCase();
+    return /job|jobs|job_detail|intern|zhaopin|zhiwei|position|岗位|职位|实习|开发|agent|ai/.test(value);
+  };
+  const jobLinkCount = (element) => {
+    const links = Array.from(element.querySelectorAll("a[href]"))
+      .map((anchor) => ({
+        href: anchor.href || "",
+        text: cleanInline(anchor.innerText || anchor.textContent || anchor.title || ""),
+      }))
+      .filter((item) => item.href && isJobHref(item.href, item.text))
+      .map((item) => item.href.split("#")[0].split("?")[0]);
+    return new Set(links).size;
+  };
+  const findJobCard = (anchor) => {
+    let best = anchor;
+    let element = anchor;
+    for (let depth = 0; element && depth < 8; depth += 1, element = element.parentElement) {
+      const text = cleanBlock(element.innerText || element.textContent || "");
+      if (text.length < 8 || text.length > 900) {
+        continue;
+      }
+      if (jobLinkCount(element) > 1) {
+        continue;
+      }
+      best = element;
+    }
+    return best;
+  };
   const collectCandidateCards = () => {
-    const selectors = [
-      "li",
-      "article",
-      "section",
-      "[class*='job']",
-      "[class*='position']",
-      "[class*='intern']",
-      "[class*='item']",
-      "[class*='card']",
-    ];
     const seen = new Set();
-    return Array.from(document.querySelectorAll(selectors.join(",")))
-      .map((element) => {
-        const link = element.matches("a[href]") ? element : element.querySelector("a[href]");
-        const href = link ? link.href || "" : "";
-        const text = clean(element.innerText || element.textContent || "");
-        const title = clean(link ? link.innerText || link.textContent || link.title || "" : "");
+    return Array.from(document.querySelectorAll("a[href]"))
+      .filter((anchor) => isJobHref(anchor.href || "", anchor.innerText || anchor.textContent || anchor.title || ""))
+      .map((anchor) => {
+        const card = findJobCard(anchor);
+        const href = anchor.href || "";
+        const text = cleanBlock(card.innerText || card.textContent || "");
+        const title = cleanInline(anchor.innerText || anchor.textContent || anchor.title || "");
         return { href, title, text };
       })
       .filter((item) => {
-        if (!item.href || item.href.startsWith("javascript:") || item.text.length < 8) {
+        if (!item.href || item.href.startsWith("javascript:") || item.text.length < 8 || item.text.length > 900) {
           return false;
         }
-        const key = `${item.href}::${item.text.slice(0, 80)}`;
+        const key = item.href.split("#")[0].split("?")[0];
         if (seen.has(key)) {
           return false;
         }
@@ -93,12 +120,12 @@ function collectPageData(captureType) {
   const links = Array.from(document.querySelectorAll("a[href]"))
     .slice(0, 500)
     .map((anchor) => {
-      const container = anchor.closest("li, article, section, div");
+      const container = findJobCard(anchor);
       return {
         href: anchor.href || "",
-        text: clean(anchor.innerText || anchor.textContent || ""),
-        title: clean(anchor.title || ""),
-        context: clean(container ? container.innerText || "" : ""),
+        text: cleanInline(anchor.innerText || anchor.textContent || ""),
+        title: cleanInline(anchor.title || ""),
+        context: cleanBlock(container ? container.innerText || "" : ""),
       };
     })
     .filter((item) => item.href && !item.href.startsWith("javascript:"));

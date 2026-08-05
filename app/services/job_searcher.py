@@ -11,11 +11,17 @@ from pathlib import Path
 from urllib.parse import quote_plus, urljoin, urlparse
 
 from ..config import data_dir
+from .analyzer import extract_salary
 from .job_fetcher import ensure_public_http_url, normalize_browser_channel, normalize_text, normalize_visible_text
 
 
 JOB_KEYWORDS = ["AI", "Agent", "大模型", "RAG", "Python", "开发", "后端", "实习", "算法", "LLM"]
 SKIP_URL_PARTS = ["login", "passport", "signup", "register", "javascript:", "mailto:", "tel:"]
+DEGREE_WORDS = ["本科", "大专", "硕士", "博士", "学历不限", "不限学历"]
+TIME_WORDS = ["天/周", "周", "个月", "月", "长期", "实习"]
+COMPANY_HINTS = ["公司", "科技", "智能", "网络", "信息", "软件", "数据", "集团", "字节", "华为", "腾讯", "阿里", "百度"]
+CITY_WORDS = ["北京", "上海", "广州", "深圳", "杭州", "重庆", "成都", "南京", "苏州", "厦门", "武汉", "长沙"]
+MASKED_SALARY_RE = re.compile(r"[□�]{2,}\s*(?:-|~|～|至|到|—|–|－)\s*[□�]{2,}\s*元\s*/?\s*[天日]")
 CITY_CODES = {
     "北京": "101010100",
     "上海": "101020100",
@@ -308,13 +314,14 @@ def extract_candidates_from_anchors(
             continue
         title = infer_title(combined) or "候选岗位"
         company = infer_company(combined)
+        summary = build_candidate_summary(combined, title, company)
         candidates.append(
             SearchCandidate(
                 title=title[:120],
                 company=company[:80],
                 city=city,
                 source_url=href,
-                summary=combined[:300],
+                summary=summary,
             )
         )
         seen_urls.add(href)
@@ -365,7 +372,7 @@ def has_job_signal(text: str, href: str) -> bool:
 
 
 def infer_title(text: str) -> str:
-    for line in text.splitlines():
+    for line in candidate_lines(text):
         clean = normalize_text(line)
         if 4 <= len(clean) <= 80 and any(keyword.lower() in clean.lower() for keyword in JOB_KEYWORDS):
             return clean
@@ -380,9 +387,87 @@ def infer_company(text: str) -> str:
     for pattern in patterns:
         match = re.search(pattern, text)
         if match:
-            return normalize_text(match.group(1)).strip(" -:：,，。；;")
-    for line in text.splitlines()[1:6]:
+            value = clean_company_name(match.group(1))
+            if is_company_candidate(value, prefer_hint=False):
+                return value
+    lines = candidate_lines(text)
+    for line in lines:
+        match = re.search(
+            r"(?:本科|大专|硕士|博士|学历不限|不限学历)\s+([^\s\n]{2,30}?)(?=\s+(?:北京|上海|广州|深圳|杭州|重庆|成都|南京|苏州|厦门|武汉|长沙|远程)(?:[·\s]|$)|$)",
+            normalize_text(line),
+        )
+        if match:
+            value = clean_company_name(match.group(1))
+            if is_company_candidate(value, prefer_hint=False):
+                return value
+    for index, line in enumerate(lines):
         clean = normalize_text(line)
-        if 2 <= len(clean) <= 40 and not any(keyword.lower() in clean.lower() for keyword in JOB_KEYWORDS):
-            return clean
+        if any(word in clean for word in DEGREE_WORDS):
+            for nearby in lines[index + 1 : index + 3]:
+                value = clean_company_name(nearby)
+                if is_company_candidate(value, prefer_hint=False):
+                    return value
+    for line in lines[1:8]:
+        value = clean_company_name(line)
+        if is_company_candidate(value, prefer_hint=True):
+            return value
+    for line in lines[1:8]:
+        value = clean_company_name(line)
+        if is_company_candidate(value, prefer_hint=False):
+            return value
     return ""
+
+
+def candidate_lines(text: str) -> list[str]:
+    normalized = normalize_visible_text(sanitize_masked_salary(text))
+    lines = [normalize_text(line).strip(" -:：,，。；;") for line in normalized.splitlines()]
+    cleaned: list[str] = []
+    for line in lines:
+        if line and line not in cleaned:
+            cleaned.append(line)
+    return cleaned
+
+
+def sanitize_masked_salary(text: str) -> str:
+    return MASKED_SALARY_RE.sub("薪资数字未能从页面文本读取", text or "")
+
+
+def clean_company_name(value: str) -> str:
+    return normalize_text(value).strip(" -:：,，。；;")
+
+
+def is_company_candidate(value: str, *, prefer_hint: bool) -> bool:
+    text = clean_company_name(value)
+    lowered = text.lower()
+    if not 2 <= len(text) <= 40:
+        return False
+    if any(keyword.lower() in lowered for keyword in JOB_KEYWORDS):
+        return False
+    if extract_salary(text) or "元/天" in text or "薪资" in text or "补贴" in text:
+        return False
+    if any(word in text for word in TIME_WORDS) and not any(hint in text for hint in COMPANY_HINTS):
+        return False
+    if text in DEGREE_WORDS or re.fullmatch(r"(?:\d+\s*)?(?:天/周|个月|月|周|本科|大专|硕士|博士)", text):
+        return False
+    if any(city in text for city in CITY_WORDS) and ("·" in text or "-" in text) and not any(hint in text for hint in COMPANY_HINTS):
+        return False
+    if prefer_hint and not any(hint in text for hint in COMPANY_HINTS):
+        return False
+    return True
+
+
+def build_candidate_summary(text: str, title: str, company: str) -> str:
+    lines = candidate_lines(text)
+    summary_lines: list[str] = []
+    for line in lines:
+        if len(line) > 140:
+            continue
+        if title and line == title and summary_lines:
+            continue
+        if company and line == company and company in summary_lines:
+            continue
+        summary_lines.append(line)
+        if len(summary_lines) >= 6:
+            break
+    summary = "\n".join(summary_lines) if summary_lines else sanitize_masked_salary(normalize_visible_text(text))
+    return summary[:260]
