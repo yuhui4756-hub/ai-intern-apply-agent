@@ -1,0 +1,103 @@
+const APP_BASE_URL = "http://127.0.0.1:8000";
+const CAPTURE_API_URL = `${APP_BASE_URL}/api/extension/capture`;
+
+const statusBadge = document.getElementById("statusBadge");
+const resultBox = document.getElementById("result");
+const captureJobButton = document.getElementById("captureJob");
+const captureSearchButton = document.getElementById("captureSearch");
+
+captureJobButton.addEventListener("click", () => captureCurrentPage("job"));
+captureSearchButton.addEventListener("click", () => captureCurrentPage("search"));
+
+async function captureCurrentPage(captureType) {
+  setBusy(true, "采集中");
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab || !tab.id) {
+      throw new Error("没有找到当前标签页。");
+    }
+
+    const [{ result }] = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: collectPageData,
+      args: [captureType],
+    });
+    const response = await fetch(CAPTURE_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(result),
+    });
+    const payload = await response.json();
+    if (!response.ok || !payload.ok) {
+      throw new Error(payload.error || "本地应用没有接受采集结果。");
+    }
+
+    renderSuccess(payload);
+  } catch (error) {
+    renderError(error.message || String(error));
+  } finally {
+    setBusy(false);
+  }
+}
+
+function collectPageData(captureType) {
+  const clean = (value) => String(value || "").replace(/\s+/g, " ").trim();
+  const pageText = (document.body && document.body.innerText ? document.body.innerText : "")
+    .replace(/\n{3,}/g, "\n\n")
+    .slice(0, 20000);
+  const links = Array.from(document.querySelectorAll("a[href]"))
+    .slice(0, 500)
+    .map((anchor) => {
+      const container = anchor.closest("li, article, section, div");
+      return {
+        href: anchor.href || "",
+        text: clean(anchor.innerText || anchor.textContent || ""),
+        title: clean(anchor.title || ""),
+        context: clean(container ? container.innerText || "" : ""),
+      };
+    })
+    .filter((item) => item.href && !item.href.startsWith("javascript:"));
+
+  return {
+    capture_type: captureType,
+    url: location.href,
+    title: document.title || "",
+    text: pageText,
+    links,
+    captured_at: new Date().toISOString(),
+  };
+}
+
+function renderSuccess(payload) {
+  statusBadge.textContent = "已采集";
+  const label = payload.capture_type === "job" ? "岗位详情" : `搜索结果：${payload.candidate_count || 0} 个候选`;
+  const targetUrl = `${APP_BASE_URL}${payload.redirect_url}`;
+  resultBox.className = "result";
+  resultBox.innerHTML = `
+    <div>${escapeHtml(label)}已保存。</div>
+    <p><a href="${targetUrl}" target="_blank" rel="noreferrer">打开本地结果</a></p>
+  `;
+}
+
+function renderError(message) {
+  statusBadge.textContent = "失败";
+  resultBox.className = "result error";
+  resultBox.textContent = message;
+}
+
+function setBusy(isBusy, label = "未采集") {
+  captureJobButton.disabled = isBusy;
+  captureSearchButton.disabled = isBusy;
+  if (isBusy) {
+    statusBadge.textContent = label;
+  }
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}

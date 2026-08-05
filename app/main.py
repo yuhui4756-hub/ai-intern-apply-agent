@@ -5,10 +5,10 @@ import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from fastapi import FastAPI, Form, Request
-from fastapi.responses import RedirectResponse, Response
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.concurrency import run_in_threadpool
@@ -22,8 +22,14 @@ from .services.analyzer import (
     rule_extract_jd,
     score_job,
 )
-from .services.job_fetcher import fetch_job_from_url
-from .services.job_searcher import capture_current_search_page, open_manual_search_in_edge, search_jobs_with_browser
+from .services.job_fetcher import ensure_public_http_url, fetch_job_from_url, normalize_visible_text
+from .services.job_searcher import (
+    SearchResult,
+    capture_current_search_page,
+    extract_candidates_from_anchors,
+    open_manual_search_in_edge,
+    search_jobs_with_browser,
+)
 from .services.llm import OpenAICompatibleClient, client_for_task
 from .services.research import search_company
 from .services.resume import read_resume_text
@@ -40,6 +46,8 @@ templates = Jinja2Templates(directory=str(ROOT_DIR / "app" / "templates"))
 app.mount("/static", StaticFiles(directory=str(ROOT_DIR / "app" / "static")), name="static")
 
 BULK_IMPORT_LIMIT = 20
+EXTENSION_TEXT_LIMIT = 20000
+EXTENSION_LINK_LIMIT = 300
 LAST_MANUAL_SEARCH_KEY = "last_manual_search"
 BATCH_SEPARATOR_RE = re.compile(r"(?m)^\s*(?:-{3,}|={3,}|#{3,}|岗位\s*\d+[:：]?)\s*$")
 BATCH_START_MARKERS = [
@@ -290,6 +298,7 @@ def browser_channel_label(value: str) -> str:
         "msedge": "Microsoft Edge",
         "edge": "Microsoft Edge",
         "chromium": "Chromium",
+        "extension": "浏览器扩展",
     }.get(value or "", value or "Microsoft Edge")
 
 
@@ -499,6 +508,144 @@ def save_search_failure(platform: str, keyword: str, city: str, browser_channel:
             ),
         )
     return int(cursor.lastrowid)
+
+
+def api_error(message: str, status_code: int = 400) -> JSONResponse:
+    return JSONResponse({"ok": False, "error": message}, status_code=status_code)
+
+
+def payload_text(payload: dict[str, Any], key: str, limit: int = 500) -> str:
+    return str(payload.get(key) or "").strip()[:limit]
+
+
+def extension_page_text(payload: dict[str, Any]) -> str:
+    title = payload_text(payload, "title", 300)
+    url = payload_text(payload, "url", 1000)
+    text = normalize_visible_text(str(payload.get("text") or ""))
+    parts = [f"页面标题：{title}" if title else "", f"页面链接：{url}" if url else "", text]
+    return "\n\n".join(part for part in parts if part).strip()[:EXTENSION_TEXT_LIMIT]
+
+
+def extension_platform(url: str, fallback: str = "") -> str:
+    inferred = infer_platform_from_url(url)
+    if inferred != "岗位链接":
+        return inferred
+    return fallback or "浏览器扩展"
+
+
+def extension_keyword(url: str, title: str) -> str:
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query)
+    for key in ["query", "keyword", "key", "kw", "q"]:
+        values = query.get(key)
+        if values and values[0].strip():
+            return values[0].strip()[:80]
+    return title.strip()[:80] or "扩展采集"
+
+
+def extension_anchors(payload: dict[str, Any]) -> list[dict[str, str]]:
+    anchors: list[dict[str, str]] = []
+    for item in list(payload.get("links") or [])[:EXTENSION_LINK_LIMIT]:
+        if not isinstance(item, dict):
+            continue
+        anchors.append(
+            {
+                "href": str(item.get("href") or item.get("url") or ""),
+                "text": str(item.get("text") or ""),
+                "title": str(item.get("title") or ""),
+                "context": str(item.get("context") or ""),
+            }
+        )
+    return anchors
+
+
+def create_job_from_extension(payload: dict[str, Any]) -> dict[str, Any] | JSONResponse:
+    raw_url = payload_text(payload, "url", 1000)
+    if not raw_url:
+        return api_error("缺少当前页面 URL。")
+    try:
+        url = ensure_public_http_url(raw_url)
+    except ValueError as exc:
+        return api_error(str(exc))
+
+    jd_text = extension_page_text({**payload, "url": url})
+    if len(jd_text) < 40:
+        return api_error("当前页面文本太短，无法作为岗位详情导入。")
+
+    title = payload_text(payload, "title", 300)
+    platform = extension_platform(url, payload_text(payload, "platform", 80))
+    with connect() as conn:
+        default_resume = conn.execute("SELECT id FROM resume_versions WHERE is_default = 1 ORDER BY id LIMIT 1").fetchone()
+        resume_id = int(default_resume["id"]) if default_resume else None
+        job_id, _analysis = create_job_record(
+            conn,
+            jd_text=jd_text,
+            resume_id=resume_id,
+            platform=platform,
+            source_url=url,
+            title=title,
+            search_depth="auto",
+        )
+        conn.execute(
+            "INSERT INTO application_events (job_id, event_type, content, created_at) VALUES (?, ?, ?, ?)",
+            (job_id, "浏览器扩展采集", f"从浏览器扩展采集当前岗位页面：{url}", utc_now()),
+        )
+
+    return {"ok": True, "capture_type": "job", "job_id": job_id, "redirect_url": f"/jobs/{job_id}"}
+
+
+def create_search_from_extension(payload: dict[str, Any]) -> dict[str, Any] | JSONResponse:
+    raw_url = payload_text(payload, "url", 1000)
+    if not raw_url:
+        return api_error("缺少当前页面 URL。")
+    try:
+        url = ensure_public_http_url(raw_url)
+    except ValueError as exc:
+        return api_error(str(exc))
+
+    title = payload_text(payload, "title", 300)
+    platform = extension_platform(url, payload_text(payload, "platform", 80))
+    keyword = payload_text(payload, "keyword", 80) or extension_keyword(url, title)
+    city = payload_text(payload, "city", 80)
+    anchors = extension_anchors(payload)
+    candidates = extract_candidates_from_anchors(anchors, platform, city, url, limit=30)
+    note = "浏览器扩展采集搜索结果页。"
+    if not candidates:
+        note += " 没有识别到候选岗位，可尝试停留在岗位列表区域后重试。"
+    result = SearchResult(
+        platform=platform,
+        keyword=keyword,
+        city=city,
+        search_url=url,
+        browser_channel="extension",
+        candidates=candidates,
+        note=note,
+    )
+    run_id = save_search_result(result)
+    return {
+        "ok": True,
+        "capture_type": "search",
+        "search_run_id": run_id,
+        "candidate_count": len(candidates),
+        "redirect_url": f"/searches/{run_id}",
+    }
+
+
+@app.post("/api/extension/capture")
+async def extension_capture(request: Request) -> Any:
+    try:
+        payload = await request.json()
+    except Exception:
+        return api_error("请求不是有效 JSON。")
+    if not isinstance(payload, dict):
+        return api_error("请求体必须是 JSON 对象。")
+
+    capture_type = payload_text(payload, "capture_type", 30) or payload_text(payload, "type", 30)
+    if capture_type == "job":
+        return create_job_from_extension(payload)
+    if capture_type == "search":
+        return create_search_from_extension(payload)
+    return api_error("capture_type 必须是 job 或 search。")
 
 
 @app.get("/")

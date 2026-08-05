@@ -1,0 +1,113 @@
+:root {
+  --bg: #f7f7f4;
+  --panel: #ffffff;
+  --text: #1f2933;
+  --muted: #68717d;
+  --line: #d9ddd5;
+  --accent: #1f7a6d;
+  --accent-dark: #155c52;
+  --error: #8a2f22;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  width: 330px;
+  min-height: 220px;
+  margin: 0;
+  color: var(--text);
+  background: var(--bg);
+  font-family: "Segoe UI", "Microsoft YaHei", Arial, sans-serif;
+}
+
+.panel {
+  padding: 16px;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+h1 {
+  margin: 0;
+  font-size: 18px;
+  letter-spacing: 0;
+}
+
+.badge {
+  border: 1px solid #b9d8ce;
+  border-radius: 999px;
+  padding: 2px 8px;
+  color: var(--accent-dark);
+  background: #eef8f4;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.actions {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 10px;
+}
+
+button {
+  min-height: 38px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  background: #fff;
+  font: inherit;
+  cursor: pointer;
+}
+
+button.primary {
+  border-color: var(--accent);
+  color: #fff;
+  background: var(--accent);
+}
+
+button:hover {
+  border-color: var(--accent);
+}
+
+button.primary:hover {
+  background: var(--accent-dark);
+}
+
+button:disabled {
+  cursor: wait;
+  opacity: 0.7;
+}
+
+.result {
+  margin-top: 14px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 10px;
+  background: var(--panel);
+  font-size: 13px;
+  word-break: break-word;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.error {
+  color: var(--error);
+}
+
+a {
+  color: var(--accent-dark);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}

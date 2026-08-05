@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "简历投递 Agent 采集器",
+  "description": "采集当前岗位页或搜索结果页，并发送到本地简历投递 Agent。",
+  "version": "0.2.0",
+  "action": {
+    "default_title": "简历投递 Agent",
+    "default_popup": "popup.html"
+  },
+  "side_panel": {
+    "default_path": "popup.html"
+  },
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "sidePanel"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:8000/*",
+    "http://localhost:8000/*"
+  ]
+}

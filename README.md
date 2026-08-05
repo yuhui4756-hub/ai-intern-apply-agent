@@ -12,7 +12,7 @@
 - 管理投递状态和跳过原因。
 - 在收到面试邀请后生成准备计划、题库和复盘材料。
 
-需求规格见 [docs/requirements.md](docs/requirements.md)，自动化路线见 [docs/agent_automation_plan.md](docs/agent_automation_plan.md)，当前完成度见 [docs/status.md](docs/status.md)。
+需求规格见 [docs/requirements.md](docs/requirements.md)，自动化路线见 [docs/agent_automation_plan.md](docs/agent_automation_plan.md)，浏览器扩展说明见 [docs/browser_extension.md](docs/browser_extension.md)，当前完成度见 [docs/status.md](docs/status.md)。
 
 ## Quick Start
 
@@ -40,6 +40,7 @@ API Key 可以在设置页直接填写；应用会保存到本地 `.env` 并立�
 - JD 粘贴分析、岗位链接抓取导入、匹配评分、风险判断和一键复制话术。
 - 岗位链接支持普通网页抓取和可选 Playwright 浏览器渲染抓取。
 - Edge 浏览器岗位搜索采集：打开招聘平台搜索页，采集候选岗位链接，再逐条导入 JD 分析。
+- 浏览器扩展采集 MVP：在已登录的 Edge/Chrome 当前页采集岗位详情或搜索结果。
 - 多段 JD 批量粘贴导入、自动分档和批量状态更新。
 - 岗位状态、跳过原因和公司搜索证据记录。
 - 面试准备、转写文本复盘和 Markdown 导出。

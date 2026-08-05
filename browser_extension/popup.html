@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>简历投递 Agent</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <main class="panel">
+    <header>
+      <h1>简历投递 Agent</h1>
+      <span id="statusBadge" class="badge">未采集</span>
+    </header>
+
+    <section class="actions">
+      <button id="captureJob" class="primary" type="button">采集当前岗位</button>
+      <button id="captureSearch" type="button">采集搜索结果</button>
+    </section>
+
+    <section id="result" class="result muted">
+      确认本地应用已运行在 http://127.0.0.1:8000。
+    </section>
+  </main>
+  <script src="popup.js"></script>
+</body>
+</html>

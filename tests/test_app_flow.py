@@ -143,6 +143,88 @@ def test_import_job_from_url_flow(tmp_path, monkeypatch):
     assert row["platform"] == "岗位链接"
 
 
+def test_extension_capture_job_creates_analyzed_job(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "extension-job.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db
+
+    monkeypatch.setattr(main, "search_company", lambda *args, **kwargs: [])
+    init_db()
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "job",
+            "url": "https://www.zhipin.com/job_detail/example.html",
+            "title": "AI 应用开发实习生",
+            "text": "公司名称：深圳扩展智能科技有限公司\nAI 应用开发实习生\n要求 Python、FastAPI、RAG，每周 5 天。",
+            "links": [],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["redirect_url"].startswith("/jobs/")
+    with connect() as conn:
+        row = conn.execute("SELECT platform, source_url, company, match_level FROM job_postings ORDER BY id DESC LIMIT 1").fetchone()
+        event = conn.execute("SELECT event_type FROM application_events ORDER BY id DESC LIMIT 1").fetchone()
+    assert row["platform"] == "Boss 直聘"
+    assert row["source_url"] == "https://www.zhipin.com/job_detail/example.html"
+    assert row["company"] == "深圳扩展智能科技有限公司"
+    assert row["match_level"]
+    assert event["event_type"] == "浏览器扩展采集"
+
+
+def test_extension_capture_search_creates_candidates(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "extension-search.sqlite3"))
+
+    from app import main  # noqa: F401
+    from app.db import connect, init_db
+
+    init_db()
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "search",
+            "url": "https://www.zhipin.com/web/geek/job?query=AI%E5%BA%94%E7%94%A8%E5%BC%80%E5%8F%91&city=101280600",
+            "title": "AI 应用开发招聘",
+            "text": "AI 应用开发实习生 深圳扩展智能科技有限公司",
+            "links": [
+                {
+                    "href": "https://www.zhipin.com/job_detail/extension-1.html",
+                    "text": "AI 应用开发实习生",
+                    "context": "AI 应用开发实习生\n深圳扩展智能科技有限公司\nPython FastAPI RAG",
+                },
+                {
+                    "href": "https://www.zhipin.com/web/geek/job?query=AI",
+                    "text": "搜索页",
+                    "context": "搜索页",
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["candidate_count"] == 1
+    assert payload["redirect_url"].startswith("/searches/")
+    with connect() as conn:
+        run = conn.execute("SELECT platform, keyword, browser_channel, status FROM job_search_runs ORDER BY id DESC LIMIT 1").fetchone()
+        candidate = conn.execute("SELECT title, company, source_url FROM job_candidates ORDER BY id DESC LIMIT 1").fetchone()
+    assert run["platform"] == "Boss 直聘"
+    assert run["keyword"] == "AI应用开发"
+    assert run["browser_channel"] == "extension"
+    assert run["status"] == "完成"
+    assert candidate["title"] == "AI 应用开发实习生"
+    assert candidate["company"] == "深圳扩展智能科技有限公司"
+
+
 def test_search_run_and_candidate_import_flow(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "search.sqlite3"))
 

@@ -299,7 +299,7 @@ def extract_candidates_from_anchors(
     seen_urls: set[str] = set()
     for anchor in anchors:
         href = normalize_href(str(anchor.get("href") or ""), base_url)
-        if not href or href in seen_urls or not looks_like_job_link(href):
+        if not href or href in seen_urls or looks_like_search_page_url(href) or not looks_like_job_link(href):
             continue
         text = normalize_visible_text(str(anchor.get("text") or anchor.get("title") or ""))
         context = normalize_visible_text(str(anchor.get("context") or ""))
@@ -338,6 +338,23 @@ def normalize_href(href: str, base_url: str = "") -> str:
 def looks_like_job_link(href: str) -> bool:
     lowered = href.lower()
     return any(token in lowered for token in ["job", "jobs", "job_detail", "intern", "zhaopin", "zhiwei", "zw", "position"])
+
+
+def looks_like_search_page_url(href: str) -> bool:
+    parsed = urlparse(href)
+    host = (parsed.netloc or "").lower()
+    path = (parsed.path or "").lower().rstrip("/")
+    if "zhipin.com" in host and path == "/web/geek/job":
+        return True
+    if "zhaopin.com" in host and host.startswith("sou."):
+        return True
+    if "51job.com" in host and path.startswith("/pc/search"):
+        return True
+    if "liepin.com" in host and path.startswith("/zhaopin"):
+        return True
+    if "shixiseng.com" in host and path.startswith("/interns"):
+        return True
+    return False
 
 
 def has_job_signal(text: str, href: str) -> bool:
