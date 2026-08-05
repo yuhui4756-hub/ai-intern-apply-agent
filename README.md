@@ -12,7 +12,7 @@
 - 管理投递状态和跳过原因。
 - 在收到面试邀请后生成准备计划、题库和复盘材料。
 
-需求规格见 [docs/requirements.md](docs/requirements.md)。
+需求规格见 [docs/requirements.md](docs/requirements.md)，当前完成度见 [docs/status.md](docs/status.md)。
 
 ## Quick Start
 

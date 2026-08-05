@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -220,10 +221,14 @@ def test_manual_edge_search_capture_flow(tmp_path, monkeypatch):
     from app.db import connect, init_db
 
     monkeypatch.setattr(main, "open_manual_search_in_edge", lambda platform, keyword, city: "https://jobs.example.com/search?q=AI")
-    monkeypatch.setattr(
-        main,
-        "capture_current_search_page",
-        lambda platform, keyword, city, browser_channel="msedge": SearchResult(
+    def capture_without_async_loop(platform, keyword, city, browser_channel="msedge"):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("browser capture should run outside the FastAPI event loop")
+        return SearchResult(
             platform=platform,
             keyword=keyword,
             city=city,
@@ -238,8 +243,9 @@ def test_manual_edge_search_capture_flow(tmp_path, monkeypatch):
                     summary="AI 应用开发实习生 Python FastAPI RAG",
                 )
             ],
-        ),
-    )
+        )
+
+    monkeypatch.setattr(main, "capture_current_search_page", capture_without_async_loop)
     init_db()
     client = TestClient(main.app)
 

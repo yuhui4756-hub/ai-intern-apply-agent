@@ -11,6 +11,7 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from starlette.concurrency import run_in_threadpool
 
 from .config import ROOT_DIR, TASK_TYPES, looks_masked, mask_secret, set_env_value, suggest_api_key_env
 from .db import connect, dumps, get_setting, init_db, loads, set_setting, utc_now
@@ -686,7 +687,7 @@ async def create_search_run(request: Request) -> RedirectResponse:
     save_last_manual_search(platform, keyword, city, browser_channel)
 
     try:
-        result = search_jobs_with_browser(platform, keyword, city, browser_channel=browser_channel)
+        result = await run_in_threadpool(search_jobs_with_browser, platform, keyword, city, browser_channel=browser_channel)
     except Exception as exc:
         run_id = save_search_failure(platform, keyword, city, browser_channel, f"自动采集失败：{str(exc)}")
         return redirect_with_notice(f"/searches/{run_id}", f"搜索采集失败：{str(exc)[:160]}", "error")
@@ -705,7 +706,7 @@ async def open_manual_search(request: Request) -> RedirectResponse:
         return redirect_with_notice("/searches", "请填写搜索关键词。", "error")
     save_last_manual_search(platform, keyword, city, "msedge")
     try:
-        search_url = open_manual_search_in_edge(platform, keyword, city)
+        search_url = await run_in_threadpool(open_manual_search_in_edge, platform, keyword, city)
     except Exception as exc:
         run_id = save_search_failure(platform, keyword, city, "msedge", f"打开 Edge 失败：{str(exc)}")
         return redirect_with_notice(f"/searches/{run_id}", f"打开 Edge 失败：{str(exc)[:160]}", "error")
@@ -725,7 +726,7 @@ async def capture_current_search(request: Request) -> RedirectResponse:
         return redirect_with_notice("/searches", "请填写搜索关键词。", "error")
     save_last_manual_search(platform, keyword, city, browser_channel, saved.get("search_url", ""))
     try:
-        result = capture_current_search_page(platform, keyword, city, browser_channel=browser_channel)
+        result = await run_in_threadpool(capture_current_search_page, platform, keyword, city, browser_channel=browser_channel)
     except Exception as exc:
         run_id = save_search_failure(platform, keyword, city, browser_channel, f"当前页面采集失败：{str(exc)}")
         return redirect_with_notice(f"/searches/{run_id}", f"当前页面采集失败：{str(exc)[:160]}", "error")
@@ -783,7 +784,7 @@ async def import_candidate(candidate_id: int, request: Request) -> RedirectRespo
     run_id = int(candidate["search_run_id"])
     channel = browser_channel or candidate.get("run_browser_channel") or "msedge"
     try:
-        fetched = fetch_job_from_url(candidate["source_url"], fetch_mode=fetch_mode, browser_channel=channel)
+        fetched = await run_in_threadpool(fetch_job_from_url, candidate["source_url"], fetch_mode=fetch_mode, browser_channel=channel)
         with connect() as conn:
             job_id, _analysis = create_job_record(
                 conn,
@@ -887,7 +888,7 @@ async def import_job_url(request: Request) -> RedirectResponse:
     browser_channel = str(form.get("browser_channel") or "msedge")
     platform = str(form.get("platform") or "").strip()
     try:
-        fetched = fetch_job_from_url(source_url, fetch_mode=fetch_mode, browser_channel=browser_channel)
+        fetched = await run_in_threadpool(fetch_job_from_url, source_url, fetch_mode=fetch_mode, browser_channel=browser_channel)
     except Exception as exc:
         return redirect_with_notice("/jobs/new", f"链接导入失败：{str(exc)[:160]}", "error")
 
