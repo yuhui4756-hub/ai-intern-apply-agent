@@ -257,6 +257,18 @@ textarea {
   gap: 12px;
 }
 
+.inline-form {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.inline-form select {
+  width: auto;
+  min-width: 96px;
+}
+
 .table-actions {
   flex-wrap: wrap;
 }

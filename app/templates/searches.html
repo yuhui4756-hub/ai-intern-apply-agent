@@ -1,0 +1,80 @@
+{% extends "layout.html" %}
+{% block title %}岗位搜索 - 简历投递 Agent{% endblock %}
+{% block content %}
+<section class="page-head">
+  <div>
+    <h1>岗位搜索</h1>
+    <p>用浏览器打开招聘平台搜索页，采集候选岗位链接，再逐条导入 JD 分析。</p>
+  </div>
+  <a class="button" href="/jobs">岗位列表</a>
+</section>
+
+{% if notice %}
+<section class="notice {{ notice_type }}">{{ notice }}</section>
+{% endif %}
+
+<form method="post" action="/searches" class="panel form-stack">
+  <div class="form-grid">
+    <label>平台
+      <select name="platform">
+        <option value="Boss 直聘">Boss 直聘</option>
+        <option value="实习僧">实习僧</option>
+        <option value="猎聘">猎聘</option>
+        <option value="智联招聘">智联招聘</option>
+        <option value="前程无忧">前程无忧</option>
+      </select>
+    </label>
+    <label>关键词
+      <input name="keyword" required placeholder="AI 应用开发实习 / Agent 开发实习 / Python RAG">
+    </label>
+    <label>城市
+      <input name="city" placeholder="杭州 / 深圳 / 成都">
+    </label>
+    <label>浏览器
+      <select name="browser_channel">
+        <option value="msedge">Microsoft Edge</option>
+        <option value="chromium">Chromium</option>
+      </select>
+    </label>
+  </div>
+  <div class="form-actions">
+    <button class="button primary" type="submit">打开浏览器并采集候选岗位</button>
+  </div>
+</form>
+
+<section class="panel">
+  <div class="panel-title">
+    <h2>搜索记录</h2>
+  </div>
+  {% if runs %}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>搜索</th>
+          <th>城市</th>
+          <th>浏览器</th>
+          <th>候选</th>
+          <th>状态</th>
+          <th>时间</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for run in runs %}
+        <tr>
+          <td><a href="/searches/{{ run.id }}">{{ run.platform }} - {{ run.keyword }}</a></td>
+          <td>{{ run.city or "-" }}</td>
+          <td>{{ browser_channel_label(run.browser_channel) }}</td>
+          <td>{{ run.imported_count or 0 }} / {{ run.candidate_count or 0 }}</td>
+          <td>{{ run.status }}</td>
+          <td>{{ run.created_at }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">还没有搜索记录。</p>
+  {% endif %}
+</section>
+{% endblock %}

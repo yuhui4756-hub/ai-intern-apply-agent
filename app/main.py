@@ -22,6 +22,7 @@ from .services.analyzer import (
     score_job,
 )
 from .services.job_fetcher import fetch_job_from_url
+from .services.job_searcher import search_jobs_with_browser
 from .services.llm import OpenAICompatibleClient, client_for_task
 from .services.research import search_company
 from .services.resume import read_resume_text
@@ -282,6 +283,14 @@ def fetch_mode_label(value: str) -> str:
     }.get(value or "", value or "自动")
 
 
+def browser_channel_label(value: str) -> str:
+    return {
+        "msedge": "Microsoft Edge",
+        "edge": "Microsoft Edge",
+        "chromium": "Chromium",
+    }.get(value or "", value or "Microsoft Edge")
+
+
 def initial_job_status(jd_text: str, scoring: dict[str, Any]) -> str:
     if not jd_text:
         return "待分析"
@@ -530,6 +539,174 @@ def new_job_page(request: Request) -> Any:
     )
 
 
+@app.get("/searches")
+def searches_page(request: Request) -> Any:
+    with connect() as conn:
+        runs = conn.execute(
+            """
+            SELECT r.*,
+                   COUNT(c.id) AS candidate_count,
+                   SUM(CASE WHEN c.status = '已导入' THEN 1 ELSE 0 END) AS imported_count
+            FROM job_search_runs r
+            LEFT JOIN job_candidates c ON c.search_run_id = r.id
+            GROUP BY r.id
+            ORDER BY r.created_at DESC
+            LIMIT 30
+            """
+        ).fetchall()
+    return templates.TemplateResponse(
+        request,
+        "searches.html",
+        {
+            "runs": [{key: row[key] for key in row.keys()} for row in runs],
+            "notice": request.query_params.get("notice", ""),
+            "notice_type": request.query_params.get("notice_type", "info"),
+            "browser_channel_label": browser_channel_label,
+        },
+    )
+
+
+@app.post("/searches")
+async def create_search_run(request: Request) -> RedirectResponse:
+    form = await request.form()
+    platform = str(form.get("platform") or "Boss 直聘").strip()
+    keyword = str(form.get("keyword") or "").strip()
+    city = str(form.get("city") or "").strip()
+    browser_channel = str(form.get("browser_channel") or "msedge").strip()
+    if not keyword:
+        return redirect_with_notice("/searches", "请填写搜索关键词。", "error")
+
+    try:
+        result = search_jobs_with_browser(platform, keyword, city, browser_channel=browser_channel)
+    except Exception as exc:
+        return redirect_with_notice("/searches", f"搜索采集失败：{str(exc)[:160]}", "error")
+
+    now = utc_now()
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO job_search_runs (
+                platform, keyword, city, search_url, browser_channel, status, note, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                result.platform,
+                result.keyword,
+                result.city,
+                result.search_url,
+                result.browser_channel,
+                "完成" if result.candidates else "无结果",
+                result.note,
+                now,
+            ),
+        )
+        run_id = cursor.lastrowid
+        for candidate in result.candidates:
+            conn.execute(
+                """
+                INSERT INTO job_candidates (
+                    search_run_id, platform, title, company, city, source_url,
+                    summary, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    result.platform,
+                    candidate.title,
+                    candidate.company,
+                    candidate.city,
+                    candidate.source_url,
+                    candidate.summary,
+                    "候选",
+                    now,
+                    now,
+                ),
+            )
+    return redirect_with_notice(f"/searches/{run_id}", f"已采集 {len(result.candidates)} 个候选岗位。", "success")
+
+
+@app.get("/searches/{run_id}")
+def search_detail(run_id: int, request: Request) -> Any:
+    with connect() as conn:
+        run = conn.execute("SELECT * FROM job_search_runs WHERE id = ?", (run_id,)).fetchone()
+        candidates = conn.execute(
+            "SELECT * FROM job_candidates WHERE search_run_id = ? ORDER BY id",
+            (run_id,),
+        ).fetchall()
+        resumes = conn.execute("SELECT * FROM resume_versions ORDER BY is_default DESC, id").fetchall()
+    if not run:
+        return redirect("/searches")
+    return templates.TemplateResponse(
+        request,
+        "search_detail.html",
+        {
+            "run": {key: run[key] for key in run.keys()},
+            "candidates": [{key: row[key] for key in row.keys()} for row in candidates],
+            "resumes": [{key: row[key] for key in row.keys()} for row in resumes],
+            "browser_channel_label": browser_channel_label,
+            "notice": request.query_params.get("notice", ""),
+            "notice_type": request.query_params.get("notice_type", "info"),
+        },
+    )
+
+
+@app.post("/candidates/{candidate_id}/import")
+async def import_candidate(candidate_id: int, request: Request) -> RedirectResponse:
+    form = await request.form()
+    resume_id_raw = str(form.get("selected_resume_id") or "")
+    resume_id = int(resume_id_raw) if resume_id_raw.isdigit() else None
+    requested_depth = str(form.get("search_depth") or "auto")
+    fetch_mode = str(form.get("fetch_mode") or "auto")
+    browser_channel = str(form.get("browser_channel") or "msedge")
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT c.*, r.browser_channel AS run_browser_channel
+            FROM job_candidates c
+            LEFT JOIN job_search_runs r ON r.id = c.search_run_id
+            WHERE c.id = ?
+            """,
+            (candidate_id,),
+        ).fetchone()
+    if not row:
+        return redirect_with_notice("/searches", "没有找到候选岗位。", "error")
+
+    candidate = {key: row[key] for key in row.keys()}
+    run_id = int(candidate["search_run_id"])
+    channel = browser_channel or candidate.get("run_browser_channel") or "msedge"
+    try:
+        fetched = fetch_job_from_url(candidate["source_url"], fetch_mode=fetch_mode, browser_channel=channel)
+        with connect() as conn:
+            job_id, _analysis = create_job_record(
+                conn,
+                jd_text=fetched.text,
+                resume_id=resume_id,
+                platform=candidate.get("platform") or infer_platform_from_url(fetched.final_url),
+                source_url=fetched.final_url,
+                title=fetched.title or candidate.get("title") or "",
+                company=candidate.get("company") or "",
+                city=candidate.get("city") or "",
+                search_depth=requested_depth,
+            )
+            now = utc_now()
+            conn.execute(
+                "UPDATE job_candidates SET job_id = ?, status = ?, error_message = '', updated_at = ? WHERE id = ?",
+                (job_id, "已导入", now, candidate_id),
+            )
+            conn.execute(
+                "INSERT INTO application_events (job_id, event_type, content, created_at) VALUES (?, ?, ?, ?)",
+                (job_id, "搜索候选导入", f"从搜索候选 {candidate.get('source_url')} 导入岗位详情。", now),
+            )
+        return redirect_with_notice(f"/jobs/{job_id}", f"已从候选岗位导入并通过{fetch_mode_label(fetched.fetch_mode)}完成分析。", "success")
+    except Exception as exc:
+        with connect() as conn:
+            conn.execute(
+                "UPDATE job_candidates SET status = ?, error_message = ?, updated_at = ? WHERE id = ?",
+                ("导入失败", str(exc)[:500], utc_now(), candidate_id),
+            )
+        return redirect_with_notice(f"/searches/{run_id}", f"候选岗位导入失败：{str(exc)[:160]}", "error")
+
+
 @app.post("/jobs/analyze")
 async def analyze_job(request: Request) -> RedirectResponse:
     form = await request.form()
@@ -599,9 +776,10 @@ async def import_job_url(request: Request) -> RedirectResponse:
     resume_id = int(resume_id_raw) if resume_id_raw.isdigit() else None
     requested_depth = str(form.get("search_depth") or "auto")
     fetch_mode = str(form.get("fetch_mode") or "auto")
+    browser_channel = str(form.get("browser_channel") or "msedge")
     platform = str(form.get("platform") or "").strip()
     try:
-        fetched = fetch_job_from_url(source_url, fetch_mode=fetch_mode)
+        fetched = fetch_job_from_url(source_url, fetch_mode=fetch_mode, browser_channel=browser_channel)
     except Exception as exc:
         return redirect_with_notice("/jobs/new", f"链接导入失败：{str(exc)[:160]}", "error")
 

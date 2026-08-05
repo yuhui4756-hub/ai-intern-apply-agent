@@ -37,6 +37,12 @@
         <option value="browser">浏览器渲染：适合动态页面</option>
       </select>
     </label>
+    <label>浏览器
+      <select name="browser_channel">
+        <option value="msedge">Microsoft Edge</option>
+        <option value="chromium">Chromium</option>
+      </select>
+    </label>
     <label>简历版本
       <select name="selected_resume_id">
         {% for resume in resumes %}

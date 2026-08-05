@@ -38,7 +38,7 @@ def test_auto_fetch_falls_back_to_browser(monkeypatch):
     def fail_http(_url):
         raise ValueError("页面文本太短")
 
-    def browser_fetch(_url):
+    def browser_fetch(_url, browser_channel="msedge"):
         return FetchResult(
             url="https://jobs.example.com/ai",
             final_url="https://jobs.example.com/ai",

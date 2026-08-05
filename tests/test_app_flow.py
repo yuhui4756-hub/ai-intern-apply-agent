@@ -1,6 +1,7 @@
 from fastapi.testclient import TestClient
 
 from app.services.job_fetcher import FetchResult
+from app.services.job_searcher import SearchCandidate, SearchResult
 
 
 def test_job_form_and_reanalysis_flow(tmp_path, monkeypatch):
@@ -107,7 +108,7 @@ def test_import_job_from_url_flow(tmp_path, monkeypatch):
     monkeypatch.setattr(
         main,
         "fetch_job_from_url",
-        lambda _url, fetch_mode="auto": FetchResult(
+        lambda _url, fetch_mode="auto", browser_channel="msedge": FetchResult(
             url="https://jobs.example.com/ai-intern",
             final_url="https://jobs.example.com/ai-intern",
             title="AI 应用开发实习生 - 链接测试",
@@ -137,3 +138,74 @@ def test_import_job_from_url_flow(tmp_path, monkeypatch):
         row = conn.execute("SELECT source_url, platform FROM job_postings ORDER BY id DESC LIMIT 1").fetchone()
     assert row["source_url"] == "https://jobs.example.com/ai-intern"
     assert row["platform"] == "岗位链接"
+
+
+def test_search_run_and_candidate_import_flow(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "search.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db
+
+    monkeypatch.setattr(main, "search_company", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        main,
+        "search_jobs_with_browser",
+        lambda platform, keyword, city, browser_channel="msedge": SearchResult(
+            platform=platform,
+            keyword=keyword,
+            city=city,
+            search_url="https://jobs.example.com/search?q=AI",
+            browser_channel=browser_channel,
+            candidates=[
+                SearchCandidate(
+                    title="AI Agent 开发实习生",
+                    company="杭州搜索智能科技有限公司",
+                    city=city,
+                    source_url="https://jobs.example.com/detail/1",
+                    summary="AI Agent 开发实习生 Python RAG FastAPI",
+                )
+            ],
+        ),
+    )
+    monkeypatch.setattr(
+        main,
+        "fetch_job_from_url",
+        lambda _url, fetch_mode="auto", browser_channel="msedge": FetchResult(
+            url="https://jobs.example.com/detail/1",
+            final_url="https://jobs.example.com/detail/1",
+            title="AI Agent 开发实习生",
+            text="公司名称：杭州搜索智能科技有限公司\nAI Agent 开发实习生\n要求 Python、RAG、FastAPI，每周 5 天。",
+            fetch_mode="http",
+        ),
+    )
+    init_db()
+    client = TestClient(main.app)
+
+    page = client.get("/searches")
+    assert page.status_code == 200
+    assert "岗位搜索" in page.text
+
+    search_response = client.post(
+        "/searches",
+        data={"platform": "Boss 直聘", "keyword": "AI Agent 实习", "city": "杭州", "browser_channel": "msedge"},
+        follow_redirects=False,
+    )
+    assert search_response.status_code == 303
+    detail = client.get(search_response.headers["location"])
+    assert "已采集 1 个候选岗位" in detail.text
+    assert "杭州搜索智能科技有限公司" in detail.text
+
+    with connect() as conn:
+        candidate_id = conn.execute("SELECT id FROM job_candidates LIMIT 1").fetchone()["id"]
+
+    import_response = client.post(
+        f"/candidates/{candidate_id}/import",
+        data={"selected_resume_id": "1", "fetch_mode": "auto", "browser_channel": "msedge"},
+        follow_redirects=False,
+    )
+    assert import_response.status_code == 303
+    imported = client.get(import_response.headers["location"])
+    assert "杭州搜索智能科技有限公司" in imported.text
+    with connect() as conn:
+        status = conn.execute("SELECT status FROM job_candidates WHERE id = ?", (candidate_id,)).fetchone()["status"]
+    assert status == "已导入"

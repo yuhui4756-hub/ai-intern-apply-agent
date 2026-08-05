@@ -1,0 +1,82 @@
+{% extends "layout.html" %}
+{% block title %}搜索候选 - 简历投递 Agent{% endblock %}
+{% block content %}
+<section class="page-head">
+  <div>
+    <h1>{{ run.platform }} - {{ run.keyword }}</h1>
+    <p>{{ run.city or "不限城市" }} · {{ browser_channel_label(run.browser_channel) }} · {{ run.status }}</p>
+  </div>
+  <a class="button" href="/searches">返回搜索</a>
+</section>
+
+{% if notice %}
+<section class="notice {{ notice_type }}">{{ notice }}</section>
+{% endif %}
+
+{% if run.note %}
+<section class="notice">{{ run.note }}</section>
+{% endif %}
+
+<section class="panel">
+  <div class="panel-title">
+    <h2>候选岗位</h2>
+    <a href="{{ run.search_url }}" target="_blank" rel="noreferrer">打开搜索页</a>
+  </div>
+  {% if candidates %}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>岗位</th>
+          <th>公司</th>
+          <th>状态</th>
+          <th>摘要</th>
+          <th>操作</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for candidate in candidates %}
+        <tr>
+          <td>
+            <a href="{{ candidate.source_url }}" target="_blank" rel="noreferrer">{{ candidate.title or "候选岗位" }}</a>
+            <div class="muted">{{ candidate.city or "-" }}</div>
+          </td>
+          <td>{{ candidate.company or "-" }}</td>
+          <td>
+            {{ candidate.status }}
+            {% if candidate.error_message %}
+            <div class="muted">{{ candidate.error_message }}</div>
+            {% endif %}
+          </td>
+          <td>{{ candidate.summary or "-" }}</td>
+          <td>
+            {% if candidate.job_id %}
+            <a class="button compact" href="/jobs/{{ candidate.job_id }}">查看岗位</a>
+            {% else %}
+            <form method="post" action="/candidates/{{ candidate.id }}/import" class="inline-form">
+              <select name="selected_resume_id">
+                {% for resume in resumes %}
+                <option value="{{ resume.id }}">{{ resume.name }}</option>
+                {% endfor %}
+              </select>
+              <select name="fetch_mode">
+                <option value="auto">自动</option>
+                <option value="http">普通网页</option>
+                <option value="browser">浏览器渲染</option>
+              </select>
+              <input type="hidden" name="browser_channel" value="{{ run.browser_channel }}">
+              <input type="hidden" name="search_depth" value="auto">
+              <button class="button compact primary" type="submit">导入分析</button>
+            </form>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">没有识别到候选岗位。</p>
+  {% endif %}
+</section>
+{% endblock %}

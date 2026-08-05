@@ -130,6 +130,36 @@ def init_db() -> None:
                 FOREIGN KEY(job_id) REFERENCES job_postings(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS job_search_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                platform TEXT NOT NULL DEFAULT '',
+                keyword TEXT NOT NULL DEFAULT '',
+                city TEXT NOT NULL DEFAULT '',
+                search_url TEXT NOT NULL DEFAULT '',
+                browser_channel TEXT NOT NULL DEFAULT 'msedge',
+                status TEXT NOT NULL DEFAULT '',
+                note TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS job_candidates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                search_run_id INTEGER NOT NULL,
+                job_id INTEGER,
+                platform TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL DEFAULT '',
+                company TEXT NOT NULL DEFAULT '',
+                city TEXT NOT NULL DEFAULT '',
+                source_url TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT '候选',
+                error_message TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(search_run_id) REFERENCES job_search_runs(id) ON DELETE CASCADE,
+                FOREIGN KEY(job_id) REFERENCES job_postings(id) ON DELETE SET NULL
+            );
+
             CREATE TABLE IF NOT EXISTS application_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 job_id INTEGER NOT NULL,

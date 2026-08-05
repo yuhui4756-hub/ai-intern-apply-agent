@@ -144,20 +144,36 @@ def validate_fetched_text(text: str) -> str:
     return normalized[:20000]
 
 
-def fetch_job_from_url(url: str, fetch_mode: str = "auto") -> FetchResult:
+def normalize_browser_channel(value: str = "msedge") -> str:
+    channel = (value or "msedge").strip().lower()
+    if channel in {"edge", "msedge", "microsoft-edge"}:
+        return "msedge"
+    if channel in {"chromium", "bundled"}:
+        return "chromium"
+    raise ValueError("浏览器类型无效。")
+
+
+def launch_chromium_browser(playwright, browser_channel: str = "msedge", *, headless: bool = True):
+    channel = normalize_browser_channel(browser_channel)
+    if channel == "msedge":
+        return playwright.chromium.launch(channel="msedge", headless=headless)
+    return playwright.chromium.launch(headless=headless)
+
+
+def fetch_job_from_url(url: str, fetch_mode: str = "auto", browser_channel: str = "msedge") -> FetchResult:
     mode = (fetch_mode or "auto").strip().lower()
     if mode not in {"auto", "http", "browser"}:
         raise ValueError("抓取模式无效。")
     if mode == "http":
         return fetch_job_with_http(url)
     if mode == "browser":
-        return fetch_job_with_browser(url)
+        return fetch_job_with_browser(url, browser_channel=browser_channel)
 
     try:
         return fetch_job_with_http(url)
     except Exception as http_exc:
         try:
-            result = fetch_job_with_browser(url)
+            result = fetch_job_with_browser(url, browser_channel=browser_channel)
             result.note = f"HTTP 抓取失败后改用浏览器抓取：{str(http_exc)[:120]}"
             return result
         except Exception as browser_exc:
@@ -188,18 +204,18 @@ def fetch_job_with_http(url: str) -> FetchResult:
     return FetchResult(url=safe_url, final_url=final_url, title=title, text=validate_fetched_text(text), fetch_mode="http")
 
 
-def fetch_job_with_browser(url: str) -> FetchResult:
+def fetch_job_with_browser(url: str, browser_channel: str = "msedge") -> FetchResult:
     safe_url = ensure_public_http_url(url)
     try:
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
         from playwright.sync_api import sync_playwright
     except ImportError as exc:
-        raise ValueError("浏览器抓取需要安装 Playwright：pip install playwright，并运行 python -m playwright install chromium。") from exc
+        raise ValueError("浏览器抓取需要安装 Playwright：pip install playwright。") from exc
 
     browser = None
     try:
         with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(headless=True)
+            browser = launch_chromium_browser(playwright, browser_channel, headless=True)
             page = browser.new_page(
                 user_agent="Mozilla/5.0 (compatible; AIInternApplyAgent/0.1; +https://github.com/yuhui4756-hub/ai-intern-apply-agent)",
                 viewport={"width": 1366, "height": 900},
@@ -219,6 +235,9 @@ def fetch_job_with_browser(url: str) -> FetchResult:
     except Exception as exc:
         message = str(exc)
         if "Executable doesn't exist" in message or "playwright install" in message:
+            channel = normalize_browser_channel(browser_channel)
+            if channel == "msedge":
+                raise ValueError("未找到 Microsoft Edge，请安装 Edge，或改选 Chromium 并运行 python -m playwright install chromium。") from exc
             raise ValueError("浏览器抓取需要先安装 Chromium：python -m playwright install chromium。") from exc
         raise ValueError(f"浏览器抓取失败：{message[:180]}") from exc
     finally:
