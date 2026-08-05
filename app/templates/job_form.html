@@ -14,7 +14,47 @@
 <section class="notice">模型尚未配置或连接不可用：本次会使用本地规则分析。可在设置页填写 API Key 并测试连接。</section>
 {% endif %}
 
+{% if notice %}
+<section class="notice {{ notice_type }}">{{ notice }}</section>
+{% endif %}
+
+<form method="post" action="/jobs/import-url" class="panel form-stack">
+  <div class="panel-title">
+    <h2>从链接导入</h2>
+    <span class="badge">预览保存</span>
+  </div>
+  <div class="form-grid">
+    <label>平台
+      <input name="platform" placeholder="可留空，自动按域名识别">
+    </label>
+    <label>岗位链接
+      <input name="source_url" required placeholder="https://...">
+    </label>
+    <label>简历版本
+      <select name="selected_resume_id">
+        {% for resume in resumes %}
+        <option value="{{ resume.id }}">{{ resume.name }} - {{ resume.target_role }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>搜索深度
+      <select name="search_depth">
+        <option value="auto">自动分档</option>
+        <option value="quick">快速</option>
+        <option value="standard">标准</option>
+        <option value="deep">深度</option>
+      </select>
+    </label>
+  </div>
+  <div class="form-actions">
+    <button class="button primary" type="submit">抓取链接并分析</button>
+  </div>
+</form>
+
 <form method="post" action="/jobs/analyze" class="panel form-stack">
+  <div class="panel-title">
+    <h2>单条粘贴</h2>
+  </div>
   <div class="form-grid">
     <label>平台
       <input name="platform" placeholder="Boss 直聘 / 实习僧 / 牛客 / 公司官网">

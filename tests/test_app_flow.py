@@ -1,5 +1,7 @@
 from fastapi.testclient import TestClient
 
+from app.services.job_fetcher import FetchResult
+
 
 def test_job_form_and_reanalysis_flow(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "app.sqlite3"))
@@ -93,3 +95,43 @@ def test_bulk_import_and_status_update_flow(tmp_path, monkeypatch):
     with connect() as conn:
         status = conn.execute("SELECT status FROM job_postings WHERE id = ?", (actionable_id,)).fetchone()["status"]
     assert status == "待投递"
+
+
+def test_import_job_from_url_flow(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "url.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db
+
+    monkeypatch.setattr(main, "search_company", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        main,
+        "fetch_job_from_url",
+        lambda _url: FetchResult(
+            url="https://jobs.example.com/ai-intern",
+            final_url="https://jobs.example.com/ai-intern",
+            title="AI 应用开发实习生 - 链接测试",
+            text="公司名称：杭州链接智能科技有限公司\nAI 应用开发实习生\n要求 Python、RAG、FastAPI，每周 5 天。",
+        ),
+    )
+    init_db()
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/jobs/import-url",
+        data={
+            "source_url": "https://jobs.example.com/ai-intern",
+            "selected_resume_id": "1",
+            "search_depth": "quick",
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    detail = client.get(response.headers["location"])
+    assert "已从岗位链接导入并完成分析" in detail.text
+    assert "杭州链接智能科技有限公司" in detail.text
+    with connect() as conn:
+        row = conn.execute("SELECT source_url, platform FROM job_postings ORDER BY id DESC LIMIT 1").fetchone()
+    assert row["source_url"] == "https://jobs.example.com/ai-intern"
+    assert row["platform"] == "岗位链接"

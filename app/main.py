@@ -21,6 +21,7 @@ from .services.analyzer import (
     rule_extract_jd,
     score_job,
 )
+from .services.job_fetcher import fetch_job_from_url
 from .services.llm import OpenAICompatibleClient, client_for_task
 from .services.research import search_company
 from .services.resume import read_resume_text
@@ -256,6 +257,21 @@ def split_batch_jds(raw_text: str) -> list[str]:
             return [text[boundaries[index] : boundaries[index + 1]].strip() for index in range(len(boundaries) - 1)]
 
     return [text]
+
+
+def infer_platform_from_url(url: str) -> str:
+    lowered = url.lower()
+    if "zhipin.com" in lowered:
+        return "Boss 直聘"
+    if "liepin.com" in lowered:
+        return "猎聘"
+    if "shixiseng.com" in lowered:
+        return "实习僧"
+    if "zhaopin.com" in lowered:
+        return "智联招聘"
+    if "51job.com" in lowered or "we.51job.com" in lowered:
+        return "前程无忧"
+    return "岗位链接"
 
 
 def initial_job_status(jd_text: str, scoring: dict[str, Any]) -> str:
@@ -500,6 +516,8 @@ def new_job_page(request: Request) -> Any:
             "resumes": [{key: row[key] for key in row.keys()} for row in resumes],
             "model_configured": bool(jd_client and jd_client.configured),
             "bulk_import_limit": BULK_IMPORT_LIMIT,
+            "notice": request.query_params.get("notice", ""),
+            "notice_type": request.query_params.get("notice_type", "info"),
         },
     )
 
@@ -563,6 +581,36 @@ async def bulk_analyze_jobs(request: Request) -> RedirectResponse:
     if truncated:
         message += f" 单次最多处理 {BULK_IMPORT_LIMIT} 条，其余内容未导入。"
     return redirect_with_notice("/jobs", message, "success")
+
+
+@app.post("/jobs/import-url")
+async def import_job_url(request: Request) -> RedirectResponse:
+    form = await request.form()
+    source_url = str(form.get("source_url") or "").strip()
+    resume_id_raw = str(form.get("selected_resume_id") or "")
+    resume_id = int(resume_id_raw) if resume_id_raw.isdigit() else None
+    requested_depth = str(form.get("search_depth") or "auto")
+    platform = str(form.get("platform") or "").strip()
+    try:
+        fetched = fetch_job_from_url(source_url)
+    except Exception as exc:
+        return redirect_with_notice("/jobs/new", f"链接导入失败：{str(exc)[:160]}", "error")
+
+    with connect() as conn:
+        job_id, _analysis = create_job_record(
+            conn,
+            jd_text=fetched.text,
+            resume_id=resume_id,
+            platform=platform or infer_platform_from_url(fetched.final_url),
+            source_url=fetched.final_url,
+            title=fetched.title,
+            search_depth=requested_depth,
+        )
+        conn.execute(
+            "INSERT INTO application_events (job_id, event_type, content, created_at) VALUES (?, ?, ?, ?)",
+            (job_id, "链接导入", f"从 {fetched.final_url} 抓取页面文本并生成岗位记录。", utc_now()),
+        )
+    return redirect_with_notice(f"/jobs/{job_id}", "已从岗位链接导入并完成分析。", "success")
 
 
 @app.post("/jobs/bulk-status")
