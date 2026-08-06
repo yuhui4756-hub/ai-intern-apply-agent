@@ -484,7 +484,7 @@ def test_extension_conversation_capture_creates_safe_draft(tmp_path, monkeypatch
 
 
 def test_liepin_resume_button_does_not_trigger_manual_review():
-    from app.services.conversation import classify_conversation, compact_conversation_text
+    from app.services.conversation import classify_conversation, prepare_conversation_text
 
     text = """
     张女士 杭州聚泽工程项目管理有限...
@@ -504,11 +504,13 @@ def test_liepin_resume_button_does_not_trigger_manual_review():
     发送
     """
 
-    clean = compact_conversation_text(text)
+    prepared = prepare_conversation_text(text)
+    clean = prepared["clean_text"]
     result = classify_conversation(text, {"title": "成本助理实习生"})
 
     assert "发简历" not in clean
     assert "交换手机号" not in clean
+    assert "发简历" in prepared["ignored_lines"]
     assert result["message_type"] == "岗位沟通"
     assert result["action_required"] is False
     assert result["draft_message"]
@@ -522,6 +524,65 @@ def test_hr_resume_request_still_triggers_manual_review():
     assert result["message_type"] == "需要我处理"
     assert result["action_required"] is True
     assert result["draft_message"] == ""
+
+
+def test_conversation_capture_stores_cleaning_debug_and_feedback(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "conversation-feedback.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db
+
+    monkeypatch.setattr(main, "search_company", lambda *args, **kwargs: [])
+    init_db()
+    client = TestClient(main.app)
+
+    job_response = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "job",
+            "url": "https://www.liepin.com/job/debug-1.html",
+            "title": "成本助理实习生",
+            "text": "公司名称：杭州聚泽工程项目管理有限公司\n成本助理实习生\n支持 AI 工具整理数据。",
+        },
+    )
+    job_id = job_response.json()["job_id"]
+    response = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "conversation",
+            "url": "https://www.liepin.com/im/chat/debug-1",
+            "title": "猎聘 HR 对话",
+            "text": "HR：我们正在招成本助理实习生，您可以看下职位信息，有兴趣可以聊一聊\n发简历\n交换手机号\n请输入文字，按Enter键发送",
+        },
+    )
+    assert response.status_code == 200
+    capture_id = response.json()["capture_id"]
+
+    with connect() as conn:
+        capture = conn.execute("SELECT * FROM conversation_captures WHERE id = ?", (capture_id,)).fetchone()
+    assert capture["job_id"] == job_id
+    assert "发简历" in capture["raw_visible_text"]
+    assert "发简历" not in capture["conversation_text"]
+    assert "发简历" in capture["ignored_lines_json"]
+
+    feedback = client.post(
+        f"/conversation-captures/{capture_id}/feedback",
+        data={
+            "feedback_status": "误判",
+            "expected_message_type": "岗位沟通",
+            "feedback_note": "猎聘底部发简历按钮不应触发人工处理。",
+        },
+        follow_redirects=False,
+    )
+    assert feedback.status_code == 303
+
+    with connect() as conn:
+        capture = conn.execute("SELECT feedback_status, expected_message_type, feedback_note FROM conversation_captures WHERE id = ?", (capture_id,)).fetchone()
+        event = conn.execute("SELECT event_type, content FROM application_events WHERE job_id = ? ORDER BY id DESC LIMIT 1", (job_id,)).fetchone()
+    assert capture["feedback_status"] == "误判"
+    assert capture["expected_message_type"] == "岗位沟通"
+    assert "猎聘底部发简历按钮" in capture["feedback_note"]
+    assert event["event_type"] == "对话分类反馈"
 
 
 def test_extension_conversation_capture_marks_interview_invite(tmp_path, monkeypatch):

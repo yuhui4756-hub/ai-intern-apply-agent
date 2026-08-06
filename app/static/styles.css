@@ -339,6 +339,33 @@ th {
   overflow-x: auto;
 }
 
+.compact-pre {
+  max-height: 180px;
+  margin: 8px 0 12px;
+  font-size: 12px;
+}
+
+.debug-details {
+  margin-top: 8px;
+}
+
+.debug-details summary {
+  color: var(--accent-dark);
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.compact-form {
+  gap: 8px;
+  min-width: 220px;
+}
+
+.compact-form textarea,
+.compact-form select {
+  font-size: 13px;
+  padding: 7px 8px;
+}
+
 .copy-area {
   min-height: 160px;
 }

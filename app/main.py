@@ -24,7 +24,7 @@ from .services.analyzer import (
     rule_extract_jd,
     score_job,
 )
-from .services.conversation import classify_conversation, compact_conversation_text
+from .services.conversation import classify_conversation, prepare_conversation_text
 from .services.job_fetcher import ensure_public_http_url, fetch_job_from_url, normalize_visible_text
 from .services.job_searcher import (
     SearchResult,
@@ -774,7 +774,8 @@ def create_conversation_from_extension(payload: dict[str, Any]) -> dict[str, Any
 
     title = payload_text(payload, "title", 300)
     platform = extension_platform(url, payload_text(payload, "platform", 80))
-    conversation_text = compact_conversation_text(str(payload.get("text") or ""))
+    prepared_text = prepare_conversation_text(str(payload.get("text") or ""))
+    conversation_text = str(prepared_text["clean_text"])
     if len(conversation_text) < 20:
         return api_error("当前页面可见对话文本太短，无法分析。")
 
@@ -787,16 +788,19 @@ def create_conversation_from_extension(payload: dict[str, Any]) -> dict[str, Any
         cursor = conn.execute(
             """
             INSERT INTO conversation_captures (
-                job_id, platform, source_url, page_title, conversation_text,
-                message_type, summary, action_required, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                job_id, platform, source_url, page_title, raw_visible_text,
+                conversation_text, ignored_lines_json, message_type, summary,
+                action_required, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job_id,
                 platform,
                 url,
                 title,
+                str(prepared_text["raw_text"]),
                 conversation_text,
+                dumps(prepared_text["ignored_lines"]),
                 str(decision.get("message_type") or ""),
                 str(decision.get("summary") or ""),
                 1 if decision.get("action_required") else 0,
@@ -1153,6 +1157,14 @@ def communications_page(request: Request) -> Any:
             """
         ).fetchall()
         draft_counts = conn.execute("SELECT status, COUNT(*) AS count FROM message_drafts GROUP BY status").fetchall()
+        feedback_counts = conn.execute(
+            """
+            SELECT feedback_status AS status, COUNT(*) AS count
+            FROM conversation_captures
+            WHERE feedback_status != ''
+            GROUP BY feedback_status
+            """
+        ).fetchall()
     return templates.TemplateResponse(
         request,
         "communications.html",
@@ -1160,6 +1172,8 @@ def communications_page(request: Request) -> Any:
             "drafts": [{key: row[key] for key in row.keys()} for row in drafts],
             "captures": [{key: row[key] for key in row.keys()} for row in captures],
             "draft_counts": {row["status"]: row["count"] for row in draft_counts},
+            "feedback_counts": {row["status"]: row["count"] for row in feedback_counts},
+            "message_types": ["岗位沟通", "面试邀请", "需要我处理", "无关内容"],
             "loads": loads,
             "notice": request.query_params.get("notice", ""),
             "notice_type": request.query_params.get("notice_type", "info"),
@@ -1189,6 +1203,45 @@ async def update_message_draft(draft_id: int, request: Request) -> RedirectRespo
                 (row["job_id"], "沟通草稿已发送", message[:500], utc_now()),
             )
     return redirect_with_notice("/communications", "草稿已更新。", "success")
+
+
+@app.post("/conversation-captures/{capture_id}/feedback")
+async def update_conversation_feedback(capture_id: int, request: Request) -> RedirectResponse:
+    form = await request.form()
+    feedback_status = str(form.get("feedback_status") or "").strip()
+    expected_message_type = str(form.get("expected_message_type") or "").strip()
+    feedback_note = str(form.get("feedback_note") or "").strip()[:1000]
+    allowed_statuses = {"", "正确", "误判", "待观察"}
+    allowed_types = {"", "岗位沟通", "面试邀请", "需要我处理", "无关内容"}
+    if feedback_status not in allowed_statuses:
+        return redirect_with_notice("/communications", "反馈状态无效。", "error")
+    if expected_message_type not in allowed_types:
+        return redirect_with_notice("/communications", "期望分类无效。", "error")
+
+    now = utc_now()
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM conversation_captures WHERE id = ?", (capture_id,)).fetchone()
+        if not row:
+            return redirect_with_notice("/communications", "没有找到这条对话采集。", "error")
+        conn.execute(
+            """
+            UPDATE conversation_captures
+            SET feedback_status = ?, expected_message_type = ?, feedback_note = ?, feedback_updated_at = ?
+            WHERE id = ?
+            """,
+            (feedback_status, expected_message_type, feedback_note, now, capture_id),
+        )
+        if row["job_id"] and feedback_status:
+            event_content = f"分类反馈：{feedback_status}"
+            if expected_message_type:
+                event_content += f"；期望分类：{expected_message_type}"
+            if feedback_note:
+                event_content += f"；备注：{feedback_note}"
+            conn.execute(
+                "INSERT INTO application_events (job_id, event_type, content, created_at) VALUES (?, ?, ?, ?)",
+                (row["job_id"], "对话分类反馈", event_content[:500], now),
+            )
+    return redirect_with_notice("/communications", "对话采集反馈已保存。", "success")
 
 
 @app.get("/jobs/new")

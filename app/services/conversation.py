@@ -23,12 +23,33 @@ TIMESTAMP_LINE_RE = re.compile(r"^\d{1,2}:\d{2}$")
 
 
 def compact_conversation_text(text: str, limit: int = 12000) -> str:
-    normalized = normalize_visible_text(text or "")
-    lines = [line for line in normalized.splitlines() if not is_conversation_noise_line(line)]
-    normalized = "\n".join(lines).strip()
-    if len(normalized) <= limit:
-        return normalized
-    return normalized[-limit:]
+    return prepare_conversation_text(text, clean_limit=limit)["clean_text"]
+
+
+def prepare_conversation_text(text: str, clean_limit: int = 12000, raw_limit: int = 20000) -> dict[str, Any]:
+    raw_text = normalize_visible_text(text or "")
+    kept_lines: list[str] = []
+    ignored_lines: list[str] = []
+    for line in raw_text.splitlines():
+        clean_line = line.strip()
+        if is_conversation_noise_line(clean_line):
+            ignored_lines.append(clean_line)
+        else:
+            kept_lines.append(line)
+
+    clean_text = "\n".join(kept_lines).strip()
+    if len(raw_text) > raw_limit:
+        raw_text = raw_text[:raw_limit]
+    if len(clean_text) > clean_limit:
+        clean_text = clean_text[-clean_limit:]
+
+    return {
+        "raw_text": raw_text,
+        "clean_text": clean_text,
+        "ignored_lines": ignored_lines[:80],
+        "raw_length": len(raw_text),
+        "clean_length": len(clean_text),
+    }
 
 
 def is_conversation_noise_line(line: str) -> bool:

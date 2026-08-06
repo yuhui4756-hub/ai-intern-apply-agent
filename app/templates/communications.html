@@ -18,6 +18,7 @@
   <div class="metric"><span>需要我处理</span><strong>{{ draft_counts.get("需要我处理", 0) }}</strong></div>
   <div class="metric"><span>已发送</span><strong>{{ draft_counts.get("已发送", 0) }}</strong></div>
   <div class="metric"><span>已驳回</span><strong>{{ draft_counts.get("已驳回", 0) }}</strong></div>
+  <div class="metric"><span>误判反馈</span><strong>{{ feedback_counts.get("误判", 0) }}</strong></div>
 </section>
 
 <section class="panel">
@@ -92,6 +93,7 @@
           <th>岗位</th>
           <th>类型</th>
           <th>摘要</th>
+          <th>校准反馈</th>
         </tr>
       </thead>
       <tbody>
@@ -107,7 +109,44 @@
             <div class="muted">{{ capture.platform or "-" }}</div>
           </td>
           <td>{{ capture.message_type or "-" }}</td>
-          <td>{{ capture.summary or "-" }}</td>
+          <td>
+            <p>{{ capture.summary or "-" }}</p>
+            <details class="debug-details">
+              <summary>查看采集依据</summary>
+              {% set ignored = loads(capture.ignored_lines_json, []) %}
+              {% if ignored %}
+              <p class="muted">已过滤页面按钮 / 系统噪声</p>
+              <pre class="pre compact-pre">{{ ignored | join("\n") }}</pre>
+              {% endif %}
+              <p class="muted">清洗后文本</p>
+              <pre class="pre compact-pre">{{ capture.conversation_text or "-" }}</pre>
+              <p class="muted">原始可见文本</p>
+              <pre class="pre compact-pre">{{ capture.raw_visible_text or capture.conversation_text or "-" }}</pre>
+            </details>
+          </td>
+          <td>
+            <form method="post" action="/conversation-captures/{{ capture.id }}" class="form-stack compact-form">
+              <label>反馈
+                <select name="feedback_status">
+                  {% for status in ["", "正确", "误判", "待观察"] %}
+                  <option value="{{ status }}" {% if capture.feedback_status == status %}selected{% endif %}>{{ status or "未标记" }}</option>
+                  {% endfor %}
+                </select>
+              </label>
+              <label>期望分类
+                <select name="expected_message_type">
+                  <option value="" {% if not capture.expected_message_type %}selected{% endif %}>不指定</option>
+                  {% for message_type in message_types %}
+                  <option value="{{ message_type }}" {% if capture.expected_message_type == message_type %}selected{% endif %}>{{ message_type }}</option>
+                  {% endfor %}
+                </select>
+              </label>
+              <label>备注
+                <textarea name="feedback_note" rows="3" placeholder="比如：猎聘底部按钮发简历被误判">{{ capture.feedback_note }}</textarea>
+              </label>
+              <button class="button compact" type="submit">保存反馈</button>
+            </form>
+          </td>
         </tr>
         {% endfor %}
       </tbody>

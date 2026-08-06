@@ -175,10 +175,16 @@ def init_db() -> None:
                 platform TEXT NOT NULL DEFAULT '',
                 source_url TEXT NOT NULL DEFAULT '',
                 page_title TEXT NOT NULL DEFAULT '',
+                raw_visible_text TEXT NOT NULL DEFAULT '',
                 conversation_text TEXT NOT NULL DEFAULT '',
+                ignored_lines_json TEXT NOT NULL DEFAULT '[]',
                 message_type TEXT NOT NULL DEFAULT '',
                 summary TEXT NOT NULL DEFAULT '',
                 action_required INTEGER NOT NULL DEFAULT 0,
+                feedback_status TEXT NOT NULL DEFAULT '',
+                expected_message_type TEXT NOT NULL DEFAULT '',
+                feedback_note TEXT NOT NULL DEFAULT '',
+                feedback_updated_at TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(job_id) REFERENCES job_postings(id) ON DELETE SET NULL
             );
@@ -263,12 +269,26 @@ def init_db() -> None:
 
 
 def ensure_columns(conn: sqlite3.Connection) -> None:
-    table_columns = {
-        row["name"]
-        for row in conn.execute("PRAGMA table_info(job_postings)").fetchall()
-    }
-    if "analysis_source" not in table_columns:
+    job_columns = table_column_names(conn, "job_postings")
+    if "analysis_source" not in job_columns:
         conn.execute("ALTER TABLE job_postings ADD COLUMN analysis_source TEXT NOT NULL DEFAULT 'local_rules'")
+
+    conversation_columns = table_column_names(conn, "conversation_captures")
+    conversation_defaults = {
+        "raw_visible_text": "TEXT NOT NULL DEFAULT ''",
+        "ignored_lines_json": "TEXT NOT NULL DEFAULT '[]'",
+        "feedback_status": "TEXT NOT NULL DEFAULT ''",
+        "expected_message_type": "TEXT NOT NULL DEFAULT ''",
+        "feedback_note": "TEXT NOT NULL DEFAULT ''",
+        "feedback_updated_at": "TEXT NOT NULL DEFAULT ''",
+    }
+    for column, definition in conversation_defaults.items():
+        if column not in conversation_columns:
+            conn.execute(f"ALTER TABLE conversation_captures ADD COLUMN {column} {definition}")
+
+
+def table_column_names(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
 
 
 def seed_defaults(conn: sqlite3.Connection) -> None:
