@@ -92,6 +92,60 @@
 
 <section class="panel">
   <div class="panel-title">
+    <h2>最近行为日志</h2>
+    <span class="muted">记录采集、草稿处理、反馈和设置变更。</span>
+  </div>
+  {% if action_logs %}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>时间</th>
+          <th>动作</th>
+          <th>状态</th>
+          <th>对象</th>
+          <th>摘要</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for log in action_logs %}
+        <tr>
+          <td>{{ log.created_at }}</td>
+          <td>{{ action_type_label(log.action_type) }}</td>
+          <td>{{ log.status or "-" }}</td>
+          <td>
+            {% if log.job_id %}
+            <a href="/jobs/{{ log.job_id }}">{{ (log.company ~ " - " if log.company else "") ~ (log.job_title or "岗位") }}</a>
+            {% else %}
+            <span class="empty">全局</span>
+            {% endif %}
+            <div class="muted">{{ log.platform or "-" }}</div>
+          </td>
+          <td>
+            <p>{{ log.summary or "-" }}</p>
+            {% set decision = loads(log.decision_json, {}) %}
+            {% if decision %}
+            <details class="debug-details">
+              <summary>查看决策摘要</summary>
+              <pre class="pre compact-pre">{{ decision }}</pre>
+            </details>
+            {% endif %}
+            {% if log.error_message %}
+            <div class="notice compact error">{{ log.error_message }}</div>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">暂无行为日志。</p>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <div class="panel-title">
     <h2>最近对话采集</h2>
   </div>
   {% if captures %}

@@ -476,11 +476,15 @@ def test_extension_conversation_capture_creates_safe_draft(tmp_path, monkeypatch
     with connect() as conn:
         capture = conn.execute("SELECT message_type, action_required FROM conversation_captures ORDER BY id DESC LIMIT 1").fetchone()
         draft = conn.execute("SELECT status, message, draft_type FROM message_drafts ORDER BY id DESC LIMIT 1").fetchone()
+        action_log = conn.execute("SELECT action_type, status, decision_json FROM agent_action_logs ORDER BY id DESC LIMIT 1").fetchone()
     assert capture["message_type"] == "岗位沟通"
     assert capture["action_required"] == 0
     assert draft["status"] == "待确认"
     assert draft["draft_type"] == "岗位沟通"
     assert "主要工作内容" in draft["message"]
+    assert action_log["action_type"] == "conversation_capture"
+    assert action_log["status"] == "岗位沟通"
+    assert "draft_status" in action_log["decision_json"]
 
 
 def test_liepin_resume_button_does_not_trigger_manual_review():
@@ -524,6 +528,51 @@ def test_hr_resume_request_still_triggers_manual_review():
     assert result["message_type"] == "需要我处理"
     assert result["action_required"] is True
     assert result["draft_message"] == ""
+
+
+def test_message_draft_status_update_writes_action_log(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "draft-action-log.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db
+
+    monkeypatch.setattr(main, "search_company", lambda *args, **kwargs: [])
+    init_db()
+    client = TestClient(main.app)
+
+    client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "job",
+            "url": "https://www.zhipin.com/job_detail/draft-log.html",
+            "title": "AI 应用开发实习生",
+            "text": "公司名称：深圳日志智能科技有限公司\nAI 应用开发实习生\n要求 Python、FastAPI、RAG，每周 5 天。",
+        },
+    )
+    captured = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "conversation",
+            "url": "https://www.zhipin.com/job_detail/draft-log.html",
+            "title": "深圳日志智能科技有限公司 HR 对话",
+            "text": "HR：可以的，你想了解工作内容还是实习周期？",
+        },
+    )
+    draft_id = captured.json()["draft_id"]
+
+    response = client.post(
+        f"/message-drafts/{draft_id}",
+        data={"status": "已发送", "message": "您好，想了解工作内容和实习周期。"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    with connect() as conn:
+        action_log = conn.execute("SELECT action_type, status, summary, decision_json FROM agent_action_logs ORDER BY id DESC LIMIT 1").fetchone()
+    assert action_log["action_type"] == "draft_status_update"
+    assert action_log["status"] == "已发送"
+    assert "待确认 -> 已发送" in action_log["summary"]
+    assert "message_length" in action_log["decision_json"]
 
 
 def test_conversation_capture_stores_cleaning_debug_and_feedback(tmp_path, monkeypatch):
@@ -579,17 +628,21 @@ def test_conversation_capture_stores_cleaning_debug_and_feedback(tmp_path, monke
     with connect() as conn:
         capture = conn.execute("SELECT feedback_status, expected_message_type, feedback_note FROM conversation_captures WHERE id = ?", (capture_id,)).fetchone()
         event = conn.execute("SELECT event_type, content FROM application_events WHERE job_id = ? ORDER BY id DESC LIMIT 1", (job_id,)).fetchone()
+        action_log = conn.execute("SELECT action_type, status, decision_json FROM agent_action_logs ORDER BY id DESC LIMIT 1").fetchone()
     assert capture["feedback_status"] == "误判"
     assert capture["expected_message_type"] == "岗位沟通"
     assert "猎聘底部发简历按钮" in capture["feedback_note"]
     assert event["event_type"] == "对话分类反馈"
+    assert action_log["action_type"] == "conversation_feedback"
+    assert action_log["status"] == "误判"
+    assert "expected_message_type" in action_log["decision_json"]
 
 
 def test_settings_updates_communication_policy(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "communication-settings.sqlite3"))
 
     from app import main
-    from app.db import get_setting, init_db
+    from app.db import connect, get_setting, init_db
 
     init_db()
     client = TestClient(main.app)
@@ -604,6 +657,11 @@ def test_settings_updates_communication_policy(tmp_path, monkeypatch):
     policy = get_setting("communication_policy", {})
     assert policy["mode"] == "autonomous"
     assert policy["max_auto_followups"] == 3
+    with connect() as conn:
+        action_log = conn.execute("SELECT action_type, status, decision_json FROM agent_action_logs ORDER BY id DESC LIMIT 1").fetchone()
+    assert action_log["action_type"] == "communication_policy_update"
+    assert action_log["status"] == "autonomous"
+    assert "new_max_auto_followups" in action_log["decision_json"]
 
 
 def test_conversation_capture_skips_when_communication_mode_off(tmp_path, monkeypatch):
@@ -632,7 +690,9 @@ def test_conversation_capture_skips_when_communication_mode_off(tmp_path, monkey
     assert payload["message_type"] == "沟通模式已关闭"
     with connect() as conn:
         count = conn.execute("SELECT COUNT(*) AS count FROM conversation_captures").fetchone()["count"]
+        log_count = conn.execute("SELECT COUNT(*) AS count FROM agent_action_logs").fetchone()["count"]
     assert count == 0
+    assert log_count == 0
 
 
 def test_autonomous_mode_pauses_after_followup_limit(tmp_path, monkeypatch):

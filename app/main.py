@@ -83,6 +83,15 @@ def communication_mode_label(value: str) -> str:
     return dict(COMMUNICATION_MODES).get(value or "", "草稿模式")
 
 
+def action_type_label(value: str) -> str:
+    return {
+        "conversation_capture": "对话采集",
+        "draft_status_update": "草稿处理",
+        "conversation_feedback": "分类反馈",
+        "communication_policy_update": "沟通设置",
+    }.get(value or "", value or "-")
+
+
 def communication_policy() -> dict[str, Any]:
     saved = get_setting(COMMUNICATION_POLICY_KEY, {}) or {}
     mode = str(saved.get("mode") or "draft")
@@ -97,6 +106,42 @@ def communication_policy() -> dict[str, Any]:
         "mode_label": communication_mode_label(mode),
         "max_auto_followups": max(0, min(max_followups, 10)),
     }
+
+
+def log_agent_action(
+    conn: Any,
+    *,
+    action_type: str,
+    status: str,
+    summary: str = "",
+    platform: str = "",
+    job_id: int | None = None,
+    capture_id: int | None = None,
+    draft_id: int | None = None,
+    decision: dict[str, Any] | None = None,
+    error_message: str = "",
+) -> int:
+    cursor = conn.execute(
+        """
+        INSERT INTO agent_action_logs (
+            job_id, capture_id, draft_id, platform, action_type, status,
+            summary, decision_json, error_message, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            job_id,
+            capture_id,
+            draft_id,
+            platform,
+            action_type,
+            status,
+            summary[:500],
+            dumps(decision or {}),
+            error_message[:500],
+            utc_now(),
+        ),
+    )
+    return int(cursor.lastrowid)
 
 
 def parse_json_fields(job: dict[str, Any]) -> dict[str, Any]:
@@ -958,6 +1003,34 @@ def create_conversation_from_extension(payload: dict[str, Any]) -> dict[str, Any
                 "INSERT INTO application_events (job_id, event_type, content, created_at) VALUES (?, ?, ?, ?)",
                 (job_id, "面试邀请识别", str(decision.get("summary") or "HR 对话中提到面试或笔试。"), now),
             )
+        if decision.get("message_type") == "面试邀请":
+            action_status = "面试邀请"
+        elif draft_id and draft_status == "待确认":
+            action_status = str(decision.get("draft_type") or "草稿待确认")
+        elif draft_id and draft_status == "需要我处理":
+            action_status = "需要我处理"
+        else:
+            action_status = "已采集"
+        log_agent_action(
+            conn,
+            action_type="conversation_capture",
+            status=action_status,
+            summary=str(decision.get("summary") or "")[:500],
+            platform=platform,
+            job_id=job_id,
+            capture_id=capture_id,
+            draft_id=draft_id,
+            decision={
+                "message_type": decision.get("message_type"),
+                "draft_type": decision.get("draft_type") or decision.get("message_type"),
+                "draft_status": draft_status if draft_id else "",
+                "communication_mode": policy["mode"],
+                "followup_index": int(decision.get("followup_index") or 0),
+                "followup_limit": int(decision.get("followup_limit") or 0),
+                "action_required": bool(decision.get("action_required")),
+                "risk_flags": risk_flags,
+            },
+        )
 
     return {
         "ok": True,
@@ -1286,6 +1359,15 @@ def communications_page(request: Request) -> Any:
             GROUP BY feedback_status
             """
         ).fetchall()
+        action_logs = conn.execute(
+            """
+            SELECT l.*, j.title AS job_title, j.company AS company
+            FROM agent_action_logs l
+            LEFT JOIN job_postings j ON j.id = l.job_id
+            ORDER BY l.created_at DESC, l.id DESC
+            LIMIT 80
+            """
+        ).fetchall()
     return templates.TemplateResponse(
         request,
         "communications.html",
@@ -1298,6 +1380,8 @@ def communications_page(request: Request) -> Any:
             "message_types": ["岗位沟通", "面试邀请", "需要我处理", "无关内容"],
             "communication_policy": communication_policy(),
             "communication_mode_label": communication_mode_label,
+            "action_logs": [{key: row[key] for key in row.keys()} for row in action_logs],
+            "action_type_label": action_type_label,
             "loads": loads,
             "notice": request.query_params.get("notice", ""),
             "notice_type": request.query_params.get("notice_type", "info"),
@@ -1317,15 +1401,36 @@ async def update_message_draft(draft_id: int, request: Request) -> RedirectRespo
         row = conn.execute("SELECT * FROM message_drafts WHERE id = ?", (draft_id,)).fetchone()
         if not row:
             return redirect_with_notice("/communications", "没有找到草稿。", "error")
+        old_status = str(row["status"] or "")
+        now = utc_now()
         conn.execute(
             "UPDATE message_drafts SET status = ?, message = ?, updated_at = ? WHERE id = ?",
-            (status, message, utc_now(), draft_id),
+            (status, message, now, draft_id),
         )
         if row["job_id"] and status == "已发送":
             conn.execute(
                 "INSERT INTO application_events (job_id, event_type, content, created_at) VALUES (?, ?, ?, ?)",
-                (row["job_id"], "沟通草稿已发送", message[:500], utc_now()),
+                (row["job_id"], "沟通草稿已发送", message[:500], now),
             )
+        log_agent_action(
+            conn,
+            action_type="draft_status_update",
+            status=status,
+            summary=f"草稿状态：{old_status or '-'} -> {status}",
+            platform=str(row["platform"] or ""),
+            job_id=int(row["job_id"]) if row["job_id"] else None,
+            capture_id=int(row["capture_id"]) if row["capture_id"] else None,
+            draft_id=draft_id,
+            decision={
+                "old_status": old_status,
+                "new_status": status,
+                "draft_type": row["draft_type"],
+                "communication_mode": row["communication_mode"],
+                "followup_index": row["followup_index"],
+                "followup_limit": row["followup_limit"],
+                "message_length": len(message),
+            },
+        )
     return redirect_with_notice("/communications", "草稿已更新。", "success")
 
 
@@ -1364,6 +1469,21 @@ async def update_conversation_feedback(capture_id: int, request: Request) -> Red
             conn.execute(
                 "INSERT INTO application_events (job_id, event_type, content, created_at) VALUES (?, ?, ?, ?)",
                 (row["job_id"], "对话分类反馈", event_content[:500], now),
+            )
+        if feedback_status:
+            log_agent_action(
+                conn,
+                action_type="conversation_feedback",
+                status=feedback_status,
+                summary=f"对话分类反馈：{feedback_status}",
+                platform=str(row["platform"] or ""),
+                job_id=int(row["job_id"]) if row["job_id"] else None,
+                capture_id=capture_id,
+                decision={
+                    "message_type": row["message_type"],
+                    "expected_message_type": expected_message_type,
+                    "feedback_note_length": len(feedback_note),
+                },
             )
     return redirect_with_notice("/communications", "对话采集反馈已保存。", "success")
 
@@ -2129,6 +2249,7 @@ async def upsert_model_profile(request: Request) -> RedirectResponse:
 @app.post("/settings/communication")
 async def update_communication_policy(request: Request) -> RedirectResponse:
     form = await request.form()
+    old_policy = communication_policy()
     mode = str(form.get("mode") or "draft").strip()
     if mode not in dict(COMMUNICATION_MODES):
         return redirect_with_notice("/settings", "沟通模式无效，未保存。", "error")
@@ -2144,6 +2265,19 @@ async def update_communication_policy(request: Request) -> RedirectResponse:
             "max_auto_followups": max_followups,
         },
     )
+    with connect() as conn:
+        log_agent_action(
+            conn,
+            action_type="communication_policy_update",
+            status=mode,
+            summary=f"沟通模式：{old_policy['mode_label']} -> {communication_mode_label(mode)}",
+            decision={
+                "old_mode": old_policy["mode"],
+                "new_mode": mode,
+                "old_max_auto_followups": old_policy["max_auto_followups"],
+                "new_max_auto_followups": max_followups,
+            },
+        )
     return redirect_with_notice(
         "/settings",
         f"沟通模式已保存：{communication_mode_label(mode)}，自主询问上限 {max_followups} 轮。",

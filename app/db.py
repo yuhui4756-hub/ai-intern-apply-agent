@@ -258,6 +258,23 @@ def init_db() -> None:
                 created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS agent_action_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER,
+                capture_id INTEGER,
+                draft_id INTEGER,
+                platform TEXT NOT NULL DEFAULT '',
+                action_type TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                decision_json TEXT NOT NULL DEFAULT '{}',
+                error_message TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(job_id) REFERENCES job_postings(id) ON DELETE SET NULL,
+                FOREIGN KEY(capture_id) REFERENCES conversation_captures(id) ON DELETE SET NULL,
+                FOREIGN KEY(draft_id) REFERENCES message_drafts(id) ON DELETE SET NULL
+            );
+
             CREATE TABLE IF NOT EXISTS app_settings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 key TEXT NOT NULL UNIQUE,
