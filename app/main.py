@@ -53,6 +53,7 @@ EXTENSION_TEXT_LIMIT = 20000
 EXTENSION_LINK_LIMIT = 300
 LAST_MANUAL_SEARCH_KEY = "last_manual_search"
 COMMUNICATION_POLICY_KEY = "communication_policy"
+AUTOMATION_CONTROL_KEY = "automation_control"
 COMMUNICATION_MODES = [
     ("off", "关闭"),
     ("draft", "草稿模式"),
@@ -89,6 +90,9 @@ def action_type_label(value: str) -> str:
         "draft_status_update": "草稿处理",
         "conversation_feedback": "分类反馈",
         "communication_policy_update": "沟通设置",
+        "automation_control_update": "自动化控制",
+        "automation_paused": "暂停跳过",
+        "conversation_diff_check": "对话差分",
     }.get(value or "", value or "-")
 
 
@@ -105,6 +109,17 @@ def communication_policy() -> dict[str, Any]:
         "mode": mode,
         "mode_label": communication_mode_label(mode),
         "max_auto_followups": max(0, min(max_followups, 10)),
+    }
+
+
+def automation_control() -> dict[str, Any]:
+    saved = get_setting(AUTOMATION_CONTROL_KEY, {}) or {}
+    paused = bool(saved.get("paused"))
+    return {
+        "paused": paused,
+        "status_label": "已暂停" if paused else "运行中",
+        "pause_reason": str(saved.get("pause_reason") or ""),
+        "updated_at": str(saved.get("updated_at") or ""),
     }
 
 
@@ -795,6 +810,46 @@ def find_job_for_conversation(conn: Any, source_url: str, text: str) -> dict[str
     return None
 
 
+def find_duplicate_conversation_capture(
+    conn: Any,
+    *,
+    job_id: int | None,
+    source_url: str,
+    platform: str,
+    page_title: str,
+    conversation_text: str,
+) -> dict[str, Any] | None:
+    if job_id:
+        row = conn.execute(
+            """
+            SELECT id, conversation_text, created_at
+            FROM conversation_captures
+            WHERE job_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (job_id,),
+        ).fetchone()
+        if row and str(row["conversation_text"] or "") == conversation_text:
+            return {key: row[key] for key in row.keys()}
+
+    row = conn.execute(
+        """
+        SELECT id, conversation_text, created_at
+        FROM conversation_captures
+        WHERE source_url = ?
+          AND platform = ?
+          AND page_title = ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (source_url, platform, page_title),
+    ).fetchone()
+    if row and str(row["conversation_text"] or "") == conversation_text:
+        return {key: row[key] for key in row.keys()}
+    return None
+
+
 def try_llm_conversation_decision(text: str, job: dict[str, Any] | None, fallback: dict[str, Any]) -> dict[str, Any]:
     client = client_for_task("hr_reply_classify")
     if not client or not client.configured:
@@ -922,6 +977,30 @@ def create_conversation_from_extension(payload: dict[str, Any]) -> dict[str, Any
             "redirect_url": "/communications",
         }
 
+    control = automation_control()
+    if control["paused"]:
+        platform = extension_platform(payload_text(payload, "url", 1000), payload_text(payload, "platform", 80))
+        with connect() as conn:
+            log_agent_action(
+                conn,
+                action_type="automation_paused",
+                status="已暂停",
+                summary="自动化已暂停，跳过本次对话采集。",
+                platform=platform,
+                decision={
+                    "pause_reason": control["pause_reason"],
+                    "updated_at": control["updated_at"],
+                },
+            )
+        return {
+            "ok": True,
+            "capture_type": "conversation",
+            "skipped": True,
+            "message_type": "自动化已暂停",
+            "reason": control["pause_reason"] or "自动化已暂停，不保存、不分析、不生成草稿。",
+            "redirect_url": "/communications",
+        }
+
     raw_url = payload_text(payload, "url", 1000)
     if not raw_url:
         return api_error("缺少当前对话页面 URL。")
@@ -939,10 +1018,43 @@ def create_conversation_from_extension(payload: dict[str, Any]) -> dict[str, Any
 
     with connect() as conn:
         job = find_job_for_conversation(conn, url, conversation_text)
+        job_id = int(job["id"]) if job else None
+        duplicate = find_duplicate_conversation_capture(
+            conn,
+            job_id=job_id,
+            source_url=url,
+            platform=platform,
+            page_title=title,
+            conversation_text=conversation_text,
+        )
+        if duplicate:
+            log_agent_action(
+                conn,
+                action_type="conversation_diff_check",
+                status="无新内容",
+                summary="清洗后的对话内容与上一条采集一致，已跳过分析。",
+                platform=platform,
+                job_id=job_id,
+                capture_id=int(duplicate["id"]),
+                decision={
+                    "matched_capture_id": int(duplicate["id"]),
+                    "text_length": len(conversation_text),
+                    "matched_by": "job_id" if job_id else "source_url",
+                },
+            )
+            return {
+                "ok": True,
+                "capture_type": "conversation",
+                "skipped": True,
+                "message_type": "无新内容",
+                "reason": "当前对话没有新增内容，已跳过分析和草稿生成。",
+                "existing_capture_id": int(duplicate["id"]),
+                "redirect_url": "/communications",
+            }
+
         decision = classify_conversation(conversation_text, job)
         decision = try_llm_conversation_decision(conversation_text, job, decision)
         now = utc_now()
-        job_id = int(job["id"]) if job else None
         decision = apply_communication_policy(conn, decision, policy, job_id)
         cursor = conn.execute(
             """
@@ -1379,6 +1491,7 @@ def communications_page(request: Request) -> Any:
             "feedback_counts": {row["status"]: row["count"] for row in feedback_counts},
             "message_types": ["岗位沟通", "面试邀请", "需要我处理", "无关内容"],
             "communication_policy": communication_policy(),
+            "automation_control": automation_control(),
             "communication_mode_label": communication_mode_label,
             "action_logs": [{key: row[key] for key in row.keys()} for row in action_logs],
             "action_type_label": action_type_label,
@@ -2155,6 +2268,7 @@ def settings_page(request: Request) -> Any:
             "blacklist_companies": "\n".join(get_setting("blacklist_companies", []) or []),
             "blacklist_keywords": "\n".join(get_setting("blacklist_keywords", []) or []),
             "communication_policy": communication_policy(),
+            "automation_control": automation_control(),
             "communication_modes": COMMUNICATION_MODES,
             "notice": request.query_params.get("notice", ""),
             "notice_type": request.query_params.get("notice_type", "info"),
@@ -2283,6 +2397,42 @@ async def update_communication_policy(request: Request) -> RedirectResponse:
         f"沟通模式已保存：{communication_mode_label(mode)}，自主询问上限 {max_followups} 轮。",
         "success",
     )
+
+
+@app.post("/settings/automation-control")
+async def update_automation_control(request: Request) -> RedirectResponse:
+    form = await request.form()
+    action = str(form.get("action") or "").strip()
+    if action not in {"pause", "resume"}:
+        return redirect_with_notice("/settings", "自动化控制动作无效。", "error")
+
+    old_control = automation_control()
+    paused = action == "pause"
+    reason = str(form.get("pause_reason") or "").strip()[:200]
+    now = utc_now()
+    new_control = {
+        "paused": paused,
+        "pause_reason": reason if paused else "",
+        "updated_at": now,
+    }
+    set_setting(AUTOMATION_CONTROL_KEY, new_control)
+    with connect() as conn:
+        log_agent_action(
+            conn,
+            action_type="automation_control_update",
+            status="已暂停" if paused else "运行中",
+            summary="自动化控制：{} -> {}".format(old_control["status_label"], "已暂停" if paused else "运行中"),
+            decision={
+                "old_paused": old_control["paused"],
+                "new_paused": paused,
+                "pause_reason": new_control["pause_reason"],
+            },
+        )
+
+    return_to = str(form.get("return_to") or "/settings")
+    if not return_to.startswith("/") or return_to.startswith("//"):
+        return_to = "/settings"
+    return redirect_with_notice(return_to, "自动化已暂停。" if paused else "自动化已恢复。", "success")
 
 
 @app.post("/settings/blacklists")

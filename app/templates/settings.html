@@ -30,6 +30,25 @@
     <h2>沟通自动化</h2>
     <span class="badge">{{ communication_policy.mode_label }}</span>
   </div>
+  <div class="panel-title">
+    <div>
+      <strong>自动化控制：{{ automation_control.status_label }}</strong>
+      {% if automation_control.paused %}
+      <p class="muted">暂停原因：{{ automation_control.pause_reason or "用户手动暂停" }}</p>
+      {% else %}
+      <p class="muted">运行中。暂停后，对话采集会跳过分析和草稿生成，避免临时误触或后台巡检继续动作。</p>
+      {% endif %}
+    </div>
+    <form method="post" action="/settings/automation-control" class="form-actions">
+      <input type="hidden" name="return_to" value="/settings">
+      {% if automation_control.paused %}
+      <button class="button primary" type="submit" name="action" value="resume">恢复自动化</button>
+      {% else %}
+      <input name="pause_reason" placeholder="暂停原因（可选）">
+      <button class="button" type="submit" name="action" value="pause">暂停自动化</button>
+      {% endif %}
+    </form>
+  </div>
   <form method="post" action="/settings/communication" class="form-grid">
     <label>沟通模式
       <select name="mode">

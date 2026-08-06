@@ -14,6 +14,7 @@
 {% endif %}
 
 <section class="metrics">
+  <div class="metric"><span>自动化</span><strong>{{ automation_control.status_label }}</strong></div>
   <div class="metric"><span>沟通模式</span><strong>{{ communication_policy.mode_label }}</strong></div>
   <div class="metric"><span>待确认</span><strong>{{ draft_counts.get("待确认", 0) }}</strong></div>
   <div class="metric"><span>需要我处理</span><strong>{{ draft_counts.get("需要我处理", 0) }}</strong></div>
@@ -21,6 +22,31 @@
   <div class="metric"><span>已驳回</span><strong>{{ draft_counts.get("已驳回", 0) }}</strong></div>
   <div class="metric"><span>自主询问候选</span><strong>{{ draft_type_counts.get("自主询问候选", 0) }}</strong></div>
   <div class="metric"><span>误判反馈</span><strong>{{ feedback_counts.get("误判", 0) }}</strong></div>
+</section>
+
+<section class="panel">
+  <div class="panel-title">
+    <h2>自动化控制</h2>
+    <span class="badge">{{ automation_control.status_label }}</span>
+  </div>
+  {% if automation_control.paused %}
+  <div class="notice compact error">当前已暂停：{{ automation_control.pause_reason or "用户手动暂停" }}</div>
+  <form method="post" action="/settings/automation-control" class="form-actions">
+    <input type="hidden" name="return_to" value="/communications">
+    <button class="button primary" type="submit" name="action" value="resume">恢复自动化</button>
+  </form>
+  {% else %}
+  <p class="muted">暂停后，浏览器扩展的对话采集会跳过分析和草稿生成；岗位采集、JD 分析等手动功能仍可使用。</p>
+  <form method="post" action="/settings/automation-control" class="form-grid">
+    <input type="hidden" name="return_to" value="/communications">
+    <label>暂停原因
+      <input name="pause_reason" placeholder="例如：今天不再自动处理 HR 消息">
+    </label>
+    <div class="form-actions">
+      <button class="button" type="submit" name="action" value="pause">暂停自动化</button>
+    </div>
+  </form>
+  {% endif %}
 </section>
 
 <section class="panel">

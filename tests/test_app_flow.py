@@ -695,6 +695,160 @@ def test_conversation_capture_skips_when_communication_mode_off(tmp_path, monkey
     assert log_count == 0
 
 
+def test_automation_control_pause_resume_updates_setting_and_log(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "automation-control.sqlite3"))
+
+    from app import main
+    from app.db import connect, get_setting, init_db
+
+    init_db()
+    client = TestClient(main.app)
+
+    pause = client.post(
+        "/settings/automation-control",
+        data={"action": "pause", "pause_reason": "今天暂停自动处理", "return_to": "/communications"},
+        follow_redirects=False,
+    )
+
+    assert pause.status_code == 303
+    assert pause.headers["location"].startswith("/communications")
+    control = get_setting("automation_control", {})
+    assert control["paused"] is True
+    assert control["pause_reason"] == "今天暂停自动处理"
+    with connect() as conn:
+        log = conn.execute("SELECT action_type, status, decision_json FROM agent_action_logs ORDER BY id DESC LIMIT 1").fetchone()
+    assert log["action_type"] == "automation_control_update"
+    assert log["status"] == "已暂停"
+    assert "今天暂停自动处理" in log["decision_json"]
+
+    resume = client.post(
+        "/settings/automation-control",
+        data={"action": "resume", "return_to": "/settings"},
+        follow_redirects=False,
+    )
+
+    assert resume.status_code == 303
+    assert resume.headers["location"].startswith("/settings")
+    control = get_setting("automation_control", {})
+    assert control["paused"] is False
+    assert control["pause_reason"] == ""
+
+
+def test_conversation_capture_skips_when_automation_paused(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "automation-paused.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db, set_setting, utc_now
+
+    init_db()
+    set_setting("automation_control", {"paused": True, "pause_reason": "外出暂停", "updated_at": utc_now()})
+    monkeypatch.setattr(
+        main,
+        "classify_conversation",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("paused capture must not analyze text")),
+    )
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "conversation",
+            "url": "https://www.zhipin.com/web/geek/chat",
+            "title": "HR 对话",
+            "text": "HR：可以聊一下工作内容和实习周期吗？",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["skipped"] is True
+    assert payload["message_type"] == "自动化已暂停"
+    with connect() as conn:
+        capture_count = conn.execute("SELECT COUNT(*) AS count FROM conversation_captures").fetchone()["count"]
+        draft_count = conn.execute("SELECT COUNT(*) AS count FROM message_drafts").fetchone()["count"]
+        log = conn.execute("SELECT action_type, status, summary, decision_json FROM agent_action_logs ORDER BY id DESC LIMIT 1").fetchone()
+    assert capture_count == 0
+    assert draft_count == 0
+    assert log["action_type"] == "automation_paused"
+    assert log["status"] == "已暂停"
+    assert "工作内容" not in log["summary"]
+    assert "工作内容" not in log["decision_json"]
+
+
+def test_duplicate_conversation_capture_skips_llm_and_draft(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "conversation-diff.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db
+
+    monkeypatch.setattr(main, "search_company", lambda *args, **kwargs: [])
+    init_db()
+    client = TestClient(main.app)
+
+    job_response = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "job",
+            "url": "https://www.zhipin.com/job_detail/diff-1.html",
+            "title": "AI 应用开发实习生",
+            "text": "公司名称：深圳差分智能科技有限公司\nAI 应用开发实习生\n要求 Python、FastAPI、RAG，每周 5 天。",
+        },
+    )
+    assert job_response.status_code == 200
+
+    llm_calls = {"count": 0}
+
+    def count_llm_call(text, job, fallback):
+        llm_calls["count"] += 1
+        return fallback
+
+    monkeypatch.setattr(main, "try_llm_conversation_decision", count_llm_call)
+    conversation = "HR：您好，这里是深圳差分智能科技有限公司，想了解工作内容还是实习周期？\n我：想了解 AI 应用开发岗位。"
+    first = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "conversation",
+            "url": "https://www.zhipin.com/job_detail/diff-1.html",
+            "title": "深圳差分智能科技有限公司 HR 对话",
+            "text": conversation,
+        },
+    )
+    second = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "conversation",
+            "url": "https://www.zhipin.com/job_detail/diff-1.html",
+            "title": "深圳差分智能科技有限公司 HR 对话",
+            "text": conversation,
+        },
+    )
+    changed = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "conversation",
+            "url": "https://www.zhipin.com/job_detail/diff-1.html",
+            "title": "深圳差分智能科技有限公司 HR 对话",
+            "text": conversation + "\nHR：这边主要做 RAG 知识库和 Agent 工具调用。",
+        },
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert changed.status_code == 200
+    assert second.json()["skipped"] is True
+    assert second.json()["message_type"] == "无新内容"
+    assert "skipped" not in changed.json()
+    assert llm_calls["count"] == 2
+    with connect() as conn:
+        capture_count = conn.execute("SELECT COUNT(*) AS count FROM conversation_captures").fetchone()["count"]
+        draft_count = conn.execute("SELECT COUNT(*) AS count FROM message_drafts").fetchone()["count"]
+        diff_log = conn.execute("SELECT action_type, status, summary FROM agent_action_logs WHERE action_type = 'conversation_diff_check' ORDER BY id DESC LIMIT 1").fetchone()
+    assert capture_count == 2
+    assert draft_count == 2
+    assert diff_log["status"] == "无新内容"
+    assert "上一条采集一致" in diff_log["summary"]
+
+
 def test_autonomous_mode_pauses_after_followup_limit(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "communication-autonomous-limit.sqlite3"))
 

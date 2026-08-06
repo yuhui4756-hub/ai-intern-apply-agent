@@ -421,6 +421,11 @@ def seed_defaults(conn: sqlite3.Connection) -> None:
             "mode": "draft",
             "max_auto_followups": 2,
         },
+        "automation_control": {
+            "paused": False,
+            "pause_reason": "",
+            "updated_at": "",
+        },
         "blacklist_companies": [],
         "blacklist_keywords": [
             "培训费",
