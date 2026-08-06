@@ -956,6 +956,257 @@ def test_duplicate_conversation_capture_skips_llm_and_draft(tmp_path, monkeypatc
     assert [row["skipped_count"] for row in patrol_rows] == [0, 1, 0]
 
 
+def test_message_patrol_observation_dry_run_records_metadata_without_capture(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "patrol-observation-dry-run.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db
+
+    monkeypatch.setattr(main, "search_company", lambda *args, **kwargs: [])
+    init_db()
+    client = TestClient(main.app)
+
+    job_response = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "job",
+            "url": "https://www.zhipin.com/job_detail/patrol-dry-run.html",
+            "title": "AI 应用开发实习生",
+            "text": "公司名称：深圳观察智能科技有限公司\nAI 应用开发实习生\n要求 Python、FastAPI、RAG，每周 5 天。",
+        },
+    )
+    assert job_response.status_code == 200
+    monkeypatch.setattr(
+        main,
+        "classify_conversation",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("dry-run must not classify conversation")),
+    )
+    monkeypatch.setattr(
+        main,
+        "try_llm_conversation_decision",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("dry-run must not call LLM")),
+    )
+
+    response = client.post(
+        "/api/message-patrol/observations",
+        json={
+            "executor": "browser_extension",
+            "dry_run": True,
+            "observations": [
+                {
+                    "url": "https://www.zhipin.com/job_detail/patrol-dry-run.html",
+                    "title": "深圳观察智能科技有限公司 HR 对话",
+                    "platform": "Boss 直聘",
+                    "text": "HR：您好，这里是深圳观察智能科技有限公司，请问你想了解工作内容还是实习周期？\n我：想了解 AI 应用开发岗位。",
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["dry_run"] is True
+    assert payload["checked_count"] == 1
+    assert payload["new_count"] == 1
+    assert payload["skipped_count"] == 0
+    assert payload["results"][0]["status"] == "观察完成"
+    with connect() as conn:
+        capture_count = conn.execute("SELECT COUNT(*) AS count FROM conversation_captures").fetchone()["count"]
+        draft_count = conn.execute("SELECT COUNT(*) AS count FROM message_drafts").fetchone()["count"]
+        patrol = conn.execute("SELECT status, checked_count, new_count, skipped_count FROM message_patrol_runs ORDER BY id DESC LIMIT 1").fetchone()
+        action_log = conn.execute("SELECT action_type, status, summary, decision_json FROM agent_action_logs ORDER BY id DESC LIMIT 1").fetchone()
+    assert capture_count == 0
+    assert draft_count == 0
+    assert patrol["status"] == "观察完成"
+    assert patrol["checked_count"] == 1
+    assert patrol["new_count"] == 1
+    assert patrol["skipped_count"] == 0
+    assert action_log["action_type"] == "message_patrol_observation"
+    assert action_log["status"] == "观察完成"
+    assert "工作内容" not in action_log["summary"]
+    assert "工作内容" not in action_log["decision_json"]
+
+
+def test_message_patrol_observation_dry_run_skips_duplicate_without_llm(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "patrol-observation-duplicate.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db
+
+    monkeypatch.setattr(main, "search_company", lambda *args, **kwargs: [])
+    init_db()
+    client = TestClient(main.app)
+
+    job_response = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "job",
+            "url": "https://www.zhipin.com/job_detail/patrol-duplicate.html",
+            "title": "AI 应用开发实习生",
+            "text": "公司名称：深圳重复智能科技有限公司\nAI 应用开发实习生\n要求 Python、FastAPI、RAG，每周 5 天。",
+        },
+    )
+    assert job_response.status_code == 200
+    llm_calls = {"count": 0}
+
+    def count_llm_call(text, job, fallback):
+        llm_calls["count"] += 1
+        return fallback
+
+    monkeypatch.setattr(main, "try_llm_conversation_decision", count_llm_call)
+    conversation = "HR：您好，这里是深圳重复智能科技有限公司，请问你想了解工作内容还是实习周期？\n我：想了解 AI 应用开发岗位。"
+    first = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "conversation",
+            "url": "https://www.zhipin.com/job_detail/patrol-duplicate.html",
+            "title": "深圳重复智能科技有限公司 HR 对话",
+            "text": conversation,
+        },
+    )
+    assert first.status_code == 200
+    assert llm_calls["count"] == 1
+
+    response = client.post(
+        "/api/message-patrol/observations",
+        json={
+            "executor": "playwright",
+            "dry_run": True,
+            "observations": [
+                {
+                    "url": "https://www.zhipin.com/job_detail/patrol-duplicate.html",
+                    "title": "深圳重复智能科技有限公司 HR 对话",
+                    "text": conversation,
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["new_count"] == 0
+    assert payload["skipped_count"] == 1
+    assert payload["results"][0]["status"] == "无新内容"
+    assert payload["results"][0]["existing_capture_id"] == first.json()["capture_id"]
+    assert llm_calls["count"] == 1
+    with connect() as conn:
+        capture_count = conn.execute("SELECT COUNT(*) AS count FROM conversation_captures").fetchone()["count"]
+        draft_count = conn.execute("SELECT COUNT(*) AS count FROM message_drafts").fetchone()["count"]
+        patrol = conn.execute("SELECT status, new_count, skipped_count FROM message_patrol_runs ORDER BY id DESC LIMIT 1").fetchone()
+    assert capture_count == 1
+    assert draft_count == 1
+    assert patrol["status"] == "无新内容"
+    assert patrol["new_count"] == 0
+    assert patrol["skipped_count"] == 1
+
+
+def test_message_patrol_observation_can_process_changed_content_when_not_dry_run(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "patrol-observation-process.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db
+
+    monkeypatch.setattr(main, "search_company", lambda *args, **kwargs: [])
+    monkeypatch.setattr(main, "try_llm_conversation_decision", lambda _text, _job, fallback: fallback)
+    init_db()
+    client = TestClient(main.app)
+
+    job_response = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "job",
+            "url": "https://www.zhipin.com/job_detail/patrol-process.html",
+            "title": "AI 应用开发实习生",
+            "text": "公司名称：深圳处理智能科技有限公司\nAI 应用开发实习生\n要求 Python、FastAPI、RAG，每周 5 天。",
+        },
+    )
+    assert job_response.status_code == 200
+
+    response = client.post(
+        "/api/message-patrol/observations",
+        json={
+            "executor": "playwright",
+            "dry_run": False,
+            "trigger_type": "executor",
+            "observations": [
+                {
+                    "url": "https://www.zhipin.com/job_detail/patrol-process.html",
+                    "title": "深圳处理智能科技有限公司 HR 对话",
+                    "text": "HR：您好，这里是深圳处理智能科技有限公司，请问你想了解主要工作内容还是实习周期？\n我：想先了解 AI 应用开发岗位。",
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["dry_run"] is False
+    assert payload["checked_count"] == 1
+    assert payload["new_count"] == 1
+    assert payload["results"][0]["capture_id"]
+    assert payload["results"][0]["draft_id"]
+    with connect() as conn:
+        capture_count = conn.execute("SELECT COUNT(*) AS count FROM conversation_captures").fetchone()["count"]
+        draft = conn.execute("SELECT status, draft_type, message FROM message_drafts ORDER BY id DESC LIMIT 1").fetchone()
+        patrol = conn.execute("SELECT trigger_type, scope, status, new_count FROM message_patrol_runs ORDER BY id DESC LIMIT 1").fetchone()
+    assert capture_count == 1
+    assert draft["status"] == "待确认"
+    assert draft["draft_type"] == "岗位沟通"
+    assert draft["message"]
+    assert patrol["trigger_type"] == "executor"
+    assert patrol["scope"] == "scheduled_patrol"
+    assert patrol["status"] == "已处理"
+    assert patrol["new_count"] == 1
+
+
+def test_message_patrol_observation_short_text_is_skipped_without_capture(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "patrol-observation-short.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db
+
+    init_db()
+    monkeypatch.setattr(
+        main,
+        "classify_conversation",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("short observation must not classify")),
+    )
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/api/message-patrol/observations",
+        json={
+            "dry_run": True,
+            "observations": [
+                {
+                    "url": "https://www.zhipin.com/web/geek/chat",
+                    "title": "HR 对话",
+                    "text": "发简历",
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["checked_count"] == 1
+    assert payload["new_count"] == 0
+    assert payload["skipped_count"] == 1
+    assert payload["results"][0]["status"] == "文本过短"
+    with connect() as conn:
+        capture_count = conn.execute("SELECT COUNT(*) AS count FROM conversation_captures").fetchone()["count"]
+        draft_count = conn.execute("SELECT COUNT(*) AS count FROM message_drafts").fetchone()["count"]
+        patrol = conn.execute("SELECT status, skipped_count FROM message_patrol_runs ORDER BY id DESC LIMIT 1").fetchone()
+    assert capture_count == 0
+    assert draft_count == 0
+    assert patrol["status"] == "文本过短"
+    assert patrol["skipped_count"] == 1
+
+
 def test_autonomous_mode_pauses_after_followup_limit(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "communication-autonomous-limit.sqlite3"))
 

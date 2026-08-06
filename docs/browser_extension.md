@@ -77,6 +77,37 @@ chrome://extensions
 
 设置页的定时巡检目前只是调度壳：可以保存启停、间隔和 cooldown，也可以手动 tick，但还不会自动读取浏览器页面。真实定时巡检需要后续接入浏览器巡检执行器。
 
+## 巡检 observation 接口
+
+本地应用已提供巡检执行器接口：
+
+```text
+POST http://127.0.0.1:8000/api/message-patrol/observations
+```
+
+它用于后续扩展监听器或 Playwright 把当前对话页“已加载的可见文本”上报给本地 Agent。
+
+默认请求应使用 `dry_run=true`：
+
+```json
+{
+  "executor": "browser_extension",
+  "dry_run": true,
+  "observations": [
+    {
+      "url": "https://www.zhipin.com/job_detail/example.html",
+      "title": "某公司 HR 对话",
+      "platform": "Boss 直聘",
+      "text": "当前页面已加载的可见对话文本"
+    }
+  ]
+}
+```
+
+`dry_run=true` 只做本地清洗、岗位匹配、重复差分和巡检统计，不保存聊天全文，不生成草稿，不调用模型。只有显式传 `dry_run=false`，才会复用现有“采集当前对话”流程生成待确认草稿。
+
+当前仍未实现真实自动巡检执行器；这个接口只是执行器和本地 Agent 之间的安全契约。
+
 ## 常见问题
 
 ### 提示无法连接本地应用

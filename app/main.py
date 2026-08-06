@@ -66,6 +66,7 @@ COMMUNICATION_POLICY_KEY = "communication_policy"
 AUTOMATION_CONTROL_KEY = "automation_control"
 MESSAGE_PATROL_POLICY_KEY = "message_patrol_policy"
 PATROL_SCHEDULER_POLL_SECONDS = 10
+MESSAGE_PATROL_OBSERVATION_LIMIT = 20
 COMMUNICATION_MODES = [
     ("off", "关闭"),
     ("draft", "草稿模式"),
@@ -106,6 +107,7 @@ def action_type_label(value: str) -> str:
         "automation_paused": "暂停跳过",
         "conversation_diff_check": "对话差分",
         "message_patrol_run": "消息巡检",
+        "message_patrol_observation": "巡检观察",
         "message_patrol_policy_update": "巡检设置",
     }.get(value or "", value or "-")
 
@@ -966,6 +968,19 @@ def payload_text(payload: dict[str, Any], key: str, limit: int = 500) -> str:
     return str(payload.get(key) or "").strip()[:limit]
 
 
+def payload_flag(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on", "y"}:
+        return True
+    if normalized in {"0", "false", "no", "off", "n"}:
+        return False
+    return default
+
+
 def extension_page_text(payload: dict[str, Any]) -> str:
     title = payload_text(payload, "title", 300)
     url = payload_text(payload, "url", 1000)
@@ -983,7 +998,7 @@ def extension_platform(url: str, fallback: str = "") -> str:
 
 def extension_patrol_trigger(payload: dict[str, Any]) -> str:
     value = payload_text(payload, "patrol_trigger", 40) or payload_text(payload, "trigger_type", 40)
-    if value in {"manual_extension", "manual", "scheduled"}:
+    if value in {"manual_extension", "manual", "scheduled", "executor", "scheduled_executor"}:
         return value
     return "manual_extension"
 
@@ -1451,6 +1466,333 @@ def create_conversation_from_extension(payload: dict[str, Any]) -> dict[str, Any
     }
 
 
+def normalize_message_patrol_observation_request(payload: Any) -> tuple[dict[str, Any] | None, str]:
+    if isinstance(payload, list):
+        observations = payload
+        return (
+            {
+                "dry_run": True,
+                "executor": "external",
+                "trigger_type": "executor",
+                "scope": "scheduled_patrol",
+                "observations": observations[:MESSAGE_PATROL_OBSERVATION_LIMIT],
+                "truncated": len(observations) > MESSAGE_PATROL_OBSERVATION_LIMIT,
+            },
+            "",
+        )
+    if not isinstance(payload, dict):
+        return None, "请求体必须是 JSON 对象或 observation 数组。"
+
+    raw_observations = payload.get("observations")
+    if raw_observations is None and any(key in payload for key in ("url", "source_url", "text", "visible_text")):
+        raw_observations = [payload]
+    if not isinstance(raw_observations, list):
+        return None, "observations 必须是数组，或直接提交单条 observation 对象。"
+    if not raw_observations:
+        return None, "至少需要提供 1 条 observation。"
+
+    trigger_type = payload_text(payload, "trigger_type", 40) or payload_text(payload, "patrol_trigger", 40) or "executor"
+    if trigger_type not in {"manual_extension", "manual", "scheduled", "executor", "scheduled_executor"}:
+        trigger_type = "executor"
+
+    return (
+        {
+            "dry_run": payload_flag(payload.get("dry_run"), True),
+            "executor": payload_text(payload, "executor", 80) or "external",
+            "trigger_type": trigger_type,
+            "scope": payload_text(payload, "scope", 80) or payload_text(payload, "patrol_scope", 80) or "scheduled_patrol",
+            "observations": raw_observations[:MESSAGE_PATROL_OBSERVATION_LIMIT],
+            "truncated": len(raw_observations) > MESSAGE_PATROL_OBSERVATION_LIMIT,
+        },
+        "",
+    )
+
+
+def json_response_payload(response: JSONResponse) -> dict[str, Any]:
+    try:
+        return loads(response.body.decode("utf-8"), {})
+    except Exception:
+        return {"ok": False, "error": "响应解析失败。"}
+
+
+def observation_error_result(index: int, message: str, status: str = "错误") -> dict[str, Any]:
+    return {
+        "index": index,
+        "ok": False,
+        "status": status,
+        "reason": message,
+        "checked_count": 0,
+        "new_count": 0,
+        "skipped_count": 0,
+        "error_count": 1,
+    }
+
+
+def write_observation_patrol_run(
+    *,
+    status: str,
+    note: str,
+    trigger_type: str,
+    scope: str,
+    platform: str,
+    source_url: str,
+    page_title: str,
+    job_id: int | None = None,
+    capture_id: int | None = None,
+    checked_count: int = 1,
+    new_count: int = 0,
+    skipped_count: int = 0,
+    error_count: int = 0,
+    decision: dict[str, Any] | None = None,
+) -> int:
+    with connect() as conn:
+        patrol_run_id = insert_message_patrol_run(
+            conn,
+            trigger_type=trigger_type,
+            platform=platform,
+            scope=scope,
+            status=status,
+            checked_count=checked_count,
+            new_count=new_count,
+            skipped_count=skipped_count,
+            error_count=error_count,
+            note=note,
+            source_url=source_url,
+            page_title=page_title,
+            job_id=job_id,
+            capture_id=capture_id,
+        )
+        log_agent_action(
+            conn,
+            action_type="message_patrol_observation",
+            status=status,
+            summary=note,
+            platform=platform,
+            job_id=job_id,
+            capture_id=capture_id,
+            decision={
+                "patrol_run_id": patrol_run_id,
+                "trigger_type": trigger_type,
+                "scope": scope,
+                "model_called": False,
+                "text_saved": False,
+                **(decision or {}),
+            },
+        )
+    return patrol_run_id
+
+
+def process_message_patrol_observation(
+    observation: Any,
+    *,
+    index: int,
+    dry_run: bool,
+    executor: str,
+    trigger_type: str,
+    scope: str,
+) -> dict[str, Any]:
+    if not isinstance(observation, dict):
+        return observation_error_result(index, "observation 必须是 JSON 对象。")
+
+    raw_url = str(observation.get("url") or observation.get("source_url") or "").strip()[:1000]
+    if not raw_url:
+        return observation_error_result(index, "observation 缺少 url 或 source_url。")
+    try:
+        url = ensure_public_http_url(raw_url)
+    except ValueError as exc:
+        return observation_error_result(index, str(exc))
+
+    title = str(observation.get("title") or observation.get("page_title") or "").strip()[:300]
+    platform = extension_platform(url, str(observation.get("platform") or "").strip()[:80])
+    base_result = {
+        "index": index,
+        "platform": platform,
+        "source_url": url,
+        "page_title": title,
+        "checked_count": 1,
+        "new_count": 0,
+        "skipped_count": 0,
+        "error_count": 0,
+    }
+
+    policy = communication_policy()
+    if policy["mode"] == "off":
+        return {
+            **base_result,
+            "ok": True,
+            "skipped": True,
+            "status": "沟通模式已关闭",
+            "reason": "沟通模式为关闭，不保存、不分析、不生成草稿。",
+            "skipped_count": 1,
+        }
+
+    control = automation_control()
+    if control["paused"]:
+        patrol_run_id = write_observation_patrol_run(
+            status="已暂停",
+            note="自动化已暂停，跳过本次巡检观察。",
+            trigger_type=trigger_type,
+            scope=scope,
+            platform=platform,
+            source_url=url,
+            page_title=title,
+            skipped_count=1,
+            decision={
+                "executor": executor,
+                "dry_run": dry_run,
+                "pause_reason": control["pause_reason"],
+                "updated_at": control["updated_at"],
+            },
+        )
+        return {
+            **base_result,
+            "ok": True,
+            "skipped": True,
+            "status": "已暂停",
+            "reason": control["pause_reason"] or "自动化已暂停。",
+            "patrol_run_id": patrol_run_id,
+            "skipped_count": 1,
+        }
+
+    raw_text = str(
+        observation.get("text")
+        or observation.get("visible_text")
+        or observation.get("conversation_text")
+        or ""
+    )[:EXTENSION_TEXT_LIMIT]
+    prepared_text = prepare_conversation_text(raw_text)
+    conversation_text = str(prepared_text["clean_text"])
+    if len(conversation_text) < 20:
+        patrol_run_id = write_observation_patrol_run(
+            status="文本过短",
+            note="当前 observation 清洗后的可见对话文本太短，未调用模型。",
+            trigger_type=trigger_type,
+            scope=scope,
+            platform=platform,
+            source_url=url,
+            page_title=title,
+            skipped_count=1,
+            decision={
+                "executor": executor,
+                "dry_run": dry_run,
+                "text_length": len(conversation_text),
+                "ignored_line_count": len(prepared_text["ignored_lines"]),
+            },
+        )
+        return {
+            **base_result,
+            "ok": True,
+            "skipped": True,
+            "status": "文本过短",
+            "reason": "当前页面可见对话文本太短，已跳过。",
+            "patrol_run_id": patrol_run_id,
+            "text_length": len(conversation_text),
+            "skipped_count": 1,
+        }
+
+    if dry_run:
+        with connect() as conn:
+            job = find_job_for_conversation(conn, url, conversation_text)
+            job_id = int(job["id"]) if job else None
+            duplicate = find_duplicate_conversation_capture(
+                conn,
+                job_id=job_id,
+                source_url=url,
+                platform=platform,
+                page_title=title,
+                conversation_text=conversation_text,
+            )
+        if duplicate:
+            status = "无新内容"
+            note = "清洗后的对话内容与上一条采集一致；dry-run 未调用模型。"
+            new_count = 0
+            skipped_count = 1
+            capture_id = int(duplicate["id"])
+        else:
+            status = "观察完成"
+            note = "发现可能的新对话内容；dry-run 未保存聊天全文、未调用模型。"
+            new_count = 1
+            skipped_count = 0
+            capture_id = None
+        patrol_run_id = write_observation_patrol_run(
+            status=status,
+            note=note,
+            trigger_type=trigger_type,
+            scope=scope,
+            platform=platform,
+            source_url=url,
+            page_title=title,
+            job_id=job_id,
+            capture_id=capture_id,
+            new_count=new_count,
+            skipped_count=skipped_count,
+            decision={
+                "executor": executor,
+                "dry_run": True,
+                "matched_capture_id": capture_id,
+                "matched_by": "job_id" if job_id else "source_url",
+                "text_length": len(conversation_text),
+                "ignored_line_count": len(prepared_text["ignored_lines"]),
+            },
+        )
+        return {
+            **base_result,
+            "ok": True,
+            "skipped": bool(skipped_count),
+            "status": status,
+            "reason": note,
+            "job_id": job_id,
+            "existing_capture_id": capture_id,
+            "patrol_run_id": patrol_run_id,
+            "text_length": len(conversation_text),
+            "new_count": new_count,
+            "skipped_count": skipped_count,
+        }
+
+    capture_payload = {
+        "capture_type": "conversation",
+        "url": url,
+        "title": title,
+        "platform": platform,
+        "text": raw_text,
+        "patrol_trigger": trigger_type,
+        "patrol_scope": scope,
+    }
+    capture_result = create_conversation_from_extension(capture_payload)
+    if isinstance(capture_result, JSONResponse):
+        response_payload = json_response_payload(capture_result)
+        if capture_result.status_code >= 400:
+            return observation_error_result(index, str(response_payload.get("error") or "对话处理失败。"))
+        capture_result = response_payload
+
+    if not isinstance(capture_result, dict):
+        return observation_error_result(index, "对话处理结果格式异常。")
+
+    skipped = bool(capture_result.get("skipped"))
+    status = str(capture_result.get("message_type") or ("已跳过" if skipped else "已处理"))
+    return {
+        **base_result,
+        **capture_result,
+        "index": index,
+        "platform": platform,
+        "source_url": url,
+        "page_title": title,
+        "status": status,
+        "new_count": 0 if skipped else 1,
+        "skipped_count": 1 if skipped else 0,
+        "error_count": 0,
+    }
+
+
+def summarize_observation_results(results: list[dict[str, Any]]) -> dict[str, int]:
+    return {
+        "checked_count": sum(int(item.get("checked_count") or 0) for item in results),
+        "new_count": sum(int(item.get("new_count") or 0) for item in results),
+        "skipped_count": sum(int(item.get("skipped_count") or 0) for item in results),
+        "error_count": sum(int(item.get("error_count") or 0) for item in results),
+    }
+
+
 def create_job_from_extension(payload: dict[str, Any]) -> dict[str, Any] | JSONResponse:
     raw_url = payload_text(payload, "url", 1000)
     if not raw_url:
@@ -1586,6 +1928,42 @@ def normalize_extension_payload(payload: Any) -> dict[str, Any] | None:
             if normalized:
                 return normalized
     return None
+
+
+@app.post("/api/message-patrol/observations")
+async def message_patrol_observations(request: Request) -> Any:
+    try:
+        raw_payload = await request.json()
+    except Exception:
+        return api_error("请求不是有效 JSON。")
+
+    parsed, error_message = normalize_message_patrol_observation_request(raw_payload)
+    if not parsed:
+        return api_error(error_message)
+
+    results = [
+        process_message_patrol_observation(
+            observation,
+            index=index,
+            dry_run=bool(parsed["dry_run"]),
+            executor=str(parsed["executor"]),
+            trigger_type=str(parsed["trigger_type"]),
+            scope=str(parsed["scope"]),
+        )
+        for index, observation in enumerate(parsed["observations"])
+    ]
+    counts = summarize_observation_results(results)
+    return {
+        "ok": counts["error_count"] == 0,
+        "dry_run": bool(parsed["dry_run"]),
+        "executor": parsed["executor"],
+        "trigger_type": parsed["trigger_type"],
+        "scope": parsed["scope"],
+        "truncated": bool(parsed["truncated"]),
+        **counts,
+        "results": results,
+        "redirect_url": "/communications",
+    }
 
 
 @app.post("/api/extension/capture")
