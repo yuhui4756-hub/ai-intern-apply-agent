@@ -741,6 +741,97 @@ def test_automation_control_pause_resume_updates_setting_and_log(tmp_path, monke
     assert control["pause_reason"] == ""
 
 
+def test_message_patrol_policy_update_and_manual_tick(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "message-patrol-policy.sqlite3"))
+
+    from app import main
+    from app.db import connect, get_setting, init_db
+
+    init_db()
+    client = TestClient(main.app)
+
+    saved = client.post(
+        "/settings/message-patrol",
+        data={
+            "enabled": "on",
+            "interval_seconds": "60",
+            "cooldown_seconds": "0",
+            "return_to": "/settings",
+        },
+        follow_redirects=False,
+    )
+
+    assert saved.status_code == 303
+    policy = get_setting("message_patrol_policy", {})
+    assert policy["enabled"] is True
+    assert policy["interval_seconds"] == 60
+    assert policy["cooldown_seconds"] == 0
+    assert policy["next_tick_at"]
+
+    tick = client.post("/message-patrol/tick", data={"return_to": "/communications"}, follow_redirects=False)
+
+    assert tick.status_code == 303
+    with connect() as conn:
+        patrol = conn.execute("SELECT trigger_type, scope, status, checked_count, new_count, skipped_count, note FROM message_patrol_runs ORDER BY id DESC LIMIT 1").fetchone()
+        action_log = conn.execute("SELECT action_type, status, decision_json FROM agent_action_logs ORDER BY id DESC LIMIT 1").fetchone()
+    policy = get_setting("message_patrol_policy", {})
+    assert patrol["trigger_type"] == "manual"
+    assert patrol["scope"] == "scheduled_patrol"
+    assert patrol["status"] == "待接入"
+    assert patrol["checked_count"] == 0
+    assert patrol["new_count"] == 0
+    assert patrol["skipped_count"] == 0
+    assert "未读取页面" in patrol["note"]
+    assert action_log["action_type"] == "message_patrol_run"
+    assert action_log["status"] == "待接入"
+    assert "model_called" in action_log["decision_json"]
+    assert policy["last_status"] == "待接入"
+    assert policy["last_tick_at"]
+
+
+def test_message_patrol_tick_respects_pause_without_browser_or_model(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "message-patrol-paused.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db, set_setting, utc_now
+
+    init_db()
+    set_setting(
+        "message_patrol_policy",
+        {
+            "enabled": True,
+            "interval_seconds": 60,
+            "cooldown_seconds": 0,
+            "last_tick_at": "",
+            "next_tick_at": "",
+            "last_status": "",
+            "updated_at": utc_now(),
+        },
+    )
+    set_setting("automation_control", {"paused": True, "pause_reason": "暂停测试", "updated_at": utc_now()})
+    monkeypatch.setattr(
+        main,
+        "client_for_task",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("message patrol tick must not call LLM")),
+    )
+    client = TestClient(main.app)
+
+    response = client.post("/message-patrol/tick", data={"return_to": "/communications"}, follow_redirects=False)
+
+    assert response.status_code == 303
+    with connect() as conn:
+        patrol = conn.execute("SELECT status, checked_count, new_count, skipped_count, note FROM message_patrol_runs ORDER BY id DESC LIMIT 1").fetchone()
+        captures = conn.execute("SELECT COUNT(*) AS count FROM conversation_captures").fetchone()["count"]
+        drafts = conn.execute("SELECT COUNT(*) AS count FROM message_drafts").fetchone()["count"]
+    assert patrol["status"] == "已暂停"
+    assert patrol["checked_count"] == 0
+    assert patrol["new_count"] == 0
+    assert patrol["skipped_count"] == 1
+    assert "未读取浏览器页面" in patrol["note"]
+    assert captures == 0
+    assert drafts == 0
+
+
 def test_conversation_capture_skips_when_automation_paused(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "automation-paused.sqlite3"))
 

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
@@ -41,7 +43,15 @@ from .services.resume import read_resume_text
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    yield
+    scheduler_task = asyncio.create_task(message_patrol_scheduler_loop())
+    try:
+        yield
+    finally:
+        scheduler_task.cancel()
+        try:
+            await scheduler_task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(title="简历投递 Agent", lifespan=lifespan)
@@ -54,6 +64,8 @@ EXTENSION_LINK_LIMIT = 300
 LAST_MANUAL_SEARCH_KEY = "last_manual_search"
 COMMUNICATION_POLICY_KEY = "communication_policy"
 AUTOMATION_CONTROL_KEY = "automation_control"
+MESSAGE_PATROL_POLICY_KEY = "message_patrol_policy"
+PATROL_SCHEDULER_POLL_SECONDS = 10
 COMMUNICATION_MODES = [
     ("off", "关闭"),
     ("draft", "草稿模式"),
@@ -94,6 +106,7 @@ def action_type_label(value: str) -> str:
         "automation_paused": "暂停跳过",
         "conversation_diff_check": "对话差分",
         "message_patrol_run": "消息巡检",
+        "message_patrol_policy_update": "巡检设置",
     }.get(value or "", value or "-")
 
 
@@ -122,6 +135,61 @@ def automation_control() -> dict[str, Any]:
         "pause_reason": str(saved.get("pause_reason") or ""),
         "updated_at": str(saved.get("updated_at") or ""),
     }
+
+
+def parse_utc_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def clamp_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(parsed, maximum))
+
+
+def message_patrol_policy() -> dict[str, Any]:
+    saved = get_setting(MESSAGE_PATROL_POLICY_KEY, {}) or {}
+    enabled = bool(saved.get("enabled"))
+    interval_seconds = clamp_int(saved.get("interval_seconds"), 300, 30, 3600)
+    cooldown_seconds = clamp_int(saved.get("cooldown_seconds"), 120, 0, 3600)
+    last_tick_at = str(saved.get("last_tick_at") or "")
+    next_tick_at = str(saved.get("next_tick_at") or "")
+    last_status = str(saved.get("last_status") or "")
+    return {
+        "enabled": enabled,
+        "status_label": "已开启" if enabled else "已关闭",
+        "interval_seconds": interval_seconds,
+        "cooldown_seconds": cooldown_seconds,
+        "last_tick_at": last_tick_at,
+        "next_tick_at": next_tick_at,
+        "last_status": last_status,
+        "updated_at": str(saved.get("updated_at") or ""),
+    }
+
+
+def save_message_patrol_policy(policy: dict[str, Any]) -> None:
+    set_setting(
+        MESSAGE_PATROL_POLICY_KEY,
+        {
+            "enabled": bool(policy.get("enabled")),
+            "interval_seconds": clamp_int(policy.get("interval_seconds"), 300, 30, 3600),
+            "cooldown_seconds": clamp_int(policy.get("cooldown_seconds"), 120, 0, 3600),
+            "last_tick_at": str(policy.get("last_tick_at") or ""),
+            "next_tick_at": str(policy.get("next_tick_at") or ""),
+            "last_status": str(policy.get("last_status") or ""),
+            "updated_at": str(policy.get("updated_at") or utc_now()),
+        },
+    )
 
 
 def log_agent_action(
@@ -205,6 +273,124 @@ def insert_message_patrol_run(
         ),
     )
     return int(cursor.lastrowid)
+
+
+def run_message_patrol_tick(trigger_type: str = "manual", force: bool = False) -> dict[str, Any] | None:
+    policy = message_patrol_policy()
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat(timespec="seconds")
+
+    if not policy["enabled"] and trigger_type == "scheduler":
+        return None
+
+    next_tick = parse_utc_datetime(policy.get("next_tick_at"))
+    if trigger_type == "scheduler" and not force and policy["enabled"] and next_tick and now_dt < next_tick:
+        return None
+
+    last_tick = parse_utc_datetime(policy.get("last_tick_at"))
+    cooldown_seconds = int(policy.get("cooldown_seconds") or 0)
+    if (
+        trigger_type == "manual"
+        and not force
+        and policy["enabled"]
+        and cooldown_seconds
+        and last_tick
+        and now_dt < last_tick + timedelta(seconds=cooldown_seconds)
+    ):
+        remaining = int((last_tick + timedelta(seconds=cooldown_seconds) - now_dt).total_seconds())
+        status = "冷却中"
+        note = f"距离上次巡检不足 cooldown，还需约 {max(1, remaining)} 秒。"
+        with connect() as conn:
+            patrol_run_id = insert_message_patrol_run(
+                conn,
+                trigger_type=trigger_type,
+                scope="scheduled_patrol",
+                status=status,
+                skipped_count=1,
+                note=note,
+            )
+            log_agent_action(
+                conn,
+                action_type="message_patrol_run",
+                status=status,
+                summary=note,
+                decision={
+                    "patrol_run_id": patrol_run_id,
+                    "trigger_type": trigger_type,
+                    "cooldown_seconds": cooldown_seconds,
+                    "last_tick_at": policy["last_tick_at"],
+                },
+            )
+        return {"status": status, "note": note, "patrol_run_id": patrol_run_id, "skipped": True}
+
+    if not policy["enabled"]:
+        status = "未启用"
+        note = "定时巡检未开启，未读取浏览器页面。"
+        checked_count = 0
+        skipped_count = 1
+    elif automation_control()["paused"]:
+        status = "已暂停"
+        note = "自动化已暂停，本次调度 tick 未读取浏览器页面。"
+        checked_count = 0
+        skipped_count = 1
+    elif communication_policy()["mode"] == "off":
+        status = "沟通关闭"
+        note = "沟通模式为关闭，本次调度 tick 未读取浏览器页面。"
+        checked_count = 0
+        skipped_count = 1
+    else:
+        status = "待接入"
+        note = "调度 tick 已到达；浏览器巡检执行器尚未接入，未读取页面。"
+        checked_count = 0
+        skipped_count = 0
+
+    with connect() as conn:
+        patrol_run_id = insert_message_patrol_run(
+            conn,
+            trigger_type=trigger_type,
+            scope="scheduled_patrol",
+            status=status,
+            checked_count=checked_count,
+            skipped_count=skipped_count,
+            note=note,
+        )
+        log_agent_action(
+            conn,
+            action_type="message_patrol_run",
+            status=status,
+            summary=note,
+            decision={
+                "patrol_run_id": patrol_run_id,
+                "trigger_type": trigger_type,
+                "interval_seconds": policy["interval_seconds"],
+                "cooldown_seconds": cooldown_seconds,
+                "browser_executor": "not_connected",
+                "model_called": False,
+            },
+        )
+
+    next_tick_at = ""
+    if policy["enabled"]:
+        next_tick_at = (now_dt + timedelta(seconds=int(policy["interval_seconds"]))).isoformat(timespec="seconds")
+    policy.update(
+        {
+            "last_tick_at": now,
+            "next_tick_at": next_tick_at,
+            "last_status": status,
+            "updated_at": now,
+        }
+    )
+    save_message_patrol_policy(policy)
+    return {"status": status, "note": note, "patrol_run_id": patrol_run_id, "skipped": skipped_count > 0}
+
+
+async def message_patrol_scheduler_loop() -> None:
+    while True:
+        await asyncio.sleep(PATROL_SCHEDULER_POLL_SECONDS)
+        try:
+            await asyncio.to_thread(run_message_patrol_tick, "scheduler", False)
+        except Exception:
+            continue
 
 
 def parse_json_fields(job: dict[str, Any]) -> dict[str, Any]:
@@ -1610,6 +1796,7 @@ def communications_page(request: Request) -> Any:
             "message_types": ["岗位沟通", "面试邀请", "需要我处理", "无关内容"],
             "communication_policy": communication_policy(),
             "automation_control": automation_control(),
+            "message_patrol_policy": message_patrol_policy(),
             "communication_mode_label": communication_mode_label,
             "action_logs": [{key: row[key] for key in row.keys()} for row in action_logs],
             "patrol_runs": [{key: row[key] for key in row.keys()} for row in patrol_runs],
@@ -2388,6 +2575,7 @@ def settings_page(request: Request) -> Any:
             "blacklist_keywords": "\n".join(get_setting("blacklist_keywords", []) or []),
             "communication_policy": communication_policy(),
             "automation_control": automation_control(),
+            "message_patrol_policy": message_patrol_policy(),
             "communication_modes": COMMUNICATION_MODES,
             "notice": request.query_params.get("notice", ""),
             "notice_type": request.query_params.get("notice_type", "info"),
@@ -2552,6 +2740,68 @@ async def update_automation_control(request: Request) -> RedirectResponse:
     if not return_to.startswith("/") or return_to.startswith("//"):
         return_to = "/settings"
     return redirect_with_notice(return_to, "自动化已暂停。" if paused else "自动化已恢复。", "success")
+
+
+@app.post("/settings/message-patrol")
+async def update_message_patrol_policy(request: Request) -> RedirectResponse:
+    form = await request.form()
+    old_policy = message_patrol_policy()
+    enabled = form.get("enabled") == "on"
+    interval_seconds = clamp_int(form.get("interval_seconds"), old_policy["interval_seconds"], 30, 3600)
+    cooldown_seconds = clamp_int(form.get("cooldown_seconds"), old_policy["cooldown_seconds"], 0, 3600)
+    now = utc_now()
+    next_tick_at = old_policy["next_tick_at"]
+    if enabled and not old_policy["enabled"]:
+        next_tick_at = (datetime.now(timezone.utc) + timedelta(seconds=interval_seconds)).isoformat(timespec="seconds")
+    if not enabled:
+        next_tick_at = ""
+
+    new_policy = {
+        "enabled": enabled,
+        "interval_seconds": interval_seconds,
+        "cooldown_seconds": cooldown_seconds,
+        "last_tick_at": old_policy["last_tick_at"],
+        "next_tick_at": next_tick_at,
+        "last_status": old_policy["last_status"],
+        "updated_at": now,
+    }
+    save_message_patrol_policy(new_policy)
+    with connect() as conn:
+        log_agent_action(
+            conn,
+            action_type="message_patrol_policy_update",
+            status="已开启" if enabled else "已关闭",
+            summary=f"定时巡检：{old_policy['status_label']} -> {'已开启' if enabled else '已关闭'}",
+            decision={
+                "old_enabled": old_policy["enabled"],
+                "new_enabled": enabled,
+                "interval_seconds": interval_seconds,
+                "cooldown_seconds": cooldown_seconds,
+                "next_tick_at": next_tick_at,
+            },
+        )
+
+    return_to = str(form.get("return_to") or "/settings")
+    if not return_to.startswith("/") or return_to.startswith("//"):
+        return_to = "/settings"
+    return redirect_with_notice(return_to, "定时巡检设置已保存。", "success")
+
+
+@app.post("/message-patrol/tick")
+async def trigger_message_patrol_tick(request: Request) -> RedirectResponse:
+    form = await request.form()
+    result = run_message_patrol_tick("manual", force=False)
+    if result is None:
+        message = "定时巡检未到下次执行时间。"
+        notice_type = "info"
+    else:
+        message = f"巡检 tick：{result['status']}。{result['note']}"
+        notice_type = "success" if result["status"] in {"待接入", "未启用"} else "info"
+
+    return_to = str(form.get("return_to") or "/communications")
+    if not return_to.startswith("/") or return_to.startswith("//"):
+        return_to = "/communications"
+    return redirect_with_notice(return_to, message, notice_type)
 
 
 @app.post("/settings/blacklists")

@@ -66,6 +66,36 @@
       <button class="button primary" type="submit">保存沟通设置</button>
     </div>
   </form>
+  <div class="panel-title">
+    <div>
+      <strong>定时巡检：{{ message_patrol_policy.status_label }}</strong>
+      <p class="muted">当前只启用调度壳：到点写入巡检记录，不读取浏览器页面，不调用模型。</p>
+      {% if message_patrol_policy.last_tick_at %}
+      <p class="muted">上次 tick：{{ message_patrol_policy.last_tick_at }} / {{ message_patrol_policy.last_status or "-" }}</p>
+      {% endif %}
+      {% if message_patrol_policy.next_tick_at %}
+      <p class="muted">下次计划：{{ message_patrol_policy.next_tick_at }}</p>
+      {% endif %}
+    </div>
+    <form method="post" action="/message-patrol/tick" class="form-actions">
+      <input type="hidden" name="return_to" value="/settings">
+      <button class="button" type="submit">手动 tick</button>
+    </form>
+  </div>
+  <form method="post" action="/settings/message-patrol" class="form-grid">
+    <input type="hidden" name="return_to" value="/settings">
+    <label class="check"><input name="enabled" type="checkbox" {% if message_patrol_policy.enabled %}checked{% endif %}> 开启定时巡检调度</label>
+    <label>巡检间隔（秒）
+      <input name="interval_seconds" type="number" min="30" max="3600" step="30" value="{{ message_patrol_policy.interval_seconds }}">
+      <span class="muted">只控制调度 tick，暂不读取页面。</span>
+    </label>
+    <label>手动 tick cooldown（秒）
+      <input name="cooldown_seconds" type="number" min="0" max="3600" step="10" value="{{ message_patrol_policy.cooldown_seconds }}">
+    </label>
+    <div class="form-actions">
+      <button class="button primary" type="submit">保存巡检设置</button>
+    </div>
+  </form>
 </section>
 
 <section class="panel">

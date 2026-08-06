@@ -447,6 +447,15 @@ def seed_defaults(conn: sqlite3.Connection) -> None:
             "pause_reason": "",
             "updated_at": "",
         },
+        "message_patrol_policy": {
+            "enabled": False,
+            "interval_seconds": 300,
+            "cooldown_seconds": 120,
+            "last_tick_at": "",
+            "next_tick_at": "",
+            "last_status": "",
+            "updated_at": "",
+        },
         "blacklist_companies": [],
         "blacklist_keywords": [
             "培训费",

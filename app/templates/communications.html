@@ -16,12 +16,31 @@
 <section class="metrics">
   <div class="metric"><span>自动化</span><strong>{{ automation_control.status_label }}</strong></div>
   <div class="metric"><span>沟通模式</span><strong>{{ communication_policy.mode_label }}</strong></div>
+  <div class="metric"><span>定时巡检</span><strong>{{ message_patrol_policy.status_label }}</strong></div>
   <div class="metric"><span>待确认</span><strong>{{ draft_counts.get("待确认", 0) }}</strong></div>
   <div class="metric"><span>需要我处理</span><strong>{{ draft_counts.get("需要我处理", 0) }}</strong></div>
   <div class="metric"><span>已发送</span><strong>{{ draft_counts.get("已发送", 0) }}</strong></div>
   <div class="metric"><span>已驳回</span><strong>{{ draft_counts.get("已驳回", 0) }}</strong></div>
   <div class="metric"><span>自主询问候选</span><strong>{{ draft_type_counts.get("自主询问候选", 0) }}</strong></div>
   <div class="metric"><span>误判反馈</span><strong>{{ feedback_counts.get("误判", 0) }}</strong></div>
+</section>
+
+<section class="panel">
+  <div class="panel-title">
+    <div>
+      <h2>巡检调度</h2>
+      <p class="muted">当前是调度壳：只记录 tick，不读取浏览器页面，不调用模型。</p>
+      {% if message_patrol_policy.next_tick_at %}
+      <p class="muted">下次计划：{{ message_patrol_policy.next_tick_at }}</p>
+      {% endif %}
+    </div>
+    <span class="badge">{{ message_patrol_policy.status_label }}</span>
+  </div>
+  <form method="post" action="/message-patrol/tick" class="form-actions">
+    <input type="hidden" name="return_to" value="/communications">
+    <button class="button" type="submit">手动 tick</button>
+    <a class="button" href="/settings">巡检设置</a>
+  </form>
 </section>
 
 <section class="panel">
