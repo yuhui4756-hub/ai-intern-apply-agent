@@ -14,6 +14,7 @@
 {% endif %}
 
 <section class="metrics">
+  <div class="metric"><span>沟通模式</span><strong>{{ communication_policy.mode_label }}</strong></div>
   <div class="metric"><span>待确认</span><strong>{{ draft_counts.get("待确认", 0) }}</strong></div>
   <div class="metric"><span>需要我处理</span><strong>{{ draft_counts.get("需要我处理", 0) }}</strong></div>
   <div class="metric"><span>已发送</span><strong>{{ draft_counts.get("已发送", 0) }}</strong></div>

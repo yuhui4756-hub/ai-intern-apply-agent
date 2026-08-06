@@ -26,6 +26,30 @@
 </section>
 
 <section class="panel">
+  <div class="panel-title">
+    <h2>沟通自动化</h2>
+    <span class="badge">{{ communication_policy.mode_label }}</span>
+  </div>
+  <form method="post" action="/settings/communication" class="form-grid">
+    <label>沟通模式
+      <select name="mode">
+        {% for value, label in communication_modes %}
+        <option value="{{ value }}" {% if communication_policy.mode == value %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+      <span class="muted">关闭：不保存、不分析、不生成草稿；草稿模式：只进待发送队列；自主询问模式：按上限生成岗位相关询问候选。</span>
+    </label>
+    <label>自主询问最多轮次
+      <input name="max_auto_followups" type="number" min="0" max="10" step="1" value="{{ communication_policy.max_auto_followups }}">
+      <span class="muted">默认 2 轮。当前阶段仍不会自动发送消息，超过上限会转为需要我处理。</span>
+    </label>
+    <div class="form-actions">
+      <button class="button primary" type="submit">保存沟通设置</button>
+    </div>
+  </form>
+</section>
+
+<section class="panel">
   <h2>模型配置档</h2>
   <div class="cards">
     {% for profile in profiles %}

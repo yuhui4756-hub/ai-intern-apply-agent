@@ -52,6 +52,12 @@ BULK_IMPORT_LIMIT = 20
 EXTENSION_TEXT_LIMIT = 20000
 EXTENSION_LINK_LIMIT = 300
 LAST_MANUAL_SEARCH_KEY = "last_manual_search"
+COMMUNICATION_POLICY_KEY = "communication_policy"
+COMMUNICATION_MODES = [
+    ("off", "关闭"),
+    ("draft", "草稿模式"),
+    ("autonomous", "自主询问模式"),
+]
 BATCH_SEPARATOR_RE = re.compile(r"(?m)^\s*(?:-{3,}|={3,}|#{3,}|岗位\s*\d+[:：]?)\s*$")
 BATCH_START_MARKERS = [
     re.compile(r"(?m)^\s*公司名称\s*[:：]"),
@@ -71,6 +77,26 @@ def redirect_with_notice(path: str, message: str, notice_type: str = "info") -> 
 
 def task_label(task_type: str) -> str:
     return dict(TASK_TYPES).get(task_type, task_type)
+
+
+def communication_mode_label(value: str) -> str:
+    return dict(COMMUNICATION_MODES).get(value or "", "草稿模式")
+
+
+def communication_policy() -> dict[str, Any]:
+    saved = get_setting(COMMUNICATION_POLICY_KEY, {}) or {}
+    mode = str(saved.get("mode") or "draft")
+    if mode not in dict(COMMUNICATION_MODES):
+        mode = "draft"
+    try:
+        max_followups = int(saved.get("max_auto_followups", 2))
+    except (TypeError, ValueError):
+        max_followups = 2
+    return {
+        "mode": mode,
+        "mode_label": communication_mode_label(mode),
+        "max_auto_followups": max(0, min(max_followups, 10)),
+    }
 
 
 def parse_json_fields(job: dict[str, Any]) -> dict[str, Any]:
@@ -763,7 +789,72 @@ def try_llm_conversation_decision(text: str, job: dict[str, Any] | None, fallbac
     return merged
 
 
+def apply_communication_policy(
+    conn: Any,
+    decision: dict[str, Any],
+    policy: dict[str, Any],
+    job_id: int | None,
+) -> dict[str, Any]:
+    mode = str(policy.get("mode") or "draft")
+    if decision.get("message_type") != "岗位沟通" or not str(decision.get("draft_message") or "").strip():
+        return decision
+
+    updated = dict(decision)
+    reason = str(updated.get("reason") or "").strip()
+    if mode == "autonomous":
+        sent_count = 0
+        if job_id:
+            sent_count = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM message_drafts
+                    WHERE job_id = ?
+                      AND status = '已发送'
+                      AND draft_type IN ('岗位沟通', '自主询问候选')
+                    """,
+                    (job_id,),
+                ).fetchone()["count"]
+            )
+        max_followups = int(policy.get("max_auto_followups") or 0)
+        if sent_count >= max_followups:
+            flags = list(updated.get("risk_flags") or [])
+            flags.append(f"自主询问已达到 {max_followups} 轮上限，暂停并等待用户确认")
+            updated.update(
+                {
+                    "action_required": True,
+                    "draft_message": "",
+                    "risk_flags": flags,
+                    "reason": "；".join(item for item in [reason, f"自主询问已达到 {max_followups} 轮上限。"] if item),
+                }
+            )
+            return updated
+        updated["reason"] = "；".join(
+            item
+            for item in [
+                reason,
+                f"当前为自主询问模式，已发送 {sent_count}/{max_followups} 轮；本阶段仍需人工确认发送。",
+            ]
+            if item
+        )
+        return updated
+
+    updated["reason"] = "；".join(item for item in [reason, "当前为草稿模式，需人工确认后发送。"] if item)
+    return updated
+
+
 def create_conversation_from_extension(payload: dict[str, Any]) -> dict[str, Any] | JSONResponse:
+    policy = communication_policy()
+    if policy["mode"] == "off":
+        return {
+            "ok": True,
+            "capture_type": "conversation",
+            "skipped": True,
+            "message_type": "沟通模式已关闭",
+            "reason": "沟通模式为关闭，不保存、不分析、不生成草稿。",
+            "redirect_url": "/communications",
+        }
+
     raw_url = payload_text(payload, "url", 1000)
     if not raw_url:
         return api_error("缺少当前对话页面 URL。")
@@ -785,6 +876,7 @@ def create_conversation_from_extension(payload: dict[str, Any]) -> dict[str, Any
         decision = try_llm_conversation_decision(conversation_text, job, decision)
         now = utc_now()
         job_id = int(job["id"]) if job else None
+        decision = apply_communication_policy(conn, decision, policy, job_id)
         cursor = conn.execute(
             """
             INSERT INTO conversation_captures (
@@ -847,6 +939,8 @@ def create_conversation_from_extension(payload: dict[str, Any]) -> dict[str, Any
         "capture_id": capture_id,
         "draft_id": draft_id,
         "message_type": decision.get("message_type"),
+        "communication_mode": policy["mode"],
+        "communication_mode_label": policy["mode_label"],
         "redirect_url": "/communications",
     }
 
@@ -1174,6 +1268,7 @@ def communications_page(request: Request) -> Any:
             "draft_counts": {row["status"]: row["count"] for row in draft_counts},
             "feedback_counts": {row["status"]: row["count"] for row in feedback_counts},
             "message_types": ["岗位沟通", "面试邀请", "需要我处理", "无关内容"],
+            "communication_policy": communication_policy(),
             "loads": loads,
             "notice": request.query_params.get("notice", ""),
             "notice_type": request.query_params.get("notice_type", "info"),
@@ -1910,6 +2005,8 @@ def settings_page(request: Request) -> Any:
             "env_example": (ROOT_DIR / ".env.example").read_text(encoding="utf-8"),
             "blacklist_companies": "\n".join(get_setting("blacklist_companies", []) or []),
             "blacklist_keywords": "\n".join(get_setting("blacklist_keywords", []) or []),
+            "communication_policy": communication_policy(),
+            "communication_modes": COMMUNICATION_MODES,
             "notice": request.query_params.get("notice", ""),
             "notice_type": request.query_params.get("notice_type", "info"),
             "default_api_key_env": "OPENAI_COMPATIBLE_API_KEY",
@@ -1998,6 +2095,31 @@ async def upsert_model_profile(request: Request) -> RedirectResponse:
             return redirect_with_notice("/settings", f"模型连接失败：{str(exc)[:160]}", "error")
 
     return redirect_with_notice("/settings", save_message, "success")
+
+
+@app.post("/settings/communication")
+async def update_communication_policy(request: Request) -> RedirectResponse:
+    form = await request.form()
+    mode = str(form.get("mode") or "draft").strip()
+    if mode not in dict(COMMUNICATION_MODES):
+        return redirect_with_notice("/settings", "沟通模式无效，未保存。", "error")
+    try:
+        max_followups = int(str(form.get("max_auto_followups") or "2"))
+    except ValueError:
+        max_followups = 2
+    max_followups = max(0, min(max_followups, 10))
+    set_setting(
+        COMMUNICATION_POLICY_KEY,
+        {
+            "mode": mode,
+            "max_auto_followups": max_followups,
+        },
+    )
+    return redirect_with_notice(
+        "/settings",
+        f"沟通模式已保存：{communication_mode_label(mode)}，自主询问上限 {max_followups} 轮。",
+        "success",
+    )
 
 
 @app.post("/settings/blacklists")

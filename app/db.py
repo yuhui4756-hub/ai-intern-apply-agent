@@ -387,6 +387,10 @@ def seed_defaults(conn: sqlite3.Connection) -> None:
             )
 
     default_settings = {
+        "communication_policy": {
+            "mode": "draft",
+            "max_auto_followups": 2,
+        },
         "blacklist_companies": [],
         "blacklist_keywords": [
             "培训费",

@@ -585,6 +585,109 @@ def test_conversation_capture_stores_cleaning_debug_and_feedback(tmp_path, monke
     assert event["event_type"] == "对话分类反馈"
 
 
+def test_settings_updates_communication_policy(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "communication-settings.sqlite3"))
+
+    from app import main
+    from app.db import get_setting, init_db
+
+    init_db()
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/settings/communication",
+        data={"mode": "autonomous", "max_auto_followups": "3"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    policy = get_setting("communication_policy", {})
+    assert policy["mode"] == "autonomous"
+    assert policy["max_auto_followups"] == 3
+
+
+def test_conversation_capture_skips_when_communication_mode_off(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "communication-off.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db, set_setting
+
+    init_db()
+    set_setting("communication_policy", {"mode": "off", "max_auto_followups": 2})
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "conversation",
+            "url": "https://www.zhipin.com/web/geek/chat",
+            "title": "HR 对话",
+            "text": "HR：想了解工作内容吗？",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["skipped"] is True
+    assert payload["message_type"] == "沟通模式已关闭"
+    with connect() as conn:
+        count = conn.execute("SELECT COUNT(*) AS count FROM conversation_captures").fetchone()["count"]
+    assert count == 0
+
+
+def test_autonomous_mode_pauses_after_followup_limit(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "communication-autonomous-limit.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db, set_setting, utc_now
+
+    monkeypatch.setattr(main, "search_company", lambda *args, **kwargs: [])
+    init_db()
+    set_setting("communication_policy", {"mode": "autonomous", "max_auto_followups": 2})
+    client = TestClient(main.app)
+
+    job_response = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "job",
+            "url": "https://www.zhipin.com/job_detail/autonomous-limit.html",
+            "title": "AI 应用开发实习生",
+            "text": "公司名称：深圳自主智能科技有限公司\nAI 应用开发实习生\n要求 Python、FastAPI、RAG，每周 5 天。",
+        },
+    )
+    job_id = job_response.json()["job_id"]
+    now = utc_now()
+    with connect() as conn:
+        for index in range(2):
+            conn.execute(
+                """
+                INSERT INTO message_drafts (
+                    job_id, platform, draft_type, status, reason,
+                    message, risk_flags_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (job_id, "Boss 直聘", "岗位沟通", "已发送", f"历史第 {index + 1} 轮", "您好", "[]", now, now),
+            )
+
+    response = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "conversation",
+            "url": "https://www.zhipin.com/job_detail/autonomous-limit.html",
+            "title": "深圳自主智能科技有限公司 HR 对话",
+            "text": "HR：可以的，你想了解工作内容还是实习周期？",
+        },
+    )
+
+    assert response.status_code == 200
+    with connect() as conn:
+        draft = conn.execute("SELECT status, message, reason, risk_flags_json FROM message_drafts ORDER BY id DESC LIMIT 1").fetchone()
+    assert draft["status"] == "需要我处理"
+    assert draft["message"] == ""
+    assert "2 轮上限" in draft["reason"]
+    assert "2 轮上限" in draft["risk_flags_json"]
+
+
 def test_extension_conversation_capture_marks_interview_invite(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "conversation-interview.sqlite3"))
 
