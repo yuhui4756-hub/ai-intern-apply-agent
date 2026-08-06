@@ -477,6 +477,7 @@ def test_extension_conversation_capture_creates_safe_draft(tmp_path, monkeypatch
         capture = conn.execute("SELECT message_type, action_required FROM conversation_captures ORDER BY id DESC LIMIT 1").fetchone()
         draft = conn.execute("SELECT status, message, draft_type FROM message_drafts ORDER BY id DESC LIMIT 1").fetchone()
         action_log = conn.execute("SELECT action_type, status, decision_json FROM agent_action_logs ORDER BY id DESC LIMIT 1").fetchone()
+        patrol = conn.execute("SELECT status, checked_count, new_count, skipped_count FROM message_patrol_runs ORDER BY id DESC LIMIT 1").fetchone()
     assert capture["message_type"] == "岗位沟通"
     assert capture["action_required"] == 0
     assert draft["status"] == "待确认"
@@ -485,6 +486,10 @@ def test_extension_conversation_capture_creates_safe_draft(tmp_path, monkeypatch
     assert action_log["action_type"] == "conversation_capture"
     assert action_log["status"] == "岗位沟通"
     assert "draft_status" in action_log["decision_json"]
+    assert patrol["status"] == "已处理"
+    assert patrol["checked_count"] == 1
+    assert patrol["new_count"] == 1
+    assert patrol["skipped_count"] == 0
 
 
 def test_liepin_resume_button_does_not_trigger_manual_review():
@@ -691,8 +696,10 @@ def test_conversation_capture_skips_when_communication_mode_off(tmp_path, monkey
     with connect() as conn:
         count = conn.execute("SELECT COUNT(*) AS count FROM conversation_captures").fetchone()["count"]
         log_count = conn.execute("SELECT COUNT(*) AS count FROM agent_action_logs").fetchone()["count"]
+        patrol_count = conn.execute("SELECT COUNT(*) AS count FROM message_patrol_runs").fetchone()["count"]
     assert count == 0
     assert log_count == 0
+    assert patrol_count == 0
 
 
 def test_automation_control_pause_resume_updates_setting_and_log(tmp_path, monkeypatch):
@@ -767,12 +774,17 @@ def test_conversation_capture_skips_when_automation_paused(tmp_path, monkeypatch
         capture_count = conn.execute("SELECT COUNT(*) AS count FROM conversation_captures").fetchone()["count"]
         draft_count = conn.execute("SELECT COUNT(*) AS count FROM message_drafts").fetchone()["count"]
         log = conn.execute("SELECT action_type, status, summary, decision_json FROM agent_action_logs ORDER BY id DESC LIMIT 1").fetchone()
+        patrol = conn.execute("SELECT status, checked_count, new_count, skipped_count FROM message_patrol_runs ORDER BY id DESC LIMIT 1").fetchone()
     assert capture_count == 0
     assert draft_count == 0
     assert log["action_type"] == "automation_paused"
     assert log["status"] == "已暂停"
     assert "工作内容" not in log["summary"]
     assert "工作内容" not in log["decision_json"]
+    assert patrol["status"] == "已暂停"
+    assert patrol["checked_count"] == 1
+    assert patrol["new_count"] == 0
+    assert patrol["skipped_count"] == 1
 
 
 def test_duplicate_conversation_capture_skips_llm_and_draft(tmp_path, monkeypatch):
@@ -843,10 +855,14 @@ def test_duplicate_conversation_capture_skips_llm_and_draft(tmp_path, monkeypatc
         capture_count = conn.execute("SELECT COUNT(*) AS count FROM conversation_captures").fetchone()["count"]
         draft_count = conn.execute("SELECT COUNT(*) AS count FROM message_drafts").fetchone()["count"]
         diff_log = conn.execute("SELECT action_type, status, summary FROM agent_action_logs WHERE action_type = 'conversation_diff_check' ORDER BY id DESC LIMIT 1").fetchone()
+        patrol_rows = conn.execute("SELECT status, checked_count, new_count, skipped_count FROM message_patrol_runs ORDER BY id").fetchall()
     assert capture_count == 2
     assert draft_count == 2
     assert diff_log["status"] == "无新内容"
     assert "上一条采集一致" in diff_log["summary"]
+    assert [row["status"] for row in patrol_rows] == ["已处理", "无新内容", "已处理"]
+    assert [row["new_count"] for row in patrol_rows] == [1, 0, 1]
+    assert [row["skipped_count"] for row in patrol_rows] == [0, 1, 0]
 
 
 def test_autonomous_mode_pauses_after_followup_limit(tmp_path, monkeypatch):

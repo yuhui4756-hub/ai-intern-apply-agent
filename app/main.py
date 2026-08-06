@@ -93,6 +93,7 @@ def action_type_label(value: str) -> str:
         "automation_control_update": "自动化控制",
         "automation_paused": "暂停跳过",
         "conversation_diff_check": "对话差分",
+        "message_patrol_run": "消息巡检",
     }.get(value or "", value or "-")
 
 
@@ -154,6 +155,53 @@ def log_agent_action(
             dumps(decision or {}),
             error_message[:500],
             utc_now(),
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
+def insert_message_patrol_run(
+    conn: Any,
+    *,
+    trigger_type: str,
+    platform: str = "",
+    scope: str = "single_conversation",
+    status: str,
+    checked_count: int = 0,
+    new_count: int = 0,
+    skipped_count: int = 0,
+    error_count: int = 0,
+    note: str = "",
+    source_url: str = "",
+    page_title: str = "",
+    job_id: int | None = None,
+    capture_id: int | None = None,
+) -> int:
+    now = utc_now()
+    cursor = conn.execute(
+        """
+        INSERT INTO message_patrol_runs (
+            job_id, capture_id, platform, source_url, page_title, trigger_type,
+            scope, status, checked_count, new_count, skipped_count, error_count,
+            note, created_at, finished_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            job_id,
+            capture_id,
+            platform,
+            source_url,
+            page_title,
+            trigger_type,
+            scope,
+            status,
+            checked_count,
+            new_count,
+            skipped_count,
+            error_count,
+            note[:500],
+            now,
+            now,
         ),
     )
     return int(cursor.lastrowid)
@@ -747,6 +795,17 @@ def extension_platform(url: str, fallback: str = "") -> str:
     return fallback or "浏览器扩展"
 
 
+def extension_patrol_trigger(payload: dict[str, Any]) -> str:
+    value = payload_text(payload, "patrol_trigger", 40) or payload_text(payload, "trigger_type", 40)
+    if value in {"manual_extension", "manual", "scheduled"}:
+        return value
+    return "manual_extension"
+
+
+def extension_patrol_scope(payload: dict[str, Any]) -> str:
+    return payload_text(payload, "patrol_scope", 80) or "single_conversation"
+
+
 def extension_keyword(url: str, title: str) -> str:
     parsed = urlparse(url)
     query = parse_qs(parsed.query)
@@ -977,10 +1036,26 @@ def create_conversation_from_extension(payload: dict[str, Any]) -> dict[str, Any
             "redirect_url": "/communications",
         }
 
+    patrol_trigger = extension_patrol_trigger(payload)
+    patrol_scope = extension_patrol_scope(payload)
     control = automation_control()
     if control["paused"]:
-        platform = extension_platform(payload_text(payload, "url", 1000), payload_text(payload, "platform", 80))
+        raw_source_url = payload_text(payload, "url", 1000)
+        page_title = payload_text(payload, "title", 300)
+        platform = extension_platform(raw_source_url, payload_text(payload, "platform", 80))
         with connect() as conn:
+            patrol_run_id = insert_message_patrol_run(
+                conn,
+                trigger_type=patrol_trigger,
+                platform=platform,
+                scope=patrol_scope,
+                status="已暂停",
+                checked_count=1,
+                skipped_count=1,
+                note="自动化已暂停，跳过本次对话巡检。",
+                source_url=raw_source_url,
+                page_title=page_title,
+            )
             log_agent_action(
                 conn,
                 action_type="automation_paused",
@@ -988,6 +1063,7 @@ def create_conversation_from_extension(payload: dict[str, Any]) -> dict[str, Any
                 summary="自动化已暂停，跳过本次对话采集。",
                 platform=platform,
                 decision={
+                    "patrol_run_id": patrol_run_id,
                     "pause_reason": control["pause_reason"],
                     "updated_at": control["updated_at"],
                 },
@@ -998,6 +1074,7 @@ def create_conversation_from_extension(payload: dict[str, Any]) -> dict[str, Any
             "skipped": True,
             "message_type": "自动化已暂停",
             "reason": control["pause_reason"] or "自动化已暂停，不保存、不分析、不生成草稿。",
+            "patrol_run_id": patrol_run_id,
             "redirect_url": "/communications",
         }
 
@@ -1028,6 +1105,20 @@ def create_conversation_from_extension(payload: dict[str, Any]) -> dict[str, Any
             conversation_text=conversation_text,
         )
         if duplicate:
+            patrol_run_id = insert_message_patrol_run(
+                conn,
+                trigger_type=patrol_trigger,
+                platform=platform,
+                scope=patrol_scope,
+                status="无新内容",
+                checked_count=1,
+                skipped_count=1,
+                note="清洗后的对话内容与上一条采集一致，未调用模型。",
+                source_url=url,
+                page_title=title,
+                job_id=job_id,
+                capture_id=int(duplicate["id"]),
+            )
             log_agent_action(
                 conn,
                 action_type="conversation_diff_check",
@@ -1037,6 +1128,7 @@ def create_conversation_from_extension(payload: dict[str, Any]) -> dict[str, Any
                 job_id=job_id,
                 capture_id=int(duplicate["id"]),
                 decision={
+                    "patrol_run_id": patrol_run_id,
                     "matched_capture_id": int(duplicate["id"]),
                     "text_length": len(conversation_text),
                     "matched_by": "job_id" if job_id else "source_url",
@@ -1049,6 +1141,7 @@ def create_conversation_from_extension(payload: dict[str, Any]) -> dict[str, Any
                 "message_type": "无新内容",
                 "reason": "当前对话没有新增内容，已跳过分析和草稿生成。",
                 "existing_capture_id": int(duplicate["id"]),
+                "patrol_run_id": patrol_run_id,
                 "redirect_url": "/communications",
             }
 
@@ -1123,6 +1216,20 @@ def create_conversation_from_extension(payload: dict[str, Any]) -> dict[str, Any
             action_status = "需要我处理"
         else:
             action_status = "已采集"
+        patrol_run_id = insert_message_patrol_run(
+            conn,
+            trigger_type=patrol_trigger,
+            platform=platform,
+            scope=patrol_scope,
+            status="已处理",
+            checked_count=1,
+            new_count=1,
+            note="发现新对话内容，已进入分类和草稿流程。",
+            source_url=url,
+            page_title=title,
+            job_id=job_id,
+            capture_id=capture_id,
+        )
         log_agent_action(
             conn,
             action_type="conversation_capture",
@@ -1133,6 +1240,7 @@ def create_conversation_from_extension(payload: dict[str, Any]) -> dict[str, Any
             capture_id=capture_id,
             draft_id=draft_id,
             decision={
+                "patrol_run_id": patrol_run_id,
                 "message_type": decision.get("message_type"),
                 "draft_type": decision.get("draft_type") or decision.get("message_type"),
                 "draft_status": draft_status if draft_id else "",
@@ -1152,6 +1260,7 @@ def create_conversation_from_extension(payload: dict[str, Any]) -> dict[str, Any
         "message_type": decision.get("message_type"),
         "communication_mode": policy["mode"],
         "communication_mode_label": policy["mode_label"],
+        "patrol_run_id": patrol_run_id,
         "redirect_url": "/communications",
     }
 
@@ -1480,6 +1589,15 @@ def communications_page(request: Request) -> Any:
             LIMIT 80
             """
         ).fetchall()
+        patrol_runs = conn.execute(
+            """
+            SELECT p.*, j.title AS job_title, j.company AS company
+            FROM message_patrol_runs p
+            LEFT JOIN job_postings j ON j.id = p.job_id
+            ORDER BY p.created_at DESC, p.id DESC
+            LIMIT 40
+            """
+        ).fetchall()
     return templates.TemplateResponse(
         request,
         "communications.html",
@@ -1494,6 +1612,7 @@ def communications_page(request: Request) -> Any:
             "automation_control": automation_control(),
             "communication_mode_label": communication_mode_label,
             "action_logs": [{key: row[key] for key in row.keys()} for row in action_logs],
+            "patrol_runs": [{key: row[key] for key in row.keys()} for row in patrol_runs],
             "action_type_label": action_type_label,
             "loads": loads,
             "notice": request.query_params.get("notice", ""),

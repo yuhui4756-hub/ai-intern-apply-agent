@@ -152,10 +152,11 @@ function renderSuccess(payload) {
     conversation: `当前对话：${payload.message_type || "已分析"}`,
   };
   const label = labels[payload.capture_type] || `搜索结果：${payload.candidate_count || 0} 个候选${sourceText}`;
+  const resultVerb = payload.skipped ? "已跳过" : "已保存";
   const targetUrl = `${APP_BASE_URL}${payload.redirect_url}`;
   resultBox.className = "result";
   resultBox.innerHTML = `
-    <div>${escapeHtml(label)}已保存。</div>
+    <div>${escapeHtml(label)}${resultVerb}。</div>
     <p><a href="${targetUrl}" target="_blank" rel="noreferrer">打开本地结果</a></p>
   `;
 }

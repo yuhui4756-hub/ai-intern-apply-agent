@@ -51,6 +51,59 @@
 
 <section class="panel">
   <div class="panel-title">
+    <h2>最近巡检</h2>
+    <span class="muted">无新内容不会调用模型。</span>
+  </div>
+  {% if patrol_runs %}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>时间</th>
+          <th>平台</th>
+          <th>岗位</th>
+          <th>状态</th>
+          <th>计数</th>
+          <th>备注</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for run in patrol_runs %}
+        <tr>
+          <td>{{ run.created_at }}</td>
+          <td>
+            {{ run.platform or "-" }}
+            <div class="muted">{{ run.trigger_type or "-" }}</div>
+          </td>
+          <td>
+            {% if run.job_id %}
+            <a href="/jobs/{{ run.job_id }}">{{ (run.company ~ " - " if run.company else "") ~ (run.job_title or "岗位") }}</a>
+            {% else %}
+            <span class="empty">未匹配岗位</span>
+            {% endif %}
+          </td>
+          <td>{{ run.status or "-" }}</td>
+          <td>
+            <span class="badge">查 {{ run.checked_count }}</span>
+            <span class="badge">新 {{ run.new_count }}</span>
+            <span class="badge">跳 {{ run.skipped_count }}</span>
+            {% if run.error_count %}
+            <span class="badge">错 {{ run.error_count }}</span>
+            {% endif %}
+          </td>
+          <td>{{ run.note or "-" }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">暂无巡检记录。</p>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <div class="panel-title">
     <h2>待发送队列</h2>
     <span class="muted">只生成草稿，不自动发送。</span>
   </div>

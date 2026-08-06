@@ -275,6 +275,27 @@ def init_db() -> None:
                 FOREIGN KEY(draft_id) REFERENCES message_drafts(id) ON DELETE SET NULL
             );
 
+            CREATE TABLE IF NOT EXISTS message_patrol_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER,
+                capture_id INTEGER,
+                platform TEXT NOT NULL DEFAULT '',
+                source_url TEXT NOT NULL DEFAULT '',
+                page_title TEXT NOT NULL DEFAULT '',
+                trigger_type TEXT NOT NULL DEFAULT '',
+                scope TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT '',
+                checked_count INTEGER NOT NULL DEFAULT 0,
+                new_count INTEGER NOT NULL DEFAULT 0,
+                skipped_count INTEGER NOT NULL DEFAULT 0,
+                error_count INTEGER NOT NULL DEFAULT 0,
+                note TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                finished_at TEXT NOT NULL DEFAULT '',
+                FOREIGN KEY(job_id) REFERENCES job_postings(id) ON DELETE SET NULL,
+                FOREIGN KEY(capture_id) REFERENCES conversation_captures(id) ON DELETE SET NULL
+            );
+
             CREATE TABLE IF NOT EXISTS app_settings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 key TEXT NOT NULL UNIQUE,
