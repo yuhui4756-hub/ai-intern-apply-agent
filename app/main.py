@@ -801,22 +801,37 @@ def apply_communication_policy(
 
     updated = dict(decision)
     reason = str(updated.get("reason") or "").strip()
+    updated["communication_mode"] = mode
     if mode == "autonomous":
-        sent_count = 0
-        if job_id:
-            sent_count = int(
-                conn.execute(
-                    """
-                    SELECT COUNT(*) AS count
-                    FROM message_drafts
-                    WHERE job_id = ?
-                      AND status = '已发送'
-                      AND draft_type IN ('岗位沟通', '自主询问候选')
-                    """,
-                    (job_id,),
-                ).fetchone()["count"]
-            )
         max_followups = int(policy.get("max_auto_followups") or 0)
+        updated["followup_limit"] = max_followups
+        if not job_id:
+            flags = list(updated.get("risk_flags") or [])
+            flags.append("未匹配到岗位，暂停自主询问并等待用户确认")
+            updated.update(
+                {
+                    "action_required": True,
+                    "draft_message": "",
+                    "draft_type": "自主询问暂停",
+                    "followup_index": 0,
+                    "risk_flags": flags,
+                    "reason": "；".join(item for item in [reason, "未匹配到岗位，无法可靠记录自主询问轮次。"] if item),
+                }
+            )
+            return updated
+
+        sent_count = int(
+            conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM message_drafts
+                WHERE job_id = ?
+                  AND status = '已发送'
+                  AND draft_type IN ('岗位沟通', '自主询问候选')
+                """,
+                (job_id,),
+            ).fetchone()["count"]
+        )
         if sent_count >= max_followups:
             flags = list(updated.get("risk_flags") or [])
             flags.append(f"自主询问已达到 {max_followups} 轮上限，暂停并等待用户确认")
@@ -824,11 +839,15 @@ def apply_communication_policy(
                 {
                     "action_required": True,
                     "draft_message": "",
+                    "draft_type": "自主询问暂停",
+                    "followup_index": sent_count,
                     "risk_flags": flags,
                     "reason": "；".join(item for item in [reason, f"自主询问已达到 {max_followups} 轮上限。"] if item),
                 }
             )
             return updated
+        updated["draft_type"] = "自主询问候选"
+        updated["followup_index"] = sent_count + 1
         updated["reason"] = "；".join(
             item
             for item in [
@@ -839,6 +858,9 @@ def apply_communication_policy(
         )
         return updated
 
+    updated["draft_type"] = "岗位沟通"
+    updated["followup_index"] = 0
+    updated["followup_limit"] = 0
     updated["reason"] = "；".join(item for item in [reason, "当前为草稿模式，需人工确认后发送。"] if item)
     return updated
 
@@ -908,16 +930,20 @@ def create_conversation_from_extension(payload: dict[str, Any]) -> dict[str, Any
             draft_cursor = conn.execute(
                 """
                 INSERT INTO message_drafts (
-                    capture_id, job_id, platform, draft_type, status, reason,
-                    message, risk_flags_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    capture_id, job_id, platform, draft_type, status,
+                    communication_mode, followup_index, followup_limit,
+                    reason, message, risk_flags_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     capture_id,
                     job_id,
                     platform,
-                    str(decision.get("message_type") or "岗位沟通"),
+                    str(decision.get("draft_type") or decision.get("message_type") or "岗位沟通"),
                     draft_status,
+                    str(decision.get("communication_mode") or policy["mode"]),
+                    int(decision.get("followup_index") or 0),
+                    int(decision.get("followup_limit") or 0),
                     str(decision.get("reason") or ""),
                     draft_message,
                     dumps(risk_flags),
@@ -1251,6 +1277,7 @@ def communications_page(request: Request) -> Any:
             """
         ).fetchall()
         draft_counts = conn.execute("SELECT status, COUNT(*) AS count FROM message_drafts GROUP BY status").fetchall()
+        draft_type_counts = conn.execute("SELECT draft_type, COUNT(*) AS count FROM message_drafts GROUP BY draft_type").fetchall()
         feedback_counts = conn.execute(
             """
             SELECT feedback_status AS status, COUNT(*) AS count
@@ -1266,9 +1293,11 @@ def communications_page(request: Request) -> Any:
             "drafts": [{key: row[key] for key in row.keys()} for row in drafts],
             "captures": [{key: row[key] for key in row.keys()} for row in captures],
             "draft_counts": {row["status"]: row["count"] for row in draft_counts},
+            "draft_type_counts": {row["draft_type"]: row["count"] for row in draft_type_counts},
             "feedback_counts": {row["status"]: row["count"] for row in feedback_counts},
             "message_types": ["岗位沟通", "面试邀请", "需要我处理", "无关内容"],
             "communication_policy": communication_policy(),
+            "communication_mode_label": communication_mode_label,
             "loads": loads,
             "notice": request.query_params.get("notice", ""),
             "notice_type": request.query_params.get("notice_type", "info"),

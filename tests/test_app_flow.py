@@ -681,11 +681,100 @@ def test_autonomous_mode_pauses_after_followup_limit(tmp_path, monkeypatch):
 
     assert response.status_code == 200
     with connect() as conn:
-        draft = conn.execute("SELECT status, message, reason, risk_flags_json FROM message_drafts ORDER BY id DESC LIMIT 1").fetchone()
+        draft = conn.execute(
+            "SELECT draft_type, status, message, communication_mode, followup_index, followup_limit, reason, risk_flags_json FROM message_drafts ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert draft["draft_type"] == "自主询问暂停"
     assert draft["status"] == "需要我处理"
     assert draft["message"] == ""
+    assert draft["communication_mode"] == "autonomous"
+    assert draft["followup_index"] == 2
+    assert draft["followup_limit"] == 2
     assert "2 轮上限" in draft["reason"]
     assert "2 轮上限" in draft["risk_flags_json"]
+
+
+def test_autonomous_mode_creates_followup_candidate_with_round_metadata(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "communication-autonomous-candidate.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db, set_setting
+
+    monkeypatch.setattr(main, "search_company", lambda *args, **kwargs: [])
+    init_db()
+    set_setting("communication_policy", {"mode": "autonomous", "max_auto_followups": 2})
+    client = TestClient(main.app)
+
+    job_response = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "job",
+            "url": "https://www.zhipin.com/job_detail/autonomous-candidate.html",
+            "title": "AI 应用开发实习生",
+            "text": "公司名称：深圳候选智能科技有限公司\nAI 应用开发实习生\n要求 Python、FastAPI、RAG，每周 5 天。",
+        },
+    )
+    job_id = job_response.json()["job_id"]
+    response = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "conversation",
+            "url": "https://www.zhipin.com/job_detail/autonomous-candidate.html",
+            "title": "深圳候选智能科技有限公司 HR 对话",
+            "text": "HR：可以的，你想了解工作内容还是实习周期？",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["communication_mode"] == "autonomous"
+    with connect() as conn:
+        draft = conn.execute(
+            "SELECT job_id, draft_type, status, communication_mode, followup_index, followup_limit, reason, message FROM message_drafts ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert draft["job_id"] == job_id
+    assert draft["draft_type"] == "自主询问候选"
+    assert draft["status"] == "待确认"
+    assert draft["communication_mode"] == "autonomous"
+    assert draft["followup_index"] == 1
+    assert draft["followup_limit"] == 2
+    assert "已发送 0/2 轮" in draft["reason"]
+    assert "主要工作内容" in draft["message"]
+
+
+def test_autonomous_mode_pauses_when_job_not_matched(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "communication-autonomous-no-job.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db, set_setting
+
+    init_db()
+    set_setting("communication_policy", {"mode": "autonomous", "max_auto_followups": 2})
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "conversation",
+            "url": "https://www.zhipin.com/web/geek/chat/no-job",
+            "title": "未匹配 HR 对话",
+            "text": "HR：可以的，你想了解工作内容还是实习周期？",
+        },
+    )
+
+    assert response.status_code == 200
+    with connect() as conn:
+        draft = conn.execute(
+            "SELECT draft_type, status, message, communication_mode, followup_index, followup_limit, reason, risk_flags_json FROM message_drafts ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert draft["draft_type"] == "自主询问暂停"
+    assert draft["status"] == "需要我处理"
+    assert draft["message"] == ""
+    assert draft["communication_mode"] == "autonomous"
+    assert draft["followup_index"] == 0
+    assert draft["followup_limit"] == 2
+    assert "未匹配到岗位" in draft["reason"]
+    assert "未匹配到岗位" in draft["risk_flags_json"]
 
 
 def test_extension_conversation_capture_marks_interview_invite(tmp_path, monkeypatch):

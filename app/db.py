@@ -196,6 +196,9 @@ def init_db() -> None:
                 platform TEXT NOT NULL DEFAULT '',
                 draft_type TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT '待确认',
+                communication_mode TEXT NOT NULL DEFAULT '',
+                followup_index INTEGER NOT NULL DEFAULT 0,
+                followup_limit INTEGER NOT NULL DEFAULT 0,
                 reason TEXT NOT NULL DEFAULT '',
                 message TEXT NOT NULL DEFAULT '',
                 risk_flags_json TEXT NOT NULL DEFAULT '[]',
@@ -285,6 +288,16 @@ def ensure_columns(conn: sqlite3.Connection) -> None:
     for column, definition in conversation_defaults.items():
         if column not in conversation_columns:
             conn.execute(f"ALTER TABLE conversation_captures ADD COLUMN {column} {definition}")
+
+    draft_columns = table_column_names(conn, "message_drafts")
+    draft_defaults = {
+        "communication_mode": "TEXT NOT NULL DEFAULT ''",
+        "followup_index": "INTEGER NOT NULL DEFAULT 0",
+        "followup_limit": "INTEGER NOT NULL DEFAULT 0",
+    }
+    for column, definition in draft_defaults.items():
+        if column not in draft_columns:
+            conn.execute(f"ALTER TABLE message_drafts ADD COLUMN {column} {definition}")
 
 
 def table_column_names(conn: sqlite3.Connection, table_name: str) -> set[str]:

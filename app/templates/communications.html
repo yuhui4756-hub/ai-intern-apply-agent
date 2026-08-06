@@ -19,6 +19,7 @@
   <div class="metric"><span>需要我处理</span><strong>{{ draft_counts.get("需要我处理", 0) }}</strong></div>
   <div class="metric"><span>已发送</span><strong>{{ draft_counts.get("已发送", 0) }}</strong></div>
   <div class="metric"><span>已驳回</span><strong>{{ draft_counts.get("已驳回", 0) }}</strong></div>
+  <div class="metric"><span>自主询问候选</span><strong>{{ draft_type_counts.get("自主询问候选", 0) }}</strong></div>
   <div class="metric"><span>误判反馈</span><strong>{{ feedback_counts.get("误判", 0) }}</strong></div>
 </section>
 
@@ -50,7 +51,15 @@
             <span class="empty">未匹配岗位</span>
             {% endif %}
           </td>
-          <td>{{ draft.draft_type or "-" }}</td>
+          <td>
+            {{ draft.draft_type or "-" }}
+            {% if draft.communication_mode %}
+            <div class="muted">{{ communication_mode_label(draft.communication_mode) }}</div>
+            {% endif %}
+            {% if draft.followup_limit %}
+            <span class="badge">第 {{ draft.followup_index }} / {{ draft.followup_limit }} 轮</span>
+            {% endif %}
+          </td>
           <td>{{ draft.status }}</td>
           <td>
             <p>{{ draft.reason or "-" }}</p>
