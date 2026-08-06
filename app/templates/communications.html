@@ -29,16 +29,26 @@
   <div class="panel-title">
     <div>
       <h2>巡检调度</h2>
-      <p class="muted">当前是调度壳：只记录 tick，不读取浏览器页面，不调用模型。</p>
+      <p class="muted">当前已接入 Edge dry-run 巡检：只读取受控 Edge 已打开的招聘平台聊天页可见文本，做本地差分，不自动回复。</p>
       {% if message_patrol_policy.next_tick_at %}
       <p class="muted">下次计划：{{ message_patrol_policy.next_tick_at }}</p>
       {% endif %}
     </div>
     <span class="badge">{{ message_patrol_policy.status_label }}</span>
   </div>
+  <form method="post" action="/message-patrol/open-browser" class="form-grid">
+    <input type="hidden" name="return_to" value="/communications">
+    <label>起始链接（可选）
+      <input name="start_url" placeholder="可粘贴招聘平台聊天页；留空打开空白巡检窗口">
+    </label>
+    <div class="form-actions">
+      <button class="button" type="submit">打开 Edge 巡检窗口</button>
+    </div>
+  </form>
   <form method="post" action="/message-patrol/tick" class="form-actions">
     <input type="hidden" name="return_to" value="/communications">
     <button class="button" type="submit">手动 tick</button>
+    <button class="button primary" type="submit" formaction="/message-patrol/browser-dry-run">巡检当前 Edge 聊天页</button>
     <a class="button" href="/settings">巡检设置</a>
   </form>
 </section>

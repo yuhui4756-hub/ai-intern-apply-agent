@@ -767,6 +767,11 @@ def test_message_patrol_policy_update_and_manual_tick(tmp_path, monkeypatch):
     assert policy["interval_seconds"] == 60
     assert policy["cooldown_seconds"] == 0
     assert policy["next_tick_at"]
+    monkeypatch.setattr(
+        main,
+        "capture_browser_patrol_observations",
+        lambda **_kwargs: (_ for _ in ()).throw(ValueError("没有检测到应用打开的 Edge 调试窗口")),
+    )
 
     tick = client.post("/message-patrol/tick", data={"return_to": "/communications"}, follow_redirects=False)
 
@@ -775,17 +780,17 @@ def test_message_patrol_policy_update_and_manual_tick(tmp_path, monkeypatch):
         patrol = conn.execute("SELECT trigger_type, scope, status, checked_count, new_count, skipped_count, note FROM message_patrol_runs ORDER BY id DESC LIMIT 1").fetchone()
         action_log = conn.execute("SELECT action_type, status, decision_json FROM agent_action_logs ORDER BY id DESC LIMIT 1").fetchone()
     policy = get_setting("message_patrol_policy", {})
-    assert patrol["trigger_type"] == "manual"
+    assert patrol["trigger_type"] == "manual_browser"
     assert patrol["scope"] == "scheduled_patrol"
-    assert patrol["status"] == "待接入"
+    assert patrol["status"] == "浏览器未连接"
     assert patrol["checked_count"] == 0
     assert patrol["new_count"] == 0
-    assert patrol["skipped_count"] == 0
-    assert "未读取页面" in patrol["note"]
+    assert patrol["skipped_count"] == 1
+    assert "没有检测到应用打开的 Edge 调试窗口" in patrol["note"]
     assert action_log["action_type"] == "message_patrol_run"
-    assert action_log["status"] == "待接入"
-    assert "model_called" in action_log["decision_json"]
-    assert policy["last_status"] == "待接入"
+    assert action_log["status"] == "浏览器未连接"
+    assert "edge_cdp" in action_log["decision_json"]
+    assert policy["last_status"] == "浏览器未连接"
     assert policy["last_tick_at"]
 
 
@@ -1205,6 +1210,171 @@ def test_message_patrol_observation_short_text_is_skipped_without_capture(tmp_pa
     assert draft_count == 0
     assert patrol["status"] == "文本过短"
     assert patrol["skipped_count"] == 1
+
+
+def test_browser_patrol_dry_run_route_uses_open_edge_observations_without_capture(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "browser-patrol-dry-run.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db
+
+    monkeypatch.setattr(main, "search_company", lambda *args, **kwargs: [])
+    init_db()
+    client = TestClient(main.app)
+
+    job_response = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "job",
+            "url": "https://www.zhipin.com/job_detail/browser-patrol.html",
+            "title": "AI 应用开发实习生",
+            "text": "公司名称：深圳浏览器巡检智能科技有限公司\nAI 应用开发实习生\n要求 Python、FastAPI、RAG，每周 5 天。",
+        },
+    )
+    assert job_response.status_code == 200
+    monkeypatch.setattr(
+        main,
+        "capture_browser_patrol_observations",
+        lambda **_kwargs: [
+            {
+                "url": "https://www.zhipin.com/job_detail/browser-patrol.html",
+                "title": "深圳浏览器巡检智能科技有限公司 HR 对话",
+                "platform": "Boss 直聘",
+                "text": "HR：您好，这里是深圳浏览器巡检智能科技有限公司，请问你想了解工作内容还是实习周期？\n我：想了解 AI 应用开发岗位。",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        main,
+        "classify_conversation",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("browser dry-run must not classify")),
+    )
+
+    response = client.post("/message-patrol/browser-dry-run", data={"return_to": "/communications"}, follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"].startswith("/communications")
+    with connect() as conn:
+        capture_count = conn.execute("SELECT COUNT(*) AS count FROM conversation_captures").fetchone()["count"]
+        draft_count = conn.execute("SELECT COUNT(*) AS count FROM message_drafts").fetchone()["count"]
+        patrol = conn.execute("SELECT trigger_type, scope, status, checked_count, new_count, skipped_count FROM message_patrol_runs ORDER BY id DESC LIMIT 1").fetchone()
+        action_log = conn.execute("SELECT action_type, status, decision_json FROM agent_action_logs ORDER BY id DESC LIMIT 1").fetchone()
+    assert capture_count == 0
+    assert draft_count == 0
+    assert patrol["trigger_type"] == "manual_browser"
+    assert patrol["scope"] == "manual_browser_patrol"
+    assert patrol["status"] == "观察完成"
+    assert patrol["checked_count"] == 1
+    assert patrol["new_count"] == 1
+    assert patrol["skipped_count"] == 0
+    assert action_log["action_type"] == "message_patrol_observation"
+    assert action_log["status"] == "观察完成"
+    assert "工作内容" not in action_log["decision_json"]
+
+    second = client.post("/message-patrol/browser-dry-run", data={"return_to": "/communications"}, follow_redirects=False)
+
+    assert second.status_code == 303
+    with connect() as conn:
+        capture_count = conn.execute("SELECT COUNT(*) AS count FROM conversation_captures").fetchone()["count"]
+        draft_count = conn.execute("SELECT COUNT(*) AS count FROM message_drafts").fetchone()["count"]
+        patrol = conn.execute("SELECT status, checked_count, new_count, skipped_count FROM message_patrol_runs ORDER BY id DESC LIMIT 1").fetchone()
+    assert capture_count == 0
+    assert draft_count == 0
+    assert patrol["status"] == "无新内容"
+    assert patrol["checked_count"] == 1
+    assert patrol["new_count"] == 0
+    assert patrol["skipped_count"] == 1
+
+
+def test_message_patrol_tick_uses_browser_executor_when_enabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "browser-patrol-tick.sqlite3"))
+
+    from app import main
+    from app.db import connect, get_setting, init_db, set_setting, utc_now
+
+    monkeypatch.setattr(main, "search_company", lambda *args, **kwargs: [])
+    init_db()
+    set_setting(
+        "message_patrol_policy",
+        {
+            "enabled": True,
+            "interval_seconds": 60,
+            "cooldown_seconds": 0,
+            "last_tick_at": "",
+            "next_tick_at": "",
+            "last_status": "",
+            "updated_at": utc_now(),
+        },
+    )
+    client = TestClient(main.app)
+    job_response = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "job",
+            "url": "https://www.zhipin.com/job_detail/browser-scheduled.html",
+            "title": "AI 应用开发实习生",
+            "text": "公司名称：深圳定时巡检智能科技有限公司\nAI 应用开发实习生\n要求 Python、FastAPI、RAG，每周 5 天。",
+        },
+    )
+    assert job_response.status_code == 200
+    monkeypatch.setattr(
+        main,
+        "capture_browser_patrol_observations",
+        lambda **_kwargs: [
+            {
+                "url": "https://www.zhipin.com/job_detail/browser-scheduled.html",
+                "title": "深圳定时巡检智能科技有限公司 HR 对话",
+                "platform": "Boss 直聘",
+                "text": "HR：您好，这里是深圳定时巡检智能科技有限公司，请问你想了解工作内容还是实习周期？\n我：想了解 AI 应用开发岗位。",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        main,
+        "try_llm_conversation_decision",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("scheduled browser dry-run must not call LLM")),
+    )
+
+    response = client.post("/message-patrol/tick", data={"return_to": "/communications"}, follow_redirects=False)
+
+    assert response.status_code == 303
+    with connect() as conn:
+        patrol = conn.execute("SELECT trigger_type, scope, status, checked_count, new_count, skipped_count FROM message_patrol_runs ORDER BY id DESC LIMIT 1").fetchone()
+        captures = conn.execute("SELECT COUNT(*) AS count FROM conversation_captures").fetchone()["count"]
+        drafts = conn.execute("SELECT COUNT(*) AS count FROM message_drafts").fetchone()["count"]
+    policy = get_setting("message_patrol_policy", {})
+    assert patrol["trigger_type"] == "manual_browser"
+    assert patrol["scope"] == "scheduled_patrol"
+    assert patrol["status"] == "观察完成"
+    assert patrol["checked_count"] == 1
+    assert patrol["new_count"] == 1
+    assert patrol["skipped_count"] == 0
+    assert captures == 0
+    assert drafts == 0
+    assert policy["last_status"] == "观察完成"
+    assert policy["last_tick_at"]
+
+
+def test_browser_patrol_open_route_delegates_to_controlled_edge(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "browser-patrol-open.sqlite3"))
+
+    from app import main
+    from app.db import init_db
+
+    init_db()
+    client = TestClient(main.app)
+    opened = {}
+    monkeypatch.setattr(main, "open_message_patrol_browser", lambda start_url="": opened.setdefault("url", start_url) or "about:blank")
+
+    response = client.post(
+        "/message-patrol/open-browser",
+        data={"return_to": "/communications", "start_url": ""},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"].startswith("/communications")
+    assert opened["url"] == ""
 
 
 def test_autonomous_mode_pauses_after_followup_limit(tmp_path, monkeypatch):

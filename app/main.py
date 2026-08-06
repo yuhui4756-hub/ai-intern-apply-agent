@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import re
 from contextlib import asynccontextmanager
@@ -26,6 +27,7 @@ from .services.analyzer import (
     rule_extract_jd,
     score_job,
 )
+from .services.browser_patrol import capture_browser_patrol_observations, open_message_patrol_browser
 from .services.conversation import classify_conversation, prepare_conversation_text
 from .services.job_fetcher import ensure_public_http_url, fetch_job_from_url, normalize_visible_text
 from .services.job_searcher import (
@@ -65,6 +67,7 @@ LAST_MANUAL_SEARCH_KEY = "last_manual_search"
 COMMUNICATION_POLICY_KEY = "communication_policy"
 AUTOMATION_CONTROL_KEY = "automation_control"
 MESSAGE_PATROL_POLICY_KEY = "message_patrol_policy"
+MESSAGE_PATROL_FINGERPRINTS_KEY = "message_patrol_fingerprints"
 PATROL_SCHEDULER_POLL_SECONDS = 10
 MESSAGE_PATROL_OBSERVATION_LIMIT = 20
 COMMUNICATION_MODES = [
@@ -277,6 +280,133 @@ def insert_message_patrol_run(
     return int(cursor.lastrowid)
 
 
+def record_message_patrol_executor_skip(
+    *,
+    status: str,
+    note: str,
+    trigger_type: str,
+    scope: str = "scheduled_patrol",
+    skipped_count: int = 1,
+    error_count: int = 0,
+    decision: dict[str, Any] | None = None,
+) -> int:
+    with connect() as conn:
+        patrol_run_id = insert_message_patrol_run(
+            conn,
+            trigger_type=trigger_type,
+            scope=scope,
+            status=status,
+            skipped_count=skipped_count,
+            error_count=error_count,
+            note=note,
+        )
+        log_agent_action(
+            conn,
+            action_type="message_patrol_run",
+            status=status,
+            summary=note,
+            decision={
+                "patrol_run_id": patrol_run_id,
+                "trigger_type": trigger_type,
+                "scope": scope,
+                "browser_executor": "edge_cdp",
+                "model_called": False,
+                **(decision or {}),
+            },
+        )
+    return patrol_run_id
+
+
+def run_browser_message_patrol_executor(
+    *,
+    trigger_type: str,
+    scope: str = "scheduled_patrol",
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    try:
+        observations = capture_browser_patrol_observations(limit=MESSAGE_PATROL_OBSERVATION_LIMIT)
+    except Exception as exc:
+        message = str(exc).strip() or exc.__class__.__name__
+        disconnected = "没有检测到" in message or "无法连接" in message or "9222" in message
+        status = "浏览器未连接" if disconnected else "巡检失败"
+        patrol_run_id = record_message_patrol_executor_skip(
+            status=status,
+            note=message[:500],
+            trigger_type=trigger_type,
+            scope=scope,
+            skipped_count=1 if disconnected else 0,
+            error_count=0 if disconnected else 1,
+            decision={"dry_run": dry_run},
+        )
+        return {
+            "status": status,
+            "note": message,
+            "patrol_run_id": patrol_run_id,
+            "checked_count": 0,
+            "new_count": 0,
+            "skipped_count": 1 if disconnected else 0,
+            "error_count": 0 if disconnected else 1,
+            "skipped": True,
+        }
+
+    if not observations:
+        note = "已连接 Edge，但没有发现已打开的招聘平台聊天页。"
+        patrol_run_id = record_message_patrol_executor_skip(
+            status="未发现聊天页",
+            note=note,
+            trigger_type=trigger_type,
+            scope=scope,
+            skipped_count=1,
+            decision={"dry_run": dry_run},
+        )
+        return {
+            "status": "未发现聊天页",
+            "note": note,
+            "patrol_run_id": patrol_run_id,
+            "checked_count": 0,
+            "new_count": 0,
+            "skipped_count": 1,
+            "error_count": 0,
+            "skipped": True,
+        }
+
+    results = [
+        process_message_patrol_observation(
+            observation,
+            index=index,
+            dry_run=dry_run,
+            executor="edge_cdp",
+            trigger_type=trigger_type,
+            scope=scope,
+        )
+        for index, observation in enumerate(observations)
+    ]
+    counts = summarize_observation_results(results)
+    if counts["error_count"]:
+        status = "部分失败" if counts["checked_count"] else "巡检失败"
+    elif counts["new_count"]:
+        status = "观察完成" if dry_run else "已处理"
+    elif counts["skipped_count"]:
+        statuses = {str(item.get("status") or "") for item in results}
+        status = "无新内容" if statuses == {"无新内容"} else "已跳过"
+    else:
+        status = "已完成"
+    note = "Edge 巡检完成：检查 {checked_count} 条，新内容 {new_count} 条，跳过 {skipped_count} 条，错误 {error_count} 条。".format(**counts)
+    patrol_ids = [int(item["patrol_run_id"]) for item in results if item.get("patrol_run_id")]
+    return {
+        "status": status,
+        "note": note,
+        "patrol_run_id": patrol_ids[-1] if patrol_ids else None,
+        "patrol_run_ids": patrol_ids,
+        "checked_count": counts["checked_count"],
+        "new_count": counts["new_count"],
+        "skipped_count": counts["skipped_count"],
+        "error_count": counts["error_count"],
+        "skipped": counts["new_count"] == 0,
+        "results": results,
+    }
+
+
 def run_message_patrol_tick(trigger_type: str = "manual", force: bool = False) -> dict[str, Any] | None:
     policy = message_patrol_policy()
     now_dt = datetime.now(timezone.utc)
@@ -341,10 +471,21 @@ def run_message_patrol_tick(trigger_type: str = "manual", force: bool = False) -
         checked_count = 0
         skipped_count = 1
     else:
-        status = "待接入"
-        note = "调度 tick 已到达；浏览器巡检执行器尚未接入，未读取页面。"
-        checked_count = 0
-        skipped_count = 0
+        executor_trigger = "scheduled_executor" if trigger_type == "scheduler" else "manual_browser"
+        result = run_browser_message_patrol_executor(trigger_type=executor_trigger, dry_run=True)
+        next_tick_at = ""
+        if policy["enabled"]:
+            next_tick_at = (now_dt + timedelta(seconds=int(policy["interval_seconds"]))).isoformat(timespec="seconds")
+        policy.update(
+            {
+                "last_tick_at": now,
+                "next_tick_at": next_tick_at,
+                "last_status": result["status"],
+                "updated_at": now,
+            }
+        )
+        save_message_patrol_policy(policy)
+        return result
 
     with connect() as conn:
         patrol_run_id = insert_message_patrol_run(
@@ -981,6 +1122,46 @@ def payload_flag(value: Any, default: bool = False) -> bool:
     return default
 
 
+def conversation_text_fingerprint(value: str) -> str:
+    return hashlib.sha256((value or "").encode("utf-8")).hexdigest()
+
+
+def conversation_fingerprint_key(
+    *,
+    job_id: int | None,
+    source_url: str,
+    platform: str,
+    page_title: str,
+) -> str:
+    if job_id:
+        return f"job:{job_id}"
+    return "page:{}|{}|{}".format(platform.strip().lower(), source_url.strip(), page_title.strip().lower())
+
+
+def load_message_patrol_fingerprints() -> dict[str, Any]:
+    saved = get_setting(MESSAGE_PATROL_FINGERPRINTS_KEY, {}) or {}
+    return saved if isinstance(saved, dict) else {}
+
+
+def save_message_patrol_fingerprint(key: str, fingerprint: str) -> None:
+    fingerprints = load_message_patrol_fingerprints()
+    fingerprints[key] = {"fingerprint": fingerprint, "updated_at": utc_now()}
+    if len(fingerprints) > 500:
+        ordered = sorted(
+            fingerprints.items(),
+            key=lambda item: str(item[1].get("updated_at") if isinstance(item[1], dict) else ""),
+        )
+        fingerprints = dict(ordered[-500:])
+    set_setting(MESSAGE_PATROL_FINGERPRINTS_KEY, fingerprints)
+
+
+def has_message_patrol_fingerprint(key: str, fingerprint: str) -> bool:
+    item = load_message_patrol_fingerprints().get(key)
+    if isinstance(item, dict):
+        return item.get("fingerprint") == fingerprint
+    return item == fingerprint
+
+
 def extension_page_text(payload: dict[str, Any]) -> str:
     title = payload_text(payload, "title", 300)
     url = payload_text(payload, "url", 1000)
@@ -998,7 +1179,7 @@ def extension_platform(url: str, fallback: str = "") -> str:
 
 def extension_patrol_trigger(payload: dict[str, Any]) -> str:
     value = payload_text(payload, "patrol_trigger", 40) or payload_text(payload, "trigger_type", 40)
-    if value in {"manual_extension", "manual", "scheduled", "executor", "scheduled_executor"}:
+    if value in {"manual_extension", "manual", "scheduled", "executor", "manual_browser", "scheduled_executor"}:
         return value
     return "manual_extension"
 
@@ -1492,7 +1673,7 @@ def normalize_message_patrol_observation_request(payload: Any) -> tuple[dict[str
         return None, "至少需要提供 1 条 observation。"
 
     trigger_type = payload_text(payload, "trigger_type", 40) or payload_text(payload, "patrol_trigger", 40) or "executor"
-    if trigger_type not in {"manual_extension", "manual", "scheduled", "executor", "scheduled_executor"}:
+    if trigger_type not in {"manual_extension", "manual", "scheduled", "executor", "manual_browser", "scheduled_executor"}:
         trigger_type = "executor"
 
     return (
@@ -1702,18 +1883,22 @@ def process_message_patrol_observation(
                 page_title=title,
                 conversation_text=conversation_text,
             )
-        if duplicate:
+        fingerprint_key = conversation_fingerprint_key(job_id=job_id, source_url=url, platform=platform, page_title=title)
+        fingerprint = conversation_text_fingerprint(conversation_text)
+        duplicate_fingerprint = has_message_patrol_fingerprint(fingerprint_key, fingerprint)
+        if duplicate or duplicate_fingerprint:
             status = "无新内容"
-            note = "清洗后的对话内容与上一条采集一致；dry-run 未调用模型。"
+            note = "清洗后的对话内容与上一条记录一致；dry-run 未保存聊天全文、未调用模型。"
             new_count = 0
             skipped_count = 1
-            capture_id = int(duplicate["id"])
+            capture_id = int(duplicate["id"]) if duplicate else None
         else:
             status = "观察完成"
             note = "发现可能的新对话内容；dry-run 未保存聊天全文、未调用模型。"
             new_count = 1
             skipped_count = 0
             capture_id = None
+        save_message_patrol_fingerprint(fingerprint_key, fingerprint)
         patrol_run_id = write_observation_patrol_run(
             status=status,
             note=note,
@@ -1731,6 +1916,8 @@ def process_message_patrol_observation(
                 "dry_run": True,
                 "matched_capture_id": capture_id,
                 "matched_by": "job_id" if job_id else "source_url",
+                "duplicate_fingerprint": duplicate_fingerprint,
+                "fingerprint_key": fingerprint_key,
                 "text_length": len(conversation_text),
                 "ignored_line_count": len(prepared_text["ignored_lines"]),
             },
@@ -3180,6 +3367,54 @@ async def trigger_message_patrol_tick(request: Request) -> RedirectResponse:
     if not return_to.startswith("/") or return_to.startswith("//"):
         return_to = "/communications"
     return redirect_with_notice(return_to, message, notice_type)
+
+
+@app.post("/message-patrol/open-browser")
+async def open_message_patrol_browser_route(request: Request) -> RedirectResponse:
+    form = await request.form()
+    return_to = str(form.get("return_to") or "/communications")
+    if not return_to.startswith("/") or return_to.startswith("//"):
+        return_to = "/communications"
+    try:
+        target_url = open_message_patrol_browser(str(form.get("start_url") or ""))
+    except Exception as exc:
+        return redirect_with_notice(return_to, f"打开 Edge 巡检窗口失败：{str(exc)[:180]}", "error")
+    if target_url == "about:blank":
+        return redirect_with_notice(return_to, "已打开 Edge 巡检窗口，请在该窗口登录招聘平台并打开 HR 对话页。", "success")
+    return redirect_with_notice(return_to, f"已打开 Edge 巡检窗口：{target_url}", "success")
+
+
+@app.post("/message-patrol/browser-dry-run")
+async def trigger_message_patrol_browser_dry_run(request: Request) -> RedirectResponse:
+    form = await request.form()
+    return_to = str(form.get("return_to") or "/communications")
+    if not return_to.startswith("/") or return_to.startswith("//"):
+        return_to = "/communications"
+
+    policy = communication_policy()
+    if policy["mode"] == "off":
+        return redirect_with_notice(return_to, "沟通模式为关闭，未读取浏览器页面。", "info")
+    control = automation_control()
+    if control["paused"]:
+        patrol_run_id = record_message_patrol_executor_skip(
+            status="已暂停",
+            note="自动化已暂停，本次手动浏览器巡检未读取页面。",
+            trigger_type="manual_browser",
+            scope="manual_browser_patrol",
+            skipped_count=1,
+            decision={"pause_reason": control["pause_reason"], "updated_at": control["updated_at"], "dry_run": True},
+        )
+        return redirect_with_notice(return_to, f"浏览器 dry-run 巡检：已暂停。记录 #{patrol_run_id}", "info")
+
+    result = run_browser_message_patrol_executor(
+        trigger_type="manual_browser",
+        scope="manual_browser_patrol",
+        dry_run=True,
+    )
+    notice_type = "success" if result["status"] in {"观察完成", "无新内容", "已跳过", "未发现聊天页"} else "info"
+    if result.get("error_count"):
+        notice_type = "error"
+    return redirect_with_notice(return_to, f"浏览器 dry-run 巡检：{result['status']}。{result['note']}", notice_type)
 
 
 @app.post("/settings/blacklists")

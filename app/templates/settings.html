@@ -69,7 +69,7 @@
   <div class="panel-title">
     <div>
       <strong>定时巡检：{{ message_patrol_policy.status_label }}</strong>
-      <p class="muted">当前只启用调度壳：到点写入巡检记录，不读取浏览器页面，不调用模型。</p>
+      <p class="muted">开启后，到点会尝试读取受控 Edge 已打开的招聘平台聊天页可见文本，并以 dry-run 做本地差分；无新内容不调用模型。</p>
       {% if message_patrol_policy.last_tick_at %}
       <p class="muted">上次 tick：{{ message_patrol_policy.last_tick_at }} / {{ message_patrol_policy.last_status or "-" }}</p>
       {% endif %}
@@ -80,14 +80,24 @@
     <form method="post" action="/message-patrol/tick" class="form-actions">
       <input type="hidden" name="return_to" value="/settings">
       <button class="button" type="submit">手动 tick</button>
+      <button class="button primary" type="submit" formaction="/message-patrol/browser-dry-run">巡检当前 Edge 聊天页</button>
     </form>
   </div>
+  <form method="post" action="/message-patrol/open-browser" class="form-grid">
+    <input type="hidden" name="return_to" value="/settings">
+    <label>Edge 巡检窗口起始链接（可选）
+      <input name="start_url" placeholder="可粘贴招聘平台聊天页；留空打开空白巡检窗口">
+    </label>
+    <div class="form-actions">
+      <button class="button" type="submit">打开 Edge 巡检窗口</button>
+    </div>
+  </form>
   <form method="post" action="/settings/message-patrol" class="form-grid">
     <input type="hidden" name="return_to" value="/settings">
     <label class="check"><input name="enabled" type="checkbox" {% if message_patrol_policy.enabled %}checked{% endif %}> 开启定时巡检调度</label>
     <label>巡检间隔（秒）
       <input name="interval_seconds" type="number" min="30" max="3600" step="30" value="{{ message_patrol_policy.interval_seconds }}">
-      <span class="muted">只控制调度 tick，暂不读取页面。</span>
+      <span class="muted">只做 dry-run 观察和差分，不自动发送。</span>
     </label>
     <label>手动 tick cooldown（秒）
       <input name="cooldown_seconds" type="number" min="0" max="3600" step="10" value="{{ message_patrol_policy.cooldown_seconds }}">
