@@ -3359,7 +3359,7 @@ async def update_message_patrol_policy(request: Request) -> RedirectResponse:
 @app.post("/message-patrol/tick")
 async def trigger_message_patrol_tick(request: Request) -> RedirectResponse:
     form = await request.form()
-    result = run_message_patrol_tick("manual", force=False)
+    result = await run_in_threadpool(run_message_patrol_tick, "manual", force=False)
     if result is None:
         message = "定时巡检未到下次执行时间。"
         notice_type = "info"
@@ -3380,7 +3380,7 @@ async def open_message_patrol_browser_route(request: Request) -> RedirectRespons
     if not return_to.startswith("/") or return_to.startswith("//"):
         return_to = "/communications"
     try:
-        target_url = open_message_patrol_browser(str(form.get("start_url") or ""))
+        target_url = await run_in_threadpool(open_message_patrol_browser, str(form.get("start_url") or ""))
     except Exception as exc:
         return redirect_with_notice(return_to, f"打开 Edge 巡检窗口失败：{str(exc)[:180]}", "error")
     if target_url == "about:blank":
@@ -3399,7 +3399,8 @@ async def trigger_message_patrol_browser_dry_run(request: Request) -> RedirectRe
     if policy["mode"] == "off":
         return redirect_with_notice(return_to, "沟通模式为关闭，未读取浏览器页面。", "info")
 
-    result = run_browser_message_patrol_executor(
+    result = await run_in_threadpool(
+        run_browser_message_patrol_executor,
         trigger_type="manual_browser",
         scope="manual_browser_patrol",
         dry_run=True,

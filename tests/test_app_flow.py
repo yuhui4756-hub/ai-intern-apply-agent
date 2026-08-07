@@ -7,6 +7,14 @@ from app.services.job_fetcher import FetchResult
 from app.services.job_searcher import SearchCandidate, SearchResult
 
 
+def assert_no_running_asyncio_loop(message: str) -> None:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    raise AssertionError(message)
+
+
 def test_job_form_and_reanalysis_flow(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "app.sqlite3"))
 
@@ -1233,17 +1241,22 @@ def test_browser_patrol_dry_run_route_uses_open_edge_observations_without_captur
         },
     )
     assert job_response.status_code == 200
-    monkeypatch.setattr(
-        main,
-        "capture_browser_patrol_observations",
-        lambda **_kwargs: [
+
+    def capture_patrol_without_async_loop(**_kwargs):
+        assert_no_running_asyncio_loop("browser dry-run should run outside the FastAPI event loop")
+        return [
             {
                 "url": "https://www.zhipin.com/job_detail/browser-patrol.html",
                 "title": "深圳浏览器巡检智能科技有限公司 HR 对话",
                 "platform": "Boss 直聘",
                 "text": "HR：您好，这里是深圳浏览器巡检智能科技有限公司，请问你想了解工作内容还是实习周期？\n我：想了解 AI 应用开发岗位。",
             }
-        ],
+        ]
+
+    monkeypatch.setattr(
+        main,
+        "capture_browser_patrol_observations",
+        capture_patrol_without_async_loop,
     )
     monkeypatch.setattr(
         main,
@@ -1318,17 +1331,22 @@ def test_message_patrol_tick_uses_browser_executor_when_enabled(tmp_path, monkey
         },
     )
     assert job_response.status_code == 200
-    monkeypatch.setattr(
-        main,
-        "capture_browser_patrol_observations",
-        lambda **_kwargs: [
+
+    def capture_tick_without_async_loop(**_kwargs):
+        assert_no_running_asyncio_loop("message patrol tick should run outside the FastAPI event loop")
+        return [
             {
                 "url": "https://www.zhipin.com/job_detail/browser-scheduled.html",
                 "title": "深圳定时巡检智能科技有限公司 HR 对话",
                 "platform": "Boss 直聘",
                 "text": "HR：您好，这里是深圳定时巡检智能科技有限公司，请问你想了解工作内容还是实习周期？\n我：想了解 AI 应用开发岗位。",
             }
-        ],
+        ]
+
+    monkeypatch.setattr(
+        main,
+        "capture_browser_patrol_observations",
+        capture_tick_without_async_loop,
     )
     monkeypatch.setattr(
         main,
