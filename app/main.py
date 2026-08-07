@@ -68,6 +68,7 @@ COMMUNICATION_POLICY_KEY = "communication_policy"
 AUTOMATION_CONTROL_KEY = "automation_control"
 MESSAGE_PATROL_POLICY_KEY = "message_patrol_policy"
 MESSAGE_PATROL_FINGERPRINTS_KEY = "message_patrol_fingerprints"
+IGNORED_MESSAGE_FINGERPRINTS_KEY = "ignored_message_fingerprints"
 PATROL_SCHEDULER_POLL_SECONDS = 10
 MESSAGE_PATROL_OBSERVATION_LIMIT = 20
 COMMUNICATION_MODES = [
@@ -112,6 +113,7 @@ def action_type_label(value: str) -> str:
         "message_patrol_run": "消息巡检",
         "message_patrol_observation": "巡检观察",
         "message_patrol_policy_update": "巡检设置",
+        "message_patrol_ignore": "忽略消息",
     }.get(value or "", value or "-")
 
 
@@ -247,6 +249,8 @@ def insert_message_patrol_run(
     note: str = "",
     source_url: str = "",
     page_title: str = "",
+    fingerprint_key: str = "",
+    fingerprint: str = "",
     job_id: int | None = None,
     capture_id: int | None = None,
 ) -> int:
@@ -256,8 +260,8 @@ def insert_message_patrol_run(
         INSERT INTO message_patrol_runs (
             job_id, capture_id, platform, source_url, page_title, trigger_type,
             scope, status, checked_count, new_count, skipped_count, error_count,
-            note, created_at, finished_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            note, fingerprint_key, fingerprint, created_at, finished_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             job_id,
@@ -273,6 +277,8 @@ def insert_message_patrol_run(
             skipped_count,
             error_count,
             note[:500],
+            fingerprint_key,
+            fingerprint,
             now,
             now,
         ),
@@ -1180,6 +1186,55 @@ def has_message_patrol_fingerprint(key: str, fingerprint: str) -> bool:
     return item == fingerprint
 
 
+def load_ignored_message_fingerprints() -> dict[str, Any]:
+    saved = get_setting(IGNORED_MESSAGE_FINGERPRINTS_KEY, {}) or {}
+    return saved if isinstance(saved, dict) else {}
+
+
+def ignored_fingerprint_items(item: Any) -> list[dict[str, Any]]:
+    if isinstance(item, list):
+        return [entry for entry in item if isinstance(entry, dict)]
+    if isinstance(item, dict):
+        return [item]
+    if isinstance(item, str):
+        return [{"fingerprint": item, "reason": "", "updated_at": ""}]
+    return []
+
+
+def save_ignored_message_fingerprint(key: str, fingerprint: str, reason: str = "") -> None:
+    ignored = load_ignored_message_fingerprints()
+    entries = [
+        entry
+        for entry in ignored_fingerprint_items(ignored.get(key))
+        if str(entry.get("fingerprint") or "") != fingerprint
+    ]
+    entries.append({
+        "fingerprint": fingerprint,
+        "reason": reason[:200],
+        "updated_at": utc_now(),
+    })
+    ignored[key] = entries[-20:]
+    if len(ignored) > 500:
+        ordered = sorted(
+            ignored.items(),
+            key=lambda item: str(
+                max(
+                    (str(entry.get("updated_at") or "") for entry in ignored_fingerprint_items(item[1])),
+                    default="",
+                )
+            ),
+        )
+        ignored = dict(ordered[-500:])
+    set_setting(IGNORED_MESSAGE_FINGERPRINTS_KEY, ignored)
+
+
+def ignored_message_fingerprint(key: str, fingerprint: str) -> dict[str, Any] | None:
+    for item in ignored_fingerprint_items(load_ignored_message_fingerprints().get(key)):
+        if item.get("fingerprint") == fingerprint:
+            return item
+    return None
+
+
 def should_skip_observation_for_pause(*, dry_run: bool, trigger_type: str) -> bool:
     return not (dry_run and trigger_type == "manual_browser")
 
@@ -1378,6 +1433,7 @@ def try_llm_conversation_decision(text: str, job: dict[str, Any] | None, fallbac
         "你是求职 Agent 的 HR 对话分类器。只输出 JSON。"
         "字段：message_type, summary, action_required(boolean), reason, draft_message, risk_flags(array)。"
         "如果涉及面试/笔试/约时间，message_type=面试邀请，不要替候选人约时间。"
+        "如果疑似 HR 群发、系统推荐、低相关岗位或无需回复，message_type=无需回复 且 draft_message 为空。"
         "如果涉及简历、联系方式、身份证、银行卡、押金、培训费、贷款、薪资谈判或无关内容，action_required=true 且 draft_message 为空。"
         "普通岗位相关问题可生成礼貌、学生真诚、不夸大的中文草稿。"
     )
@@ -1393,7 +1449,7 @@ def try_llm_conversation_decision(text: str, job: dict[str, Any] | None, fallbac
         return fallback
 
     merged = dict(fallback)
-    allowed_types = {"岗位沟通", "面试邀请", "需要我处理", "无关内容"}
+    allowed_types = {"岗位沟通", "面试邀请", "需要我处理", "无关内容", "无需回复"}
     result_type = str(result.get("message_type") or "").strip()
     if result_type and result_type not in allowed_types:
         return fallback
@@ -1409,6 +1465,69 @@ def try_llm_conversation_decision(text: str, job: dict[str, Any] | None, fallbac
     return merged
 
 
+def enforce_reply_gate(decision: dict[str, Any], job: dict[str, Any] | None, job_id: int | None) -> dict[str, Any]:
+    message_type = str(decision.get("message_type") or "")
+    if message_type == "面试邀请":
+        return decision
+
+    updated = dict(decision)
+    reasons = [str(item).strip() for item in list(updated.get("reply_gate_reasons") or []) if str(item).strip()]
+    flags = [str(item).strip() for item in list(updated.get("risk_flags") or []) if str(item).strip()]
+    gate = str(updated.get("reply_gate") or "allow")
+    job_recommendation = str((job or {}).get("recommendation") or "")
+    job_match_level = str((job or {}).get("match_level") or "")
+
+    if job and (job_recommendation == "跳过" or job_match_level == "低匹配"):
+        gate = "skip"
+        reasons.append("岗位此前被评为低匹配或建议跳过")
+        flags.append("低匹配岗位默认不进入自动回复")
+
+    if gate == "skip":
+        updated.update(
+            {
+                "message_type": "无需回复",
+                "action_required": False,
+                "draft_message": "",
+                "draft_type": "初筛跳过",
+                "reason": "；".join(reasons) or "回复闸门判断无需回复。",
+                "risk_flags": dedupe_texts(flags),
+            }
+        )
+    elif gate == "manual" and message_type == "岗位沟通" and not job_id:
+        flags.append("未匹配到岗位，禁止自动生成回复")
+        updated.update(
+            {
+                "message_type": "需要我处理",
+                "action_required": True,
+                "draft_message": "",
+                "draft_type": "初筛待确认",
+                "reason": "；".join(reasons) or "未匹配到岗位，需人工确认是否值得回复。",
+                "risk_flags": dedupe_texts(flags),
+            }
+        )
+    else:
+        updated["risk_flags"] = dedupe_texts(flags)
+    updated["reply_gate"] = gate
+    updated["reply_gate_reasons"] = dedupe_texts(reasons)
+    return updated
+
+
+def classify_conversation_for_patrol_preview(text: str, job: dict[str, Any] | None) -> dict[str, Any]:
+    from .services.conversation import classify_conversation as rule_classify_conversation
+
+    return rule_classify_conversation(text, job)
+
+
+def dedupe_texts(values: list[str]) -> list[str]:
+    seen = set()
+    result: list[str] = []
+    for value in values:
+        if value and value not in seen:
+            seen.add(value)
+            result.append(value)
+    return result
+
+
 def apply_communication_policy(
     conn: Any,
     decision: dict[str, Any],
@@ -1416,6 +1535,27 @@ def apply_communication_policy(
     job_id: int | None,
 ) -> dict[str, Any]:
     mode = str(policy.get("mode") or "draft")
+    if (
+        mode == "autonomous"
+        and not job_id
+        and decision.get("message_type") == "需要我处理"
+        and decision.get("draft_type") == "初筛待确认"
+    ):
+        updated = dict(decision)
+        reason = str(updated.get("reason") or "").strip()
+        flags = list(updated.get("risk_flags") or [])
+        flags.append("未匹配到岗位，暂停自主询问并等待用户确认")
+        updated.update(
+            {
+                "communication_mode": mode,
+                "followup_limit": int(policy.get("max_auto_followups") or 0),
+                "followup_index": 0,
+                "draft_type": "自主询问暂停",
+                "risk_flags": dedupe_texts(flags),
+                "reason": "；".join(item for item in [reason, "未匹配到岗位，无法可靠记录自主询问轮次。"] if item),
+            }
+        )
+        return updated
     if decision.get("message_type") != "岗位沟通" or not str(decision.get("draft_message") or "").strip():
         return decision
 
@@ -1564,6 +1704,51 @@ def create_conversation_from_extension(payload: dict[str, Any]) -> dict[str, Any
             text_scope=str(payload.get("text_scope") or ""),
         )
         job_id = int(job["id"]) if job else None
+        fingerprint_key = conversation_fingerprint_key(job_id=job_id, source_url=url, platform=platform, page_title=title)
+        fingerprint = conversation_text_fingerprint(conversation_text)
+        ignored = ignored_message_fingerprint(fingerprint_key, fingerprint)
+        if ignored:
+            patrol_run_id = insert_message_patrol_run(
+                conn,
+                trigger_type=patrol_trigger,
+                platform=platform,
+                scope=patrol_scope,
+                status="已忽略",
+                checked_count=1,
+                skipped_count=1,
+                note="这条对话已被手动忽略，未保存聊天全文、未调用模型。",
+                source_url=url,
+                page_title=title,
+                fingerprint_key=fingerprint_key,
+                fingerprint=fingerprint,
+                job_id=job_id,
+            )
+            log_agent_action(
+                conn,
+                action_type="message_patrol_observation",
+                status="已忽略",
+                summary="这条对话已被手动忽略，跳过采集和草稿生成。",
+                platform=platform,
+                job_id=job_id,
+                decision={
+                    "patrol_run_id": patrol_run_id,
+                    "fingerprint_key": fingerprint_key,
+                    "ignored": True,
+                    "ignore_reason": str(ignored.get("reason") or ""),
+                    "model_called": False,
+                    "text_saved": False,
+                },
+            )
+            return {
+                "ok": True,
+                "capture_type": "conversation",
+                "skipped": True,
+                "message_type": "已忽略",
+                "reason": "这条对话已被手动忽略。",
+                "patrol_run_id": patrol_run_id,
+                "redirect_url": "/communications",
+            }
+
         duplicate = find_duplicate_conversation_capture(
             conn,
             job_id=job_id,
@@ -1584,6 +1769,8 @@ def create_conversation_from_extension(payload: dict[str, Any]) -> dict[str, Any
                 note="清洗后的对话内容与上一条采集一致，未调用模型。",
                 source_url=url,
                 page_title=title,
+                fingerprint_key=fingerprint_key,
+                fingerprint=fingerprint,
                 job_id=job_id,
                 capture_id=int(duplicate["id"]),
             )
@@ -1615,6 +1802,7 @@ def create_conversation_from_extension(payload: dict[str, Any]) -> dict[str, Any
 
         decision = classify_conversation(conversation_text, job)
         decision = try_llm_conversation_decision(conversation_text, job, decision)
+        decision = enforce_reply_gate(decision, job, job_id)
         now = utc_now()
         decision = apply_communication_policy(conn, decision, policy, job_id)
         cursor = conn.execute(
@@ -1678,23 +1866,36 @@ def create_conversation_from_extension(payload: dict[str, Any]) -> dict[str, Any
             )
         if decision.get("message_type") == "面试邀请":
             action_status = "面试邀请"
+        elif decision.get("message_type") == "无需回复":
+            action_status = "无需回复"
         elif draft_id and draft_status == "待确认":
             action_status = str(decision.get("draft_type") or "草稿待确认")
         elif draft_id and draft_status == "需要我处理":
             action_status = "需要我处理"
         else:
             action_status = "已采集"
+        patrol_status = "无需回复" if decision.get("message_type") == "无需回复" else "已处理"
+        patrol_new_count = 0 if decision.get("message_type") == "无需回复" else 1
+        patrol_skipped_count = 1 if decision.get("message_type") == "无需回复" else 0
+        patrol_note = (
+            "回复闸门判断无需回复，已保存采集依据但未生成草稿。"
+            if decision.get("message_type") == "无需回复"
+            else "发现新对话内容，已进入分类和草稿流程。"
+        )
         patrol_run_id = insert_message_patrol_run(
             conn,
             trigger_type=patrol_trigger,
             platform=platform,
             scope=patrol_scope,
-            status="已处理",
+            status=patrol_status,
             checked_count=1,
-            new_count=1,
-            note="发现新对话内容，已进入分类和草稿流程。",
+            new_count=patrol_new_count,
+            skipped_count=patrol_skipped_count,
+            note=patrol_note,
             source_url=url,
             page_title=title,
+            fingerprint_key=fingerprint_key,
+            fingerprint=fingerprint,
             job_id=job_id,
             capture_id=capture_id,
         )
@@ -1717,10 +1918,12 @@ def create_conversation_from_extension(payload: dict[str, Any]) -> dict[str, Any
                 "followup_limit": int(decision.get("followup_limit") or 0),
                 "action_required": bool(decision.get("action_required")),
                 "risk_flags": risk_flags,
+                "reply_gate": decision.get("reply_gate"),
+                "reply_gate_reasons": decision.get("reply_gate_reasons"),
             },
         )
 
-    return {
+    response_payload = {
         "ok": True,
         "capture_type": "conversation",
         "capture_id": capture_id,
@@ -1731,6 +1934,9 @@ def create_conversation_from_extension(payload: dict[str, Any]) -> dict[str, Any
         "patrol_run_id": patrol_run_id,
         "redirect_url": "/communications",
     }
+    if decision.get("message_type") == "无需回复":
+        response_payload["skipped"] = True
+    return response_payload
 
 
 def normalize_message_patrol_observation_request(payload: Any) -> tuple[dict[str, Any] | None, str]:
@@ -1806,6 +2012,8 @@ def write_observation_patrol_run(
     page_title: str,
     job_id: int | None = None,
     capture_id: int | None = None,
+    fingerprint_key: str = "",
+    fingerprint: str = "",
     checked_count: int = 1,
     new_count: int = 0,
     skipped_count: int = 0,
@@ -1826,6 +2034,8 @@ def write_observation_patrol_run(
             note=note,
             source_url=source_url,
             page_title=page_title,
+            fingerprint_key=fingerprint_key,
+            fingerprint=fingerprint,
             job_id=job_id,
             capture_id=capture_id,
         )
@@ -1979,7 +2189,45 @@ def process_message_patrol_observation(
             )
         fingerprint_key = conversation_fingerprint_key(job_id=job_id, source_url=url, platform=platform, page_title=title)
         fingerprint = conversation_text_fingerprint(conversation_text)
+        ignored = ignored_message_fingerprint(fingerprint_key, fingerprint)
+        if ignored:
+            note = "这条对话已被手动忽略；dry-run 未保存聊天全文、未调用模型。"
+            patrol_run_id = write_observation_patrol_run(
+                status="已忽略",
+                note=note,
+                trigger_type=trigger_type,
+                scope=scope,
+                platform=platform,
+                source_url=url,
+                page_title=title,
+                job_id=job_id,
+                fingerprint_key=fingerprint_key,
+                fingerprint=fingerprint,
+                skipped_count=1,
+                decision={
+                    "executor": executor,
+                    "dry_run": True,
+                    "ignored": True,
+                    "ignore_reason": str(ignored.get("reason") or ""),
+                    "fingerprint_key": fingerprint_key,
+                    "text_length": len(conversation_text),
+                    "ignored_line_count": len(prepared_text["ignored_lines"]),
+                    "text_scope": text_scope,
+                },
+            )
+            return {
+                **base_result,
+                "ok": True,
+                "skipped": True,
+                "status": "已忽略",
+                "reason": note,
+                "job_id": job_id,
+                "patrol_run_id": patrol_run_id,
+                "text_length": len(conversation_text),
+                "skipped_count": 1,
+            }
         duplicate_fingerprint = has_message_patrol_fingerprint(fingerprint_key, fingerprint)
+        preview_decision: dict[str, Any] = {}
         if duplicate or duplicate_fingerprint:
             status = "无新内容"
             note = "清洗后的对话内容与上一条记录一致；dry-run 未保存聊天全文、未调用模型。"
@@ -1987,11 +2235,19 @@ def process_message_patrol_observation(
             skipped_count = 1
             capture_id = int(duplicate["id"]) if duplicate else None
         else:
-            status = "观察完成"
-            note = "发现可能的新对话内容；dry-run 未保存聊天全文、未调用模型。"
-            new_count = 1
-            skipped_count = 0
-            capture_id = None
+            preview_decision = enforce_reply_gate(classify_conversation_for_patrol_preview(conversation_text, job), job, job_id)
+            if preview_decision.get("message_type") == "无需回复":
+                status = "无需回复"
+                note = "回复闸门判断无需回复；dry-run 未保存聊天全文、未调用模型。"
+                new_count = 0
+                skipped_count = 1
+                capture_id = None
+            else:
+                status = "观察完成"
+                note = "发现可能的新对话内容；dry-run 未保存聊天全文、未调用模型。"
+                new_count = 1
+                skipped_count = 0
+                capture_id = None
         save_message_patrol_fingerprint(fingerprint_key, fingerprint)
         patrol_run_id = write_observation_patrol_run(
             status=status,
@@ -2003,6 +2259,8 @@ def process_message_patrol_observation(
             page_title=title,
             job_id=job_id,
             capture_id=capture_id,
+            fingerprint_key=fingerprint_key,
+            fingerprint=fingerprint,
             new_count=new_count,
             skipped_count=skipped_count,
             decision={
@@ -2015,6 +2273,8 @@ def process_message_patrol_observation(
                 "text_length": len(conversation_text),
                 "ignored_line_count": len(prepared_text["ignored_lines"]),
                 "text_scope": text_scope,
+                "reply_gate": preview_decision.get("reply_gate", ""),
+                "reply_gate_reasons": preview_decision.get("reply_gate_reasons", []),
             },
         )
         return {
@@ -2454,7 +2714,7 @@ def communications_page(request: Request) -> Any:
             "draft_counts": {row["status"]: row["count"] for row in draft_counts},
             "draft_type_counts": {row["draft_type"]: row["count"] for row in draft_type_counts},
             "feedback_counts": {row["status"]: row["count"] for row in feedback_counts},
-            "message_types": ["岗位沟通", "面试邀请", "需要我处理", "无关内容"],
+            "message_types": ["岗位沟通", "面试邀请", "需要我处理", "无关内容", "无需回复"],
             "communication_policy": communication_policy(),
             "automation_control": automation_control(),
             "message_patrol_policy": message_patrol_policy(),
@@ -2521,7 +2781,7 @@ async def update_conversation_feedback(capture_id: int, request: Request) -> Red
     expected_message_type = str(form.get("expected_message_type") or "").strip()
     feedback_note = str(form.get("feedback_note") or "").strip()[:1000]
     allowed_statuses = {"", "正确", "误判", "待观察"}
-    allowed_types = {"", "岗位沟通", "面试邀请", "需要我处理", "无关内容"}
+    allowed_types = {"", "岗位沟通", "面试邀请", "需要我处理", "无关内容", "无需回复"}
     if feedback_status not in allowed_statuses:
         return redirect_with_notice("/communications", "反馈状态无效。", "error")
     if expected_message_type not in allowed_types:
@@ -2566,6 +2826,56 @@ async def update_conversation_feedback(capture_id: int, request: Request) -> Red
                 },
             )
     return redirect_with_notice("/communications", "对话采集反馈已保存。", "success")
+
+
+@app.post("/message-patrol/runs/{run_id}/ignore")
+async def ignore_message_patrol_run(run_id: int, request: Request) -> RedirectResponse:
+    form = await request.form()
+    return_to = str(form.get("return_to") or "/communications")
+    if not return_to.startswith("/") or return_to.startswith("//"):
+        return_to = "/communications"
+    reason = str(form.get("reason") or "用户从巡检记录手动忽略相同消息。").strip()[:200]
+
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM message_patrol_runs WHERE id = ?", (run_id,)).fetchone()
+        run = {key: row[key] for key in row.keys()} if row else None
+    if not run:
+        return redirect_with_notice(return_to, "没有找到这条巡检记录。", "error")
+
+    fingerprint_key = str(run.get("fingerprint_key") or "")
+    fingerprint = str(run.get("fingerprint") or "")
+    if not fingerprint_key or not fingerprint:
+        return redirect_with_notice(return_to, "这条巡检记录没有可忽略的消息指纹，请重新巡检后再试。", "error")
+
+    save_ignored_message_fingerprint(fingerprint_key, fingerprint, reason)
+    now = utc_now()
+    note = "这条消息已加入忽略列表；后续相同消息会直接标记为已忽略。"
+    with connect() as conn:
+        conn.execute(
+            """
+            UPDATE message_patrol_runs
+            SET status = ?, new_count = 0, skipped_count = CASE WHEN skipped_count = 0 THEN 1 ELSE skipped_count END,
+                note = ?, finished_at = ?
+            WHERE id = ?
+            """,
+            ("已忽略", note, now, run_id),
+        )
+        log_agent_action(
+            conn,
+            action_type="message_patrol_ignore",
+            status="已忽略",
+            summary=note,
+            platform=str(run.get("platform") or ""),
+            job_id=int(run["job_id"]) if run.get("job_id") else None,
+            capture_id=int(run["capture_id"]) if run.get("capture_id") else None,
+            decision={
+                "patrol_run_id": run_id,
+                "fingerprint_key": fingerprint_key,
+                "reason": reason,
+                "text_saved": False,
+            },
+        )
+    return redirect_with_notice(return_to, "已忽略相同消息。", "success")
 
 
 @app.get("/jobs/new")
@@ -3497,7 +3807,7 @@ async def trigger_message_patrol_browser_dry_run(request: Request) -> RedirectRe
         scope="manual_browser_patrol",
         dry_run=True,
     )
-    notice_type = "success" if result["status"] in {"观察完成", "无新内容", "已跳过", "未发现聊天页"} else "info"
+    notice_type = "success" if result["status"] in {"观察完成", "无新内容", "无需回复", "已忽略", "已跳过", "未发现聊天页"} else "info"
     if result.get("error_count"):
         notice_type = "error"
     return redirect_with_notice(return_to, f"浏览器 dry-run 巡检：{result['status']}。{result['note']}", notice_type)

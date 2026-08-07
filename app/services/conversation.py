@@ -15,6 +15,14 @@ SENSITIVE_RE = re.compile(r"(手机号|电话|微信|邮箱|身份证|银行卡|
 IRRELEVANT_RE = re.compile(r"(周末玩|游戏|恋爱|私事|无关)")
 JOB_INFO_RE = re.compile(r"(工作内容|技术栈|实习周期|到岗|每周|薪资|导师|转正|远程|base|地点|流程|要求|接受大二)")
 HIGH_RISK_RE = re.compile(r"(押金|培训费|贷款)")
+TARGET_RE = re.compile(r"(AI|人工智能|大模型|LLM|RAG|Agent|智能体|Python|FastAPI|后端|应用开发|算法|模型|知识库)", re.IGNORECASE)
+BROADCAST_RE = re.compile(
+    r"(系统自动|系统推荐|群发|批量|急招职位|向您推荐|推荐.*职位|"
+    r"期待您.{0,6}投递|期待你的投递|欢迎投递|"
+    r"有兴趣.{0,12}(投递|发简历|聊一聊|沟通)|感兴趣.{0,12}(投递|发简历|聊一聊|沟通)|"
+    r"正在招聘.{0,30}(期待|欢迎|投递|发简历)|可以直接发简历|可直接发简历)"
+)
+DIRECT_QUESTION_RE = re.compile(r"(请问|是否|能否|方便|吗[？?]?|么[？?]?|什么时间|什么时候|想了解|考虑吗|有兴趣吗)")
 UI_NOISE_LINE_RE = re.compile(
     r"^(发简历|交换手机号|交换微信号|再考虑一下|发送|去使用>?|"
     r"请输入文字.*发送|我们为您生成了.*打招呼语.*|不支持此消息查看.*查看消息内容[!！]?)$"
@@ -61,26 +69,40 @@ def classify_conversation(text: str, job: dict[str, Any] | None = None) -> dict[
     clean = compact_conversation_text(text)
     latest = latest_message_excerpt(clean)
     risk_flags: list[str] = []
+    reply_signals = conversation_reply_signals(clean, job)
 
-    if RESUME_REQUEST_RE.search(clean) or SENSITIVE_RE.search(clean):
+    sensitive_or_resume = bool(RESUME_REQUEST_RE.search(clean) or SENSITIVE_RE.search(clean))
+    high_risk = bool(HIGH_RISK_RE.search(clean))
+    if sensitive_or_resume:
         risk_flags.append("涉及简历、联系方式、面试时间、薪资谈判或敏感信息，需要用户确认")
-    if HIGH_RISK_RE.search(clean):
+    if high_risk:
         risk_flags.append("命中高风险招聘信号")
 
-    if INTERVIEW_RE.search(clean):
+    if high_risk:
+        message_type = "需要我处理"
+        action_required = True
+        reason = "对话命中押金、培训费或贷款等高风险招聘信号。"
+        draft = ""
+    elif INTERVIEW_RE.search(clean):
         message_type = "面试邀请"
         action_required = True
         reason = "识别到 HR 提到面试、笔试或约时间。"
-        draft = ""
-    elif risk_flags:
-        message_type = "需要我处理"
-        action_required = True
-        reason = "对话中包含必须转人工确认的内容。"
         draft = ""
     elif IRRELEVANT_RE.search(clean):
         message_type = "无关内容"
         action_required = True
         reason = "对话疑似偏离岗位沟通范围。"
+        draft = ""
+    elif should_skip_reply(reply_signals):
+        message_type = "无需回复"
+        action_required = False
+        reason = "；".join(reply_signals["reasons"])
+        draft = ""
+        risk_flags.extend(reply_signals["risk_flags"])
+    elif sensitive_or_resume:
+        message_type = "需要我处理"
+        action_required = True
+        reason = "对话中包含必须转人工确认的内容。"
         draft = ""
     else:
         message_type = "岗位沟通"
@@ -95,7 +117,57 @@ def classify_conversation(text: str, job: dict[str, Any] | None = None) -> dict[
         "reason": reason,
         "draft_message": draft,
         "risk_flags": risk_flags,
+        "reply_gate": reply_signals["action"],
+        "reply_gate_reasons": reply_signals["reasons"],
     }
+
+
+def conversation_reply_signals(text: str, job: dict[str, Any] | None = None) -> dict[str, Any]:
+    clean = compact_conversation_text(text)
+    job_text = " ".join(
+        str((job or {}).get(key) or "")
+        for key in ["title", "company", "jd_text", "summary", "extracted_json", "recommendation", "match_level"]
+    )
+    has_job = bool(job)
+    is_broadcast = bool(BROADCAST_RE.search(clean))
+    target_related = bool(TARGET_RE.search(clean) or TARGET_RE.search(job_text))
+    direct_question = bool(DIRECT_QUESTION_RE.search(clean))
+    sensitive_or_resume = bool(RESUME_REQUEST_RE.search(clean) or SENSITIVE_RE.search(clean))
+    reasons: list[str] = []
+    risk_flags: list[str] = []
+    action = "allow"
+
+    if is_broadcast:
+        reasons.append("疑似 HR 群发或系统推荐消息")
+        risk_flags.append("疑似群发/系统推荐，默认不进入自动回复")
+    if not has_job:
+        reasons.append("未匹配到已保存目标岗位")
+    if not target_related:
+        reasons.append("未出现 AI 应用、Agent、Python、后端等目标方向信号")
+
+    if sensitive_or_resume and not is_broadcast:
+        action = "manual"
+    elif is_broadcast and not direct_question:
+        action = "skip"
+    elif not has_job and not target_related:
+        action = "manual" if direct_question else "skip"
+    elif not has_job:
+        action = "manual"
+    elif not target_related:
+        action = "manual"
+
+    return {
+        "action": action,
+        "reasons": reasons,
+        "risk_flags": risk_flags,
+        "is_broadcast": is_broadcast,
+        "target_related": target_related,
+        "direct_question": direct_question,
+    }
+
+
+def should_skip_reply(signals: dict[str, Any]) -> bool:
+    return str(signals.get("action") or "") == "skip"
 
 
 def latest_message_excerpt(text: str, limit: int = 260) -> str:

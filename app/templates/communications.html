@@ -95,6 +95,7 @@
           <th>状态</th>
           <th>计数</th>
           <th>备注</th>
+          <th>操作</th>
         </tr>
       </thead>
       <tbody>
@@ -122,6 +123,18 @@
             {% endif %}
           </td>
           <td>{{ run.note or "-" }}</td>
+          <td>
+            {% if run.fingerprint_key and run.fingerprint and run.status != "已忽略" %}
+            <form method="post" action="/message-patrol/runs/{{ run.id }}/ignore" class="form-actions table-actions">
+              <input type="hidden" name="return_to" value="/communications">
+              <button class="button compact" type="submit">忽略相同消息</button>
+            </form>
+            {% elif run.status == "已忽略" %}
+            <span class="badge">已忽略</span>
+            {% else %}
+            <span class="empty">-</span>
+            {% endif %}
+          </td>
         </tr>
         {% endfor %}
       </tbody>

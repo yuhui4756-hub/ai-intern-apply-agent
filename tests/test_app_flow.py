@@ -528,9 +528,9 @@ def test_liepin_resume_button_does_not_trigger_manual_review():
     assert "发简历" not in clean
     assert "交换手机号" not in clean
     assert "发简历" in prepared["ignored_lines"]
-    assert result["message_type"] == "岗位沟通"
+    assert result["message_type"] == "无需回复"
     assert result["action_required"] is False
-    assert result["draft_message"]
+    assert result["draft_message"] == ""
 
 
 def test_hr_resume_request_still_triggers_manual_review():
@@ -541,6 +541,61 @@ def test_hr_resume_request_still_triggers_manual_review():
     assert result["message_type"] == "需要我处理"
     assert result["action_required"] is True
     assert result["draft_message"] == ""
+
+
+def test_broadcast_recommendation_is_reply_gate_skip():
+    from app.services.conversation import classify_conversation
+
+    result = classify_conversation(
+        "卢女士 晶科能源有限公司\n储能销售经理\n赵先生您好！我们正在招聘储能销售经理，期待您的投递。\n发简历"
+    )
+
+    assert result["message_type"] == "无需回复"
+    assert result["action_required"] is False
+    assert result["draft_message"] == ""
+    assert result["reply_gate"] == "skip"
+
+
+def test_extension_conversation_capture_broadcast_saves_no_draft(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "conversation-broadcast-skip.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db
+
+    init_db()
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "conversation",
+            "url": "https://c.liepin.com/?time=1786081283285",
+            "title": "我的首页_猎聘",
+            "platform": "猎聘",
+            "text": "卢女士 晶科能源有限公司\n储能销售经理\n赵先生您好！我们正在招聘储能销售经理，期待您的投递。\n发简历",
+            "text_scope": "conversation_panel",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["message_type"] == "无需回复"
+    assert payload["skipped"] is True
+    with connect() as conn:
+        capture = conn.execute("SELECT message_type, action_required FROM conversation_captures ORDER BY id DESC LIMIT 1").fetchone()
+        draft_count = conn.execute("SELECT COUNT(*) AS count FROM message_drafts").fetchone()["count"]
+        patrol = conn.execute(
+            "SELECT status, checked_count, new_count, skipped_count, fingerprint_key, fingerprint FROM message_patrol_runs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert capture["message_type"] == "无需回复"
+    assert capture["action_required"] == 0
+    assert draft_count == 0
+    assert patrol["status"] == "无需回复"
+    assert patrol["checked_count"] == 1
+    assert patrol["new_count"] == 0
+    assert patrol["skipped_count"] == 1
+    assert patrol["fingerprint_key"]
+    assert patrol["fingerprint"]
 
 
 def test_message_draft_status_update_writes_action_log(tmp_path, monkeypatch):
@@ -1083,14 +1138,17 @@ def test_message_patrol_observation_does_not_match_generic_title_across_platform
     assert response.status_code == 200
     payload = response.json()
     assert payload["ok"] is True
-    assert payload["new_count"] == 1
+    assert payload["new_count"] == 0
+    assert payload["skipped_count"] == 1
+    assert payload["results"][0]["status"] == "无需回复"
     assert payload["results"][0]["job_id"] is None
     with connect() as conn:
-        patrol = conn.execute("SELECT job_id, source_url, page_title FROM message_patrol_runs ORDER BY id DESC LIMIT 1").fetchone()
+        patrol = conn.execute("SELECT job_id, source_url, page_title, status FROM message_patrol_runs ORDER BY id DESC LIMIT 1").fetchone()
         action_log = conn.execute("SELECT decision_json FROM agent_action_logs ORDER BY id DESC LIMIT 1").fetchone()
     assert patrol["job_id"] is None
     assert patrol["source_url"] == "https://c.liepin.com/?time=1786081283285"
     assert patrol["page_title"] == "我的首页_猎聘"
+    assert patrol["status"] == "无需回复"
     assert "job:" not in action_log["decision_json"]
     assert "https://c.liepin.com/" in action_log["decision_json"]
 
@@ -1352,6 +1410,81 @@ def test_browser_patrol_dry_run_route_uses_open_edge_observations_without_captur
     assert patrol["checked_count"] == 1
     assert patrol["new_count"] == 0
     assert patrol["skipped_count"] == 1
+
+
+def test_message_patrol_dry_run_can_ignore_same_broadcast_message(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "patrol-ignore-broadcast.sqlite3"))
+
+    from app import main
+    from app.db import connect, get_setting, init_db
+
+    init_db()
+    client = TestClient(main.app)
+    observation = {
+        "url": "https://c.liepin.com/?time=1786081283285",
+        "title": "我的首页_猎聘",
+        "platform": "猎聘",
+        "text": "卢女士 晶科能源有限公司\n储能销售经理\n赵先生您好！我们正在招聘储能销售经理，期待您的投递。\n发简历",
+        "text_scope": "conversation_panel",
+    }
+
+    first = client.post(
+        "/api/message-patrol/observations",
+        json={
+            "dry_run": True,
+            "executor": "test",
+            "trigger_type": "manual_browser",
+            "scope": "manual_browser_patrol",
+            "observations": [observation],
+        },
+    )
+
+    assert first.status_code == 200
+    first_payload = first.json()
+    assert first_payload["results"][0]["status"] == "无需回复"
+    assert first_payload["new_count"] == 0
+    assert first_payload["skipped_count"] == 1
+    run_id = first_payload["results"][0]["patrol_run_id"]
+    page = client.get("/communications")
+    assert page.status_code == 200
+    assert "忽略相同消息" in page.text
+
+    ignored = client.post(
+        f"/message-patrol/runs/{run_id}/ignore",
+        data={"return_to": "/communications"},
+        follow_redirects=False,
+    )
+
+    assert ignored.status_code == 303
+    assert ignored.headers["location"].startswith("/communications")
+    ignored_settings = get_setting("ignored_message_fingerprints", {})
+    assert ignored_settings
+
+    second = client.post(
+        "/api/message-patrol/observations",
+        json={
+            "dry_run": True,
+            "executor": "test",
+            "trigger_type": "manual_browser",
+            "scope": "manual_browser_patrol",
+            "observations": [observation],
+        },
+    )
+
+    assert second.status_code == 200
+    second_payload = second.json()
+    assert second_payload["results"][0]["status"] == "已忽略"
+    assert second_payload["new_count"] == 0
+    assert second_payload["skipped_count"] == 1
+    with connect() as conn:
+        patrol = conn.execute("SELECT status, new_count, skipped_count FROM message_patrol_runs ORDER BY id DESC LIMIT 1").fetchone()
+        captures = conn.execute("SELECT COUNT(*) AS count FROM conversation_captures").fetchone()["count"]
+        drafts = conn.execute("SELECT COUNT(*) AS count FROM message_drafts").fetchone()["count"]
+    assert patrol["status"] == "已忽略"
+    assert patrol["new_count"] == 0
+    assert patrol["skipped_count"] == 1
+    assert captures == 0
+    assert drafts == 0
 
 
 def test_browser_patrol_skips_broad_liepin_home_body_without_panel():

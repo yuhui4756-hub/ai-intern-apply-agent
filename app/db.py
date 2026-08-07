@@ -290,6 +290,8 @@ def init_db() -> None:
                 skipped_count INTEGER NOT NULL DEFAULT 0,
                 error_count INTEGER NOT NULL DEFAULT 0,
                 note TEXT NOT NULL DEFAULT '',
+                fingerprint_key TEXT NOT NULL DEFAULT '',
+                fingerprint TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 finished_at TEXT NOT NULL DEFAULT '',
                 FOREIGN KEY(job_id) REFERENCES job_postings(id) ON DELETE SET NULL,
@@ -336,6 +338,15 @@ def ensure_columns(conn: sqlite3.Connection) -> None:
     for column, definition in draft_defaults.items():
         if column not in draft_columns:
             conn.execute(f"ALTER TABLE message_drafts ADD COLUMN {column} {definition}")
+
+    patrol_columns = table_column_names(conn, "message_patrol_runs")
+    patrol_defaults = {
+        "fingerprint_key": "TEXT NOT NULL DEFAULT ''",
+        "fingerprint": "TEXT NOT NULL DEFAULT ''",
+    }
+    for column, definition in patrol_defaults.items():
+        if column not in patrol_columns:
+            conn.execute(f"ALTER TABLE message_patrol_runs ADD COLUMN {column} {definition}")
 
 
 def table_column_names(conn: sqlite3.Connection, table_name: str) -> set[str]:
