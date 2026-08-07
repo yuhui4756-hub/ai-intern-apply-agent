@@ -71,6 +71,7 @@ MESSAGE_PATROL_FINGERPRINTS_KEY = "message_patrol_fingerprints"
 IGNORED_MESSAGE_FINGERPRINTS_KEY = "ignored_message_fingerprints"
 PATROL_SCHEDULER_POLL_SECONDS = 10
 MESSAGE_PATROL_OBSERVATION_LIMIT = 20
+COMMUNICATION_EXECUTOR_PLAN_LIMIT = 20
 COMMUNICATION_MODES = [
     ("off", "关闭"),
     ("draft", "草稿模式"),
@@ -115,6 +116,7 @@ def action_type_label(value: str) -> str:
         "message_patrol_policy_update": "巡检设置",
         "message_patrol_ignore": "忽略消息",
         "draft_send_gate": "发送闸门",
+        "communication_executor_dry_run": "自动回复演练",
     }.get(value or "", value or "-")
 
 
@@ -1593,6 +1595,118 @@ def evaluate_draft_send_gate(conn: Any, draft: Any, message: str) -> dict[str, A
     }
 
 
+def build_communication_execution_plan(
+    conn: Any,
+    *,
+    trigger_type: str = "manual",
+    limit: int = COMMUNICATION_EXECUTOR_PLAN_LIMIT,
+) -> dict[str, Any]:
+    policy = communication_policy()
+    if policy["mode"] == "off":
+        return {
+            "ok": True,
+            "dry_run": True,
+            "trigger_type": trigger_type,
+            "status": "已关闭",
+            "note": "沟通模式为关闭，自动回复执行器未扫描候选草稿。",
+            "policy_mode": policy["mode"],
+            "candidate_count": 0,
+            "allowed_count": 0,
+            "blocked_count": 0,
+            "plans": [],
+        }
+
+    rows = conn.execute(
+        """
+        SELECT
+            d.*,
+            j.title AS job_title,
+            j.company AS company,
+            j.status AS job_status,
+            j.recommendation AS job_recommendation,
+            j.match_level AS job_match_level,
+            c.message_type AS capture_message_type
+        FROM message_drafts d
+        LEFT JOIN job_postings j ON j.id = d.job_id
+        LEFT JOIN conversation_captures c ON c.id = d.capture_id
+        WHERE d.status = '待确认'
+        ORDER BY d.created_at ASC, d.id ASC
+        LIMIT ?
+        """,
+        (max(1, min(int(limit or COMMUNICATION_EXECUTOR_PLAN_LIMIT), 100)),),
+    ).fetchall()
+
+    plans: list[dict[str, Any]] = []
+    for row in rows:
+        message = str(row["message"] or "")
+        gate = evaluate_draft_send_gate(conn, row, message)
+        plans.append(
+            {
+                "draft_id": int(row["id"]),
+                "job_id": int(row["job_id"]) if row["job_id"] else None,
+                "platform": str(row["platform"] or ""),
+                "company": str(row["company"] or ""),
+                "job_title": str(row["job_title"] or ""),
+                "draft_type": str(row["draft_type"] or ""),
+                "communication_mode": str(row["communication_mode"] or policy["mode"]),
+                "followup_index": int(row["followup_index"] or 0),
+                "followup_limit": int(row["followup_limit"] or 0),
+                "message_length": len(message.strip()),
+                "decision": "计划发送" if gate["allowed"] else "拦截",
+                "gate_allowed": bool(gate["allowed"]),
+                "gate_reasons": gate["reasons"],
+                "job_status": str(row["job_status"] or ""),
+                "job_recommendation": str(row["job_recommendation"] or ""),
+                "job_match_level": str(row["job_match_level"] or ""),
+                "capture_message_type": str(row["capture_message_type"] or ""),
+            }
+        )
+
+    allowed_count = sum(1 for item in plans if item["gate_allowed"])
+    blocked_count = len(plans) - allowed_count
+    if not plans:
+        status = "无候选"
+        note = "没有待确认草稿可进入自动回复演练。"
+    else:
+        status = "演练完成"
+        note = f"扫描 {len(plans)} 条待确认草稿：计划发送 {allowed_count} 条，拦截 {blocked_count} 条。"
+
+    return {
+        "ok": True,
+        "dry_run": True,
+        "trigger_type": trigger_type,
+        "status": status,
+        "note": note,
+        "policy_mode": policy["mode"],
+        "candidate_count": len(plans),
+        "allowed_count": allowed_count,
+        "blocked_count": blocked_count,
+        "plans": plans,
+    }
+
+
+def run_communication_executor_dry_run(trigger_type: str = "manual") -> dict[str, Any]:
+    with connect() as conn:
+        plan = build_communication_execution_plan(conn, trigger_type=trigger_type)
+        log_agent_action(
+            conn,
+            action_type="communication_executor_dry_run",
+            status=str(plan["status"]),
+            summary=str(plan["note"]),
+            decision={
+                "dry_run": True,
+                "trigger_type": trigger_type,
+                "policy_mode": plan["policy_mode"],
+                "candidate_count": plan["candidate_count"],
+                "allowed_count": plan["allowed_count"],
+                "blocked_count": plan["blocked_count"],
+                "plans": plan["plans"],
+                "message_text_saved": False,
+            },
+        )
+    return plan
+
+
 def apply_communication_policy(
     conn: Any,
     decision: dict[str, Any],
@@ -2859,6 +2973,17 @@ async def update_message_draft(draft_id: int, request: Request) -> RedirectRespo
             },
         )
     return redirect_with_notice("/communications", "草稿已更新。", "success")
+
+
+@app.post("/communication-executor/dry-run")
+async def communication_executor_dry_run_route(request: Request) -> RedirectResponse:
+    form = await request.form()
+    return_to = str(form.get("return_to") or "/communications")
+    if not return_to.startswith("/") or return_to.startswith("//"):
+        return_to = "/communications"
+    plan = await run_in_threadpool(run_communication_executor_dry_run, "manual")
+    notice_type = "success" if plan["status"] in {"演练完成", "无候选"} else "info"
+    return redirect_with_notice(return_to, f"自动回复 dry-run：{plan['note']}", notice_type)
 
 
 @app.post("/conversation-captures/{capture_id}/feedback")

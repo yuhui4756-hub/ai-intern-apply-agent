@@ -751,6 +751,119 @@ def test_send_gate_blocks_low_match_job_draft(tmp_path, monkeypatch):
     assert "低匹配" in action_log["summary"]
 
 
+def test_communication_executor_dry_run_plans_without_sending(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "communication-executor-dry-run.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db, utc_now
+
+    monkeypatch.setattr(main, "search_company", lambda *args, **kwargs: [])
+    init_db()
+    client = TestClient(main.app)
+
+    allowed_job = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "job",
+            "url": "https://www.zhipin.com/job_detail/executor-allowed.html",
+            "title": "AI 应用开发实习生",
+            "text": "公司名称：深圳演练智能科技有限公司\nAI 应用开发实习生\n要求 Python、FastAPI、RAG，每周 5 天。",
+        },
+    )
+    assert allowed_job.status_code == 200
+    captured = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "conversation",
+            "url": "https://www.zhipin.com/job_detail/executor-allowed.html",
+            "title": "深圳演练智能科技有限公司 HR 对话",
+            "text": "HR：可以的，你想了解工作内容还是实习周期？",
+        },
+    )
+    allowed_draft_id = captured.json()["draft_id"]
+
+    blocked_job = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "job",
+            "url": "https://www.zhipin.com/job_detail/executor-blocked.html",
+            "title": "AI 应用开发实习生",
+            "text": "公司名称：深圳拦截智能科技有限公司\nAI 应用开发实习生\n要求 Python、FastAPI、RAG。",
+        },
+    )
+    blocked_job_id = blocked_job.json()["job_id"]
+    now = utc_now()
+    with connect() as conn:
+        conn.execute(
+            "UPDATE job_postings SET recommendation = ?, match_level = ?, updated_at = ? WHERE id = ?",
+            ("跳过", "低匹配", now, blocked_job_id),
+        )
+        cursor = conn.execute(
+            """
+            INSERT INTO message_drafts (
+                job_id, platform, draft_type, status, reason, message,
+                risk_flags_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (blocked_job_id, "Boss 直聘", "岗位沟通", "待确认", "低匹配测试", "您好，想了解岗位内容。", "[]", now, now),
+        )
+        blocked_draft_id = int(cursor.lastrowid)
+
+    response = client.post("/communication-executor/dry-run", data={"return_to": "/communications"}, follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"].startswith("/communications")
+    with connect() as conn:
+        drafts = conn.execute(
+            "SELECT id, status FROM message_drafts WHERE id IN (?, ?) ORDER BY id",
+            (allowed_draft_id, blocked_draft_id),
+        ).fetchall()
+        action_log = conn.execute("SELECT action_type, status, summary, decision_json FROM agent_action_logs ORDER BY id DESC LIMIT 1").fetchone()
+    assert [row["status"] for row in drafts] == ["待确认", "待确认"]
+    assert action_log["action_type"] == "communication_executor_dry_run"
+    assert action_log["status"] == "演练完成"
+    assert "计划发送 1 条，拦截 1 条" in action_log["summary"]
+    assert '"allowed_count": 1' in action_log["decision_json"]
+    assert '"blocked_count": 1' in action_log["decision_json"]
+    assert "计划发送" in action_log["decision_json"]
+    assert "拦截" in action_log["decision_json"]
+    assert "主要工作内容" not in action_log["decision_json"]
+
+
+def test_communication_executor_dry_run_respects_mode_off(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "communication-executor-off.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db, set_setting, utc_now
+
+    init_db()
+    set_setting("communication_policy", {"mode": "off", "max_auto_followups": 2})
+    client = TestClient(main.app)
+    now = utc_now()
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO message_drafts (
+                platform, draft_type, status, reason, message,
+                risk_flags_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("Boss 直聘", "岗位沟通", "待确认", "关闭模式测试", "您好，想了解岗位内容。", "[]", now, now),
+        )
+        draft_id = int(cursor.lastrowid)
+
+    response = client.post("/communication-executor/dry-run", data={"return_to": "/communications"}, follow_redirects=False)
+
+    assert response.status_code == 303
+    with connect() as conn:
+        draft = conn.execute("SELECT status FROM message_drafts WHERE id = ?", (draft_id,)).fetchone()
+        action_log = conn.execute("SELECT action_type, status, decision_json FROM agent_action_logs ORDER BY id DESC LIMIT 1").fetchone()
+    assert draft["status"] == "待确认"
+    assert action_log["action_type"] == "communication_executor_dry_run"
+    assert action_log["status"] == "已关闭"
+    assert '"candidate_count": 0' in action_log["decision_json"]
+
+
 def test_conversation_capture_stores_cleaning_debug_and_feedback(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "conversation-feedback.sqlite3"))
 
