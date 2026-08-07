@@ -985,6 +985,156 @@ def test_communication_browser_strategy_service_handles_unsupported_platform():
     assert plan["browser_plans"][0]["message_text_included"] is False
 
 
+def test_communication_browser_probe_matches_page_snapshot():
+    from app.services.communication_browser import (
+        build_browser_send_adapter_plan,
+        normalize_probe_text,
+        probe_browser_send_adapter_plan,
+        text_digest,
+    )
+
+    browser_plan = build_browser_send_adapter_plan(
+        {
+            "ok": True,
+            "dry_run": True,
+            "trigger_type": "test",
+            "status": "演练完成",
+            "note": "",
+            "policy_mode": "draft",
+            "candidate_count": 1,
+            "allowed_count": 1,
+            "blocked_count": 0,
+            "plans": [
+                {
+                    "draft_id": 1,
+                    "job_id": 2,
+                    "platform": "Boss 直聘",
+                    "company": "深圳探测智能科技有限公司",
+                    "job_title": "AI 应用开发实习生",
+                    "source_url": "https://www.zhipin.com/job_detail/probe-ready.html",
+                    "message_length": 24,
+                    "gate_allowed": True,
+                    "gate_reasons": [],
+                }
+            ],
+        }
+    )
+    page_text = "深圳探测智能科技有限公司 AI 应用开发实习生 HR：可以沟通，请输入内容后发送"
+    result = probe_browser_send_adapter_plan(
+        browser_plan,
+        page_snapshots=[
+            {
+                "url": "https://www.zhipin.com/job_detail/probe-ready.html",
+                "title": "深圳探测智能科技有限公司 HR 对话",
+                "host": "www.zhipin.com",
+                "text_length": len(page_text),
+                "text_digest": text_digest(page_text),
+                "normalized_text": normalize_probe_text(page_text),
+                "selectors": {
+                    "[class*='chat']": 1,
+                    "textarea": 1,
+                    "button:has-text('发送')": 1,
+                },
+            }
+        ],
+    )
+
+    assert result["status"] == "探测完成"
+    assert result["probe_ready_count"] == 1
+    probe = result["probe_results"][0]
+    assert probe["probe_status"] == "probe_ready"
+    assert probe["message_text_included"] is False
+    assert probe["matched_page"]["company_match"] is True
+    assert probe["matched_page"]["message_input_count"] == 1
+    assert probe["matched_page"]["send_button_count"] == 1
+    assert "深圳探测智能科技有限公司" not in probe["matched_page"]["text_digest"]
+
+
+def test_communication_browser_probe_route_logs_dry_run_without_sending(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "communication-browser-probe-route.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db
+
+    monkeypatch.setattr(main, "search_company", lambda *args, **kwargs: [])
+    init_db()
+    client = TestClient(main.app)
+
+    job_response = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "job",
+            "url": "https://www.zhipin.com/job_detail/probe-route.html",
+            "platform": "Boss 直聘",
+            "title": "AI 应用开发实习生",
+            "text": "公司名称：深圳路由探测智能科技有限公司\nAI 应用开发实习生\n要求 Python、FastAPI、RAG。",
+        },
+    )
+    assert job_response.status_code == 200
+    captured = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "conversation",
+            "url": "https://www.zhipin.com/job_detail/probe-route.html",
+            "platform": "Boss 直聘",
+            "title": "深圳路由探测智能科技有限公司 HR 对话",
+            "text": "HR：可以的，你想了解工作内容还是实习周期？",
+        },
+    )
+    draft_id = captured.json()["draft_id"]
+
+    def fake_probe(browser_plan):
+        return {
+            **browser_plan,
+            "status": "探测完成",
+            "note": "探测 1 条浏览器定位计划：可定位 1 条，部分匹配 0 条，未找到 0 条，跳过 0 条。",
+            "browser_probe_dry_run": True,
+            "browser_connected": True,
+            "page_count": 1,
+            "probe_ready_count": 1,
+            "probe_partial_count": 0,
+            "probe_not_found_count": 0,
+            "probe_skipped_count": 0,
+            "probe_results": [
+                {
+                    "draft_id": draft_id,
+                    "probe_status": "probe_ready",
+                    "message_text_included": False,
+                    "matched_page": {
+                        "host": "www.zhipin.com",
+                        "text_length": 120,
+                        "text_digest": "sha256:test|len:120",
+                        "domain_match": True,
+                        "company_match": True,
+                        "job_title_match": True,
+                        "message_input_count": 1,
+                        "send_button_count": 1,
+                    },
+                }
+            ],
+            "message_text_saved": False,
+        }
+
+    monkeypatch.setattr(main, "probe_browser_send_adapter_plan", fake_probe)
+
+    response = client.post("/communication-executor/browser-probe-dry-run", data={"return_to": "/communications"}, follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"].startswith("/communications")
+    with connect() as conn:
+        draft = conn.execute("SELECT status FROM message_drafts WHERE id = ?", (draft_id,)).fetchone()
+        action_log = conn.execute("SELECT action_type, status, summary, decision_json FROM agent_action_logs ORDER BY id DESC LIMIT 1").fetchone()
+    assert draft["status"] == "待确认"
+    assert action_log["action_type"] == "communication_browser_probe"
+    assert action_log["status"] == "探测完成"
+    assert "可定位 1 条" in action_log["summary"]
+    assert '"browser_connected": true' in action_log["decision_json"]
+    assert '"probe_ready_count": 1' in action_log["decision_json"]
+    assert '"browser_clicked": false' in action_log["decision_json"]
+    assert '"message_filled": false' in action_log["decision_json"]
+    assert "主要工作内容" not in action_log["decision_json"]
+
+
 def test_conversation_capture_stores_cleaning_debug_and_feedback(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "conversation-feedback.sqlite3"))
 

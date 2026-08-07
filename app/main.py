@@ -28,7 +28,7 @@ from .services.analyzer import (
     score_job,
 )
 from .services.browser_patrol import capture_browser_patrol_observations, open_message_patrol_browser
-from .services.communication_browser import build_browser_send_adapter_plan
+from .services.communication_browser import build_browser_send_adapter_plan, probe_browser_send_adapter_plan
 from .services.conversation import classify_conversation, prepare_conversation_text
 from .services.job_fetcher import ensure_public_http_url, fetch_job_from_url, normalize_visible_text
 from .services.job_searcher import (
@@ -119,6 +119,7 @@ def action_type_label(value: str) -> str:
         "draft_send_gate": "发送闸门",
         "communication_executor_dry_run": "自动回复演练",
         "communication_browser_dry_run": "浏览器发送演练",
+        "communication_browser_probe": "浏览器页面探测",
     }.get(value or "", value or "-")
 
 
@@ -1740,6 +1741,50 @@ def run_communication_browser_dry_run(trigger_type: str = "manual") -> dict[str,
     return browser_plan
 
 
+def run_communication_browser_probe_dry_run(trigger_type: str = "manual_browser") -> dict[str, Any]:
+    with connect() as conn:
+        execution_plan = build_communication_execution_plan(conn, trigger_type=trigger_type)
+        browser_plan = build_browser_send_adapter_plan(execution_plan)
+    try:
+        probe_plan = probe_browser_send_adapter_plan(browser_plan)
+    except ValueError as exc:
+        probe_plan = {
+            **browser_plan,
+            "status": "浏览器未连接",
+            "note": str(exc)[:500],
+            "browser_probe_dry_run": True,
+            "browser_connected": False,
+            "probe_results": [],
+            "message_text_saved": False,
+        }
+    with connect() as conn:
+        log_agent_action(
+            conn,
+            action_type="communication_browser_probe",
+            status=str(probe_plan["status"]),
+            summary=str(probe_plan["note"]),
+            decision={
+                "dry_run": True,
+                "trigger_type": trigger_type,
+                "policy_mode": probe_plan.get("policy_mode", ""),
+                "candidate_count": probe_plan.get("candidate_count", 0),
+                "allowed_count": probe_plan.get("allowed_count", 0),
+                "blocked_count": probe_plan.get("blocked_count", 0),
+                "browser_connected": bool(probe_plan.get("browser_connected")),
+                "page_count": int(probe_plan.get("page_count") or 0),
+                "probe_ready_count": int(probe_plan.get("probe_ready_count") or 0),
+                "probe_partial_count": int(probe_plan.get("probe_partial_count") or 0),
+                "probe_not_found_count": int(probe_plan.get("probe_not_found_count") or 0),
+                "probe_skipped_count": int(probe_plan.get("probe_skipped_count") or 0),
+                "probe_results": probe_plan.get("probe_results", []),
+                "message_text_saved": False,
+                "browser_clicked": False,
+                "message_filled": False,
+            },
+        )
+    return probe_plan
+
+
 def apply_communication_policy(
     conn: Any,
     decision: dict[str, Any],
@@ -3028,6 +3073,19 @@ async def communication_browser_dry_run_route(request: Request) -> RedirectRespo
     plan = await run_in_threadpool(run_communication_browser_dry_run, "manual_browser")
     notice_type = "success" if plan["status"] in {"映射完成", "无候选"} else "info"
     return redirect_with_notice(return_to, f"浏览器发送 dry-run：{plan['note']}", notice_type)
+
+
+@app.post("/communication-executor/browser-probe-dry-run")
+async def communication_browser_probe_dry_run_route(request: Request) -> RedirectResponse:
+    form = await request.form()
+    return_to = str(form.get("return_to") or "/communications")
+    if not return_to.startswith("/") or return_to.startswith("//"):
+        return_to = "/communications"
+    plan = await run_in_threadpool(run_communication_browser_probe_dry_run, "manual_browser")
+    notice_type = "success" if plan["status"] in {"探测完成", "无候选"} else "info"
+    if plan["status"] == "浏览器未连接":
+        notice_type = "error"
+    return redirect_with_notice(return_to, f"浏览器页面探测 dry-run：{plan['note']}", notice_type)
 
 
 @app.post("/conversation-captures/{capture_id}/feedback")
