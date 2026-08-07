@@ -57,12 +57,13 @@
   <div class="panel-title">
     <div>
       <h2>自动回复执行器</h2>
-      <p class="muted">当前只支持 dry-run：扫描待确认草稿，执行发送闸门，生成计划和日志，不会发送消息。</p>
+      <p class="muted">当前只支持 dry-run：扫描待确认草稿，执行发送闸门，生成计划、浏览器定位策略和日志，不会发送消息。</p>
     </div>
   </div>
   <form method="post" action="/communication-executor/dry-run" class="form-actions">
     <input type="hidden" name="return_to" value="/communications">
     <button class="button primary" type="submit">执行 dry-run</button>
+    <button class="button" type="submit" formaction="/communication-executor/browser-dry-run">生成浏览器定位策略</button>
   </form>
 </section>
 

@@ -28,6 +28,7 @@ from .services.analyzer import (
     score_job,
 )
 from .services.browser_patrol import capture_browser_patrol_observations, open_message_patrol_browser
+from .services.communication_browser import build_browser_send_adapter_plan
 from .services.conversation import classify_conversation, prepare_conversation_text
 from .services.job_fetcher import ensure_public_http_url, fetch_job_from_url, normalize_visible_text
 from .services.job_searcher import (
@@ -117,6 +118,7 @@ def action_type_label(value: str) -> str:
         "message_patrol_ignore": "忽略消息",
         "draft_send_gate": "发送闸门",
         "communication_executor_dry_run": "自动回复演练",
+        "communication_browser_dry_run": "浏览器发送演练",
     }.get(value or "", value or "-")
 
 
@@ -1622,10 +1624,12 @@ def build_communication_execution_plan(
             d.*,
             j.title AS job_title,
             j.company AS company,
+            j.source_url AS job_source_url,
             j.status AS job_status,
             j.recommendation AS job_recommendation,
             j.match_level AS job_match_level,
-            c.message_type AS capture_message_type
+            c.message_type AS capture_message_type,
+            c.source_url AS capture_source_url
         FROM message_drafts d
         LEFT JOIN job_postings j ON j.id = d.job_id
         LEFT JOIN conversation_captures c ON c.id = d.capture_id
@@ -1647,6 +1651,7 @@ def build_communication_execution_plan(
                 "platform": str(row["platform"] or ""),
                 "company": str(row["company"] or ""),
                 "job_title": str(row["job_title"] or ""),
+                "source_url": str(row["capture_source_url"] or row["job_source_url"] or ""),
                 "draft_type": str(row["draft_type"] or ""),
                 "communication_mode": str(row["communication_mode"] or policy["mode"]),
                 "followup_index": int(row["followup_index"] or 0),
@@ -1705,6 +1710,34 @@ def run_communication_executor_dry_run(trigger_type: str = "manual") -> dict[str
             },
         )
     return plan
+
+
+def run_communication_browser_dry_run(trigger_type: str = "manual") -> dict[str, Any]:
+    with connect() as conn:
+        execution_plan = build_communication_execution_plan(conn, trigger_type=trigger_type)
+        browser_plan = build_browser_send_adapter_plan(execution_plan)
+        log_agent_action(
+            conn,
+            action_type="communication_browser_dry_run",
+            status=str(browser_plan["status"]),
+            summary=str(browser_plan["note"]),
+            decision={
+                "dry_run": True,
+                "trigger_type": trigger_type,
+                "policy_mode": browser_plan["policy_mode"],
+                "candidate_count": browser_plan["candidate_count"],
+                "allowed_count": browser_plan["allowed_count"],
+                "blocked_count": browser_plan["blocked_count"],
+                "browser_ready_count": browser_plan["browser_ready_count"],
+                "browser_manual_count": browser_plan["browser_manual_count"],
+                "browser_skipped_count": browser_plan["browser_skipped_count"],
+                "browser_plans": browser_plan["browser_plans"],
+                "message_text_saved": False,
+                "browser_clicked": False,
+                "message_filled": False,
+            },
+        )
+    return browser_plan
 
 
 def apply_communication_policy(
@@ -2984,6 +3017,17 @@ async def communication_executor_dry_run_route(request: Request) -> RedirectResp
     plan = await run_in_threadpool(run_communication_executor_dry_run, "manual")
     notice_type = "success" if plan["status"] in {"演练完成", "无候选"} else "info"
     return redirect_with_notice(return_to, f"自动回复 dry-run：{plan['note']}", notice_type)
+
+
+@app.post("/communication-executor/browser-dry-run")
+async def communication_browser_dry_run_route(request: Request) -> RedirectResponse:
+    form = await request.form()
+    return_to = str(form.get("return_to") or "/communications")
+    if not return_to.startswith("/") or return_to.startswith("//"):
+        return_to = "/communications"
+    plan = await run_in_threadpool(run_communication_browser_dry_run, "manual_browser")
+    notice_type = "success" if plan["status"] in {"映射完成", "无候选"} else "info"
+    return redirect_with_notice(return_to, f"浏览器发送 dry-run：{plan['note']}", notice_type)
 
 
 @app.post("/conversation-captures/{capture_id}/feedback")
