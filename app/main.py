@@ -1135,7 +1135,25 @@ def conversation_fingerprint_key(
 ) -> str:
     if job_id:
         return f"job:{job_id}"
-    return "page:{}|{}|{}".format(platform.strip().lower(), source_url.strip(), page_title.strip().lower())
+    return "page:{}|{}|{}".format(platform.strip().lower(), stable_conversation_url(source_url), page_title.strip().lower())
+
+
+def stable_conversation_url(url: str) -> str:
+    parsed = urlparse((url or "").strip())
+    if not parsed.scheme or not parsed.netloc:
+        return (url or "").strip()
+    host = parsed.netloc.lower()
+    path = parsed.path.rstrip("/") or parsed.path or "/"
+    query = parse_qs(parsed.query, keep_blank_values=False)
+    volatile_keys = {"time", "timestamp", "ts", "t", "_"}
+    stable_query = {
+        key: values
+        for key, values in query.items()
+        if key.lower() not in volatile_keys and not key.lower().startswith("_")
+    }
+    if host.endswith("liepin.com") and path == "/":
+        stable_query = {}
+    return urlunparse((parsed.scheme.lower(), host, path, "", urlencode(stable_query, doseq=True), ""))
 
 
 def load_message_patrol_fingerprints() -> dict[str, Any]:
@@ -1239,20 +1257,77 @@ def extension_candidate_sources(payload: dict[str, Any]) -> list[dict[str, str]]
     return [*extension_cards(payload), *extension_anchors(payload)]
 
 
-def find_job_for_conversation(conn: Any, source_url: str, text: str) -> dict[str, Any] | None:
+def find_job_for_conversation(
+    conn: Any,
+    source_url: str,
+    text: str,
+    platform: str = "",
+    page_title: str = "",
+    text_scope: str = "",
+) -> dict[str, Any] | None:
     existing = find_existing_job_by_source_url(conn, source_url)
-    if existing:
+    if existing and source_url_identifies_job(source_url) and platform_matches(platform, str(existing["platform"] or "")):
         return {key: existing[key] for key in existing.keys()}
     clean_text = text or ""
     rows = conn.execute("SELECT * FROM job_postings ORDER BY updated_at DESC, id DESC LIMIT 300").fetchall()
     for row in rows:
-        title = str(row["title"] or "")
         company = str(row["company"] or "")
-        if title and title in clean_text:
-            return {key: row[key] for key in row.keys()}
         if company and company in clean_text:
             return {key: row[key] for key in row.keys()}
+    title_matches = [
+        row
+        for row in rows
+        if is_distinctive_conversation_title(str(row["title"] or ""))
+        and str(row["title"] or "") in clean_text
+        and platform_matches(platform, str(row["platform"] or ""))
+    ]
+    if len(title_matches) == 1:
+        row = title_matches[0]
+        return {key: row[key] for key in row.keys()}
     return None
+
+
+def source_url_identifies_job(url: str) -> bool:
+    return bool(url) and not is_broad_conversation_source_url(url)
+
+
+def is_broad_conversation_source_url(url: str, page_title: str = "") -> bool:
+    parsed = urlparse((url or "").strip())
+    host = (parsed.hostname or "").lower()
+    path = (parsed.path or "/").rstrip("/") or "/"
+    lowered = f"{path}?{parsed.query}".lower()
+    if not host:
+        return True
+    if "首页" in (page_title or "") or "home" in (page_title or "").lower():
+        return True
+    if path == "/":
+        return True
+    detail_tokens = ["job_detail", "/job/", "/intern/", "/position/"]
+    if any(token in lowered for token in detail_tokens):
+        return False
+    broad_tokens = ["search", "jobs", "joblist", "job-list", "web/geek/jobs", "interns"]
+    chat_tokens = ["/im/", "/chat", "/message", "/messages", "/conversation"]
+    return any(token in lowered for token in broad_tokens) or any(token in lowered for token in chat_tokens)
+
+
+def platform_matches(observed_platform: str, job_platform: str) -> bool:
+    observed = (observed_platform or "").strip()
+    saved = (job_platform or "").strip()
+    if not observed or not saved:
+        return True
+    if "岗位链接" in {observed, saved}:
+        return True
+    return observed == saved
+
+
+def is_distinctive_conversation_title(title: str) -> bool:
+    compact = re.sub(r"\s+", "", title or "")
+    if len(compact) < 5:
+        return False
+    too_generic = {"AI应用开发", "AI开发", "Agent开发", "后端开发", "软件开发", "Python开发"}
+    if compact in too_generic:
+        return False
+    return bool(re.search(r"(实习|工程师|开发|后端|算法|agent|ai|大模型|llm|rag)", title or "", re.IGNORECASE))
 
 
 def find_duplicate_conversation_capture(
@@ -1480,7 +1555,14 @@ def create_conversation_from_extension(payload: dict[str, Any]) -> dict[str, Any
         return api_error("当前页面可见对话文本太短，无法分析。")
 
     with connect() as conn:
-        job = find_job_for_conversation(conn, url, conversation_text)
+        job = find_job_for_conversation(
+            conn,
+            url,
+            conversation_text,
+            platform=platform,
+            page_title=title,
+            text_scope=str(payload.get("text_scope") or ""),
+        )
         job_id = int(job["id"]) if job else None
         duplicate = find_duplicate_conversation_capture(
             conn,
@@ -1845,6 +1927,7 @@ def process_message_patrol_observation(
         or observation.get("conversation_text")
         or ""
     )[:EXTENSION_TEXT_LIMIT]
+    text_scope = str(observation.get("text_scope") or "")
     prepared_text = prepare_conversation_text(raw_text)
     conversation_text = str(prepared_text["clean_text"])
     if len(conversation_text) < 20:
@@ -1877,7 +1960,14 @@ def process_message_patrol_observation(
 
     if dry_run:
         with connect() as conn:
-            job = find_job_for_conversation(conn, url, conversation_text)
+            job = find_job_for_conversation(
+                conn,
+                url,
+                conversation_text,
+                platform=platform,
+                page_title=title,
+                text_scope=text_scope,
+            )
             job_id = int(job["id"]) if job else None
             duplicate = find_duplicate_conversation_capture(
                 conn,
@@ -1919,11 +2009,12 @@ def process_message_patrol_observation(
                 "executor": executor,
                 "dry_run": True,
                 "matched_capture_id": capture_id,
-                "matched_by": "job_id" if job_id else "source_url",
+                "matched_by": "job_id" if job_id else "page_fingerprint",
                 "duplicate_fingerprint": duplicate_fingerprint,
                 "fingerprint_key": fingerprint_key,
                 "text_length": len(conversation_text),
                 "ignored_line_count": len(prepared_text["ignored_lines"]),
+                "text_scope": text_scope,
             },
         )
         return {
@@ -1946,6 +2037,7 @@ def process_message_patrol_observation(
         "title": title,
         "platform": platform,
         "text": raw_text,
+        "text_scope": text_scope,
         "patrol_trigger": trigger_type,
         "patrol_scope": scope,
     }

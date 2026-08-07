@@ -124,18 +124,23 @@ def capture_page_observation(page) -> dict[str, str] | None:
 
     title = safe_page_title(page)
     url_or_title_matches = looks_like_conversation_url(url) or looks_like_conversation_title(title)
-    text = ""
-    if url_or_title_matches or needs_text_probe(url):
-        text = safe_body_text(page)
+    text = safe_conversation_panel_text(page)
+    text_scope = "conversation_panel" if text else ""
+    if not text and (url_or_title_matches or needs_text_probe(url)):
+        body_text = safe_body_text(page)
+        if body_text and not is_broad_recruitment_page(url, title):
+            text = body_text
+            text_scope = "page_body"
     if not text:
         return None
-    if not url_or_title_matches and not looks_like_conversation_text(text):
+    if text_scope != "conversation_panel" and not url_or_title_matches and not looks_like_conversation_text(text):
         return None
     return {
         "url": url,
         "title": title,
         "platform": platform,
         "text": text[:20000],
+        "text_scope": text_scope,
     }
 
 
@@ -149,6 +154,13 @@ def safe_page_title(page) -> str:
 def safe_body_text(page) -> str:
     try:
         return str(page.locator("body").inner_text(timeout=5000) or "")
+    except Exception:
+        return ""
+
+
+def safe_conversation_panel_text(page) -> str:
+    try:
+        return str(page.evaluate(CONVERSATION_PANEL_SCRIPT) or "")
     except Exception:
         return ""
 
@@ -177,3 +189,112 @@ def looks_like_conversation_text(text: str) -> bool:
 
 def needs_text_probe(url: str) -> bool:
     return bool(infer_recruitment_platform(url))
+
+
+def is_broad_recruitment_page(url: str, title: str = "") -> bool:
+    parsed = urlparse(url)
+    path = (parsed.path or "/").rstrip("/") or "/"
+    lowered = f"{path}?{parsed.query}".lower()
+    title_text = (title or "").lower()
+    if "首页" in (title or "") or "home" in title_text:
+        return True
+    if path == "/":
+        return True
+    broad_tokens = [
+        "search",
+        "jobs",
+        "joblist",
+        "job-list",
+        "web/geek/jobs",
+        "interns",
+        "position",
+    ]
+    return any(token in lowered for token in broad_tokens) and not looks_like_conversation_url(url)
+
+
+CONVERSATION_PANEL_SCRIPT = """
+() => {
+  const controlTerms = ['请输入文字', '按Enter键发送', '发简历', '交换手机号', '交换微信号', '再考虑一下'];
+  const messageTerms = ['HR', '先生', '女士', '您好', '招聘', '投递', '岗位', '职位', '面试'];
+  const skipTags = new Set(['HTML', 'BODY', 'SCRIPT', 'STYLE', 'NOSCRIPT']);
+
+  function visible(el) {
+    const rect = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return rect.width >= 240 && rect.height >= 180 && style.visibility !== 'hidden' && style.display !== 'none';
+  }
+
+  function classText(el) {
+    return String(el.className || '').toLowerCase();
+  }
+
+  function isContainerLike(el) {
+    if (skipTags.has(el.tagName)) return false;
+    const cls = classText(el);
+    const role = String(el.getAttribute('role') || '').toLowerCase();
+    const aria = String(el.getAttribute('aria-label') || '').toLowerCase();
+    return (
+      role === 'dialog' ||
+      el.getAttribute('aria-modal') === 'true' ||
+      cls.includes('chat') ||
+      cls.includes('im') ||
+      cls.includes('message') ||
+      cls.includes('conversation') ||
+      cls.includes('communicat') ||
+      cls.includes('dialog') ||
+      cls.includes('modal') ||
+      cls.includes('drawer') ||
+      cls.includes('pop') ||
+      cls.includes('talk') ||
+      aria.includes('chat') ||
+      aria.includes('message')
+    );
+  }
+
+  function score(el, text) {
+    const rect = el.getBoundingClientRect();
+    const controlHits = controlTerms.filter(term => text.includes(term)).length;
+    const messageHits = messageTerms.filter(term => text.includes(term)).length;
+    let value = controlHits * 20 + messageHits * 4;
+    if (isContainerLike(el)) value += 12;
+    if (rect.width <= window.innerWidth * 0.75) value += 6;
+    if (rect.height <= window.innerHeight * 0.95) value += 4;
+    if (text.length > 120 && text.length < 9000) value += 6;
+    if (text.includes('我的沟通') && text.length > 5000) value -= 20;
+    return value;
+  }
+
+  const seeds = [];
+  for (const el of Array.from(document.querySelectorAll('body *'))) {
+    const text = (el.innerText || '').trim();
+    if (!text || text.length < 20) continue;
+    if (!visible(el)) continue;
+    if (isContainerLike(el) || controlTerms.some(term => text.includes(term))) {
+      seeds.push(el);
+    }
+  }
+
+  const candidates = new Map();
+  for (const seed of seeds) {
+    let current = seed;
+    for (let depth = 0; current && current !== document.body && depth < 6; depth += 1) {
+      const text = (current.innerText || '').trim();
+      if (text.length >= 40 && text.length <= 10000 && visible(current)) {
+        candidates.set(current, text);
+      }
+      current = current.parentElement;
+    }
+  }
+
+  let bestText = '';
+  let bestScore = 0;
+  for (const [el, text] of candidates.entries()) {
+    const currentScore = score(el, text);
+    if (currentScore > bestScore) {
+      bestScore = currentScore;
+      bestText = text;
+    }
+  }
+  return bestScore >= 24 ? bestText : '';
+}
+"""

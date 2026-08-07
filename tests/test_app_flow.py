@@ -1041,6 +1041,60 @@ def test_message_patrol_observation_dry_run_records_metadata_without_capture(tmp
     assert "工作内容" not in action_log["decision_json"]
 
 
+def test_message_patrol_observation_does_not_match_generic_title_across_platform(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "patrol-generic-title.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db
+
+    monkeypatch.setattr(main, "search_company", lambda *args, **kwargs: [])
+    init_db()
+    client = TestClient(main.app)
+
+    job_response = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "job",
+            "url": "https://www.zhipin.com/web/geek/jobs?query=ai%E5%BA%94%E7%94%A8%E5%BC%80%E5%8F%91",
+            "title": "AI应用开发",
+            "platform": "Boss 直聘",
+            "text": "公司名称：新旦智能\n岗位名称：AI应用开发\n要求 Python、FastAPI、RAG。",
+        },
+    )
+    assert job_response.status_code == 200
+
+    response = client.post(
+        "/api/message-patrol/observations",
+        json={
+            "executor": "edge_cdp",
+            "dry_run": True,
+            "observations": [
+                {
+                    "url": "https://c.liepin.com/?time=1786081283285",
+                    "title": "我的首页_猎聘",
+                    "platform": "猎聘",
+                    "text_scope": "page_body",
+                    "text": "我的沟通\nAI应用开发\n发简历\n赵先生您好！我们正在招聘储能销售经理，期待您的投递。",
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["new_count"] == 1
+    assert payload["results"][0]["job_id"] is None
+    with connect() as conn:
+        patrol = conn.execute("SELECT job_id, source_url, page_title FROM message_patrol_runs ORDER BY id DESC LIMIT 1").fetchone()
+        action_log = conn.execute("SELECT decision_json FROM agent_action_logs ORDER BY id DESC LIMIT 1").fetchone()
+    assert patrol["job_id"] is None
+    assert patrol["source_url"] == "https://c.liepin.com/?time=1786081283285"
+    assert patrol["page_title"] == "我的首页_猎聘"
+    assert "job:" not in action_log["decision_json"]
+    assert "https://c.liepin.com/" in action_log["decision_json"]
+
+
 def test_message_patrol_observation_dry_run_skips_duplicate_without_llm(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "patrol-observation-duplicate.sqlite3"))
 
@@ -1298,6 +1352,57 @@ def test_browser_patrol_dry_run_route_uses_open_edge_observations_without_captur
     assert patrol["checked_count"] == 1
     assert patrol["new_count"] == 0
     assert patrol["skipped_count"] == 1
+
+
+def test_browser_patrol_skips_broad_liepin_home_body_without_panel():
+    from app.services.browser_patrol import capture_page_observation
+
+    class FakeLocator:
+        def inner_text(self, timeout=5000):
+            return "我的沟通\nAI应用开发\n发简历\n交换手机号\n赵先生您好！我们正在招聘储能销售经理，期待您的投递。"
+
+    class FakePage:
+        url = "https://c.liepin.com/?time=1786081283285"
+
+        def title(self):
+            return "我的首页_猎聘"
+
+        def locator(self, _selector):
+            return FakeLocator()
+
+        def evaluate(self, _script):
+            return ""
+
+    assert capture_page_observation(FakePage()) is None
+
+
+def test_browser_patrol_prefers_liepin_conversation_panel_over_page_body():
+    from app.services.browser_patrol import capture_page_observation
+
+    panel_text = "卢女士 晶科能源有限公司\n储能销售经理\n赵先生您好！我们正在招聘储能销售经理，期待您的投递。\n发简历"
+
+    class FakeLocator:
+        def inner_text(self, timeout=5000):
+            return "我的首页_猎聘\nAI应用开发\n推荐职位\n" + panel_text
+
+    class FakePage:
+        url = "https://c.liepin.com/?time=1786081283285"
+
+        def title(self):
+            return "我的首页_猎聘"
+
+        def locator(self, _selector):
+            return FakeLocator()
+
+        def evaluate(self, _script):
+            return panel_text
+
+    observation = capture_page_observation(FakePage())
+
+    assert observation is not None
+    assert observation["platform"] == "猎聘"
+    assert observation["text"] == panel_text
+    assert observation["text_scope"] == "conversation_panel"
 
 
 def test_message_patrol_tick_uses_browser_executor_when_enabled(tmp_path, monkeypatch):
