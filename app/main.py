@@ -114,6 +114,7 @@ def action_type_label(value: str) -> str:
         "message_patrol_observation": "巡检观察",
         "message_patrol_policy_update": "巡检设置",
         "message_patrol_ignore": "忽略消息",
+        "draft_send_gate": "发送闸门",
     }.get(value or "", value or "-")
 
 
@@ -1528,6 +1529,70 @@ def dedupe_texts(values: list[str]) -> list[str]:
     return result
 
 
+def evaluate_draft_send_gate(conn: Any, draft: Any, message: str) -> dict[str, Any]:
+    reasons: list[str] = []
+    draft_type = str(draft["draft_type"] or "")
+    old_status = str(draft["status"] or "")
+    job_id = int(draft["job_id"]) if draft["job_id"] else None
+    capture_id = int(draft["capture_id"]) if draft["capture_id"] else None
+
+    if old_status != "待确认":
+        reasons.append(f"草稿当前状态为「{old_status or '未设置'}」，只能发送待确认草稿")
+    if not message.strip():
+        reasons.append("草稿内容为空")
+    if not job_id:
+        reasons.append("未匹配到岗位")
+
+    blocked_draft_types = {"初筛跳过", "初筛待确认", "自主询问暂停", "面试邀请", "需要我处理", "无关内容"}
+    if draft_type in blocked_draft_types:
+        reasons.append(f"草稿类型为「{draft_type}」，必须人工处理")
+
+    capture_type = ""
+    if capture_id:
+        capture = conn.execute(
+            "SELECT message_type, action_required FROM conversation_captures WHERE id = ?",
+            (capture_id,),
+        ).fetchone()
+        if capture:
+            capture_type = str(capture["message_type"] or "")
+            if capture_type != "岗位沟通":
+                reasons.append(f"对话分类为「{capture_type or '未分类'}」，不能进入发送流程")
+            if capture["action_required"]:
+                reasons.append("对话采集标记为需要人工处理")
+
+    job_status = ""
+    job_recommendation = ""
+    job_match_level = ""
+    if job_id:
+        job = conn.execute(
+            "SELECT status, recommendation, match_level FROM job_postings WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+        if job:
+            job_status = str(job["status"] or "")
+            job_recommendation = str(job["recommendation"] or "")
+            job_match_level = str(job["match_level"] or "")
+            if job_status in {"面试邀请", "待面试"}:
+                reasons.append(f"岗位状态为「{job_status}」，后续沟通需人工确认")
+            if job_recommendation == "跳过" or job_match_level == "低匹配":
+                reasons.append("岗位此前被评为低匹配或建议跳过")
+
+    return {
+        "allowed": not reasons,
+        "reasons": dedupe_texts(reasons),
+        "draft_id": int(draft["id"]),
+        "draft_status": old_status,
+        "draft_type": draft_type,
+        "message_length": len(message.strip()),
+        "job_id": job_id,
+        "job_status": job_status,
+        "job_recommendation": job_recommendation,
+        "job_match_level": job_match_level,
+        "capture_id": capture_id,
+        "capture_message_type": capture_type,
+    }
+
+
 def apply_communication_policy(
     conn: Any,
     decision: dict[str, Any],
@@ -2743,6 +2808,27 @@ async def update_message_draft(draft_id: int, request: Request) -> RedirectRespo
             return redirect_with_notice("/communications", "没有找到草稿。", "error")
         old_status = str(row["status"] or "")
         now = utc_now()
+        send_gate: dict[str, Any] | None = None
+        if status == "已发送":
+            send_gate = evaluate_draft_send_gate(conn, row, message)
+            if not send_gate["allowed"]:
+                conn.execute(
+                    "UPDATE message_drafts SET message = ?, updated_at = ? WHERE id = ?",
+                    (message, now, draft_id),
+                )
+                summary = "发送闸门拦截：" + "；".join(send_gate["reasons"])
+                log_agent_action(
+                    conn,
+                    action_type="draft_send_gate",
+                    status="已拦截",
+                    summary=summary[:500],
+                    platform=str(row["platform"] or ""),
+                    job_id=int(row["job_id"]) if row["job_id"] else None,
+                    capture_id=int(row["capture_id"]) if row["capture_id"] else None,
+                    draft_id=draft_id,
+                    decision=send_gate,
+                )
+                return redirect_with_notice("/communications", summary[:180], "error")
         conn.execute(
             "UPDATE message_drafts SET status = ?, message = ?, updated_at = ? WHERE id = ?",
             (status, message, now, draft_id),
@@ -2769,6 +2855,7 @@ async def update_message_draft(draft_id: int, request: Request) -> RedirectRespo
                 "followup_index": row["followup_index"],
                 "followup_limit": row["followup_limit"],
                 "message_length": len(message),
+                "send_gate": send_gate or {"checked": False},
             },
         )
     return redirect_with_notice("/communications", "草稿已更新。", "success")

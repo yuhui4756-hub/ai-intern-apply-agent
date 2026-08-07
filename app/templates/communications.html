@@ -195,7 +195,9 @@
               <textarea id="draft-{{ draft.id }}" name="message" rows="5">{{ draft.message }}</textarea>
               <div class="form-actions table-actions">
                 <button class="button compact copy-button" type="button" data-copy-target="draft-{{ draft.id }}">复制</button>
+                {% if draft.status == "待确认" %}
                 <button class="button compact primary" type="submit" name="status" value="已发送">标记已发送</button>
+                {% endif %}
                 <button class="button compact" type="submit" name="status" value="待确认">保存编辑</button>
                 <button class="button compact" type="submit" name="status" value="需要我处理">需要我处理</button>
                 <button class="button compact" type="submit" name="status" value="已驳回">驳回</button>

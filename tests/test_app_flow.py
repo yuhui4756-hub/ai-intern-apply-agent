@@ -641,6 +641,114 @@ def test_message_draft_status_update_writes_action_log(tmp_path, monkeypatch):
     assert action_log["status"] == "已发送"
     assert "待确认 -> 已发送" in action_log["summary"]
     assert "message_length" in action_log["decision_json"]
+    assert '"allowed": true' in action_log["decision_json"]
+
+
+def test_send_gate_blocks_interview_invite_draft(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "draft-send-gate-interview.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db
+
+    monkeypatch.setattr(main, "search_company", lambda *args, **kwargs: [])
+    init_db()
+    client = TestClient(main.app)
+
+    job_response = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "job",
+            "url": "https://www.zhipin.com/job_detail/send-gate-interview.html",
+            "title": "AI Agent 开发实习生",
+            "text": "公司名称：杭州发送闸门智能科技有限公司\nAI Agent 开发实习生\n要求 Python、RAG、FastAPI。",
+        },
+    )
+    job_id = job_response.json()["job_id"]
+    captured = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "conversation",
+            "url": "https://www.zhipin.com/job_detail/send-gate-interview.html",
+            "title": "杭州发送闸门智能科技有限公司 HR 对话",
+            "text": "HR：我们可以约一个线上面试时间，你什么时候方便？",
+        },
+    )
+    draft_id = captured.json()["draft_id"]
+
+    response = client.post(
+        f"/message-drafts/{draft_id}",
+        data={"status": "已发送", "message": "您好，我这周三下午方便。"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    with connect() as conn:
+        draft = conn.execute("SELECT status, message FROM message_drafts WHERE id = ?", (draft_id,)).fetchone()
+        sent_events = conn.execute(
+            "SELECT COUNT(*) AS count FROM application_events WHERE job_id = ? AND event_type = '沟通草稿已发送'",
+            (job_id,),
+        ).fetchone()["count"]
+        action_log = conn.execute("SELECT action_type, status, summary, decision_json FROM agent_action_logs ORDER BY id DESC LIMIT 1").fetchone()
+    assert draft["status"] == "需要我处理"
+    assert draft["message"] == "您好，我这周三下午方便。"
+    assert sent_events == 0
+    assert action_log["action_type"] == "draft_send_gate"
+    assert action_log["status"] == "已拦截"
+    assert "面试邀请" in action_log["summary"]
+    assert '"allowed": false' in action_log["decision_json"]
+
+
+def test_send_gate_blocks_low_match_job_draft(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "draft-send-gate-low-match.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db, utc_now
+
+    monkeypatch.setattr(main, "search_company", lambda *args, **kwargs: [])
+    init_db()
+    client = TestClient(main.app)
+
+    job_response = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "job",
+            "url": "https://www.zhipin.com/job_detail/send-gate-low.html",
+            "title": "AI 应用开发实习生",
+            "text": "公司名称：深圳低匹配智能科技有限公司\nAI 应用开发实习生\n要求 Python、FastAPI、RAG。",
+        },
+    )
+    job_id = job_response.json()["job_id"]
+    now = utc_now()
+    with connect() as conn:
+        conn.execute(
+            "UPDATE job_postings SET recommendation = ?, match_level = ?, updated_at = ? WHERE id = ?",
+            ("跳过", "低匹配", now, job_id),
+        )
+        cursor = conn.execute(
+            """
+            INSERT INTO message_drafts (
+                job_id, platform, draft_type, status, reason, message,
+                risk_flags_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (job_id, "Boss 直聘", "岗位沟通", "待确认", "测试未来自动发送闸门", "您好，想了解岗位内容。", "[]", now, now),
+        )
+        draft_id = int(cursor.lastrowid)
+
+    response = client.post(
+        f"/message-drafts/{draft_id}",
+        data={"status": "已发送", "message": "您好，想了解岗位内容。"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    with connect() as conn:
+        draft = conn.execute("SELECT status FROM message_drafts WHERE id = ?", (draft_id,)).fetchone()
+        action_log = conn.execute("SELECT action_type, status, summary FROM agent_action_logs ORDER BY id DESC LIMIT 1").fetchone()
+    assert draft["status"] == "待确认"
+    assert action_log["action_type"] == "draft_send_gate"
+    assert action_log["status"] == "已拦截"
+    assert "低匹配" in action_log["summary"]
 
 
 def test_conversation_capture_stores_cleaning_debug_and_feedback(tmp_path, monkeypatch):
