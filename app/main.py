@@ -1162,6 +1162,10 @@ def has_message_patrol_fingerprint(key: str, fingerprint: str) -> bool:
     return item == fingerprint
 
 
+def should_skip_observation_for_pause(*, dry_run: bool, trigger_type: str) -> bool:
+    return not (dry_run and trigger_type == "manual_browser")
+
+
 def extension_page_text(payload: dict[str, Any]) -> str:
     title = payload_text(payload, "title", 300)
     url = payload_text(payload, "url", 1000)
@@ -1808,7 +1812,7 @@ def process_message_patrol_observation(
         }
 
     control = automation_control()
-    if control["paused"]:
+    if control["paused"] and should_skip_observation_for_pause(dry_run=dry_run, trigger_type=trigger_type):
         patrol_run_id = write_observation_patrol_run(
             status="已暂停",
             note="自动化已暂停，跳过本次巡检观察。",
@@ -3394,17 +3398,6 @@ async def trigger_message_patrol_browser_dry_run(request: Request) -> RedirectRe
     policy = communication_policy()
     if policy["mode"] == "off":
         return redirect_with_notice(return_to, "沟通模式为关闭，未读取浏览器页面。", "info")
-    control = automation_control()
-    if control["paused"]:
-        patrol_run_id = record_message_patrol_executor_skip(
-            status="已暂停",
-            note="自动化已暂停，本次手动浏览器巡检未读取页面。",
-            trigger_type="manual_browser",
-            scope="manual_browser_patrol",
-            skipped_count=1,
-            decision={"pause_reason": control["pause_reason"], "updated_at": control["updated_at"], "dry_run": True},
-        )
-        return redirect_with_notice(return_to, f"浏览器 dry-run 巡检：已暂停。记录 #{patrol_run_id}", "info")
 
     result = run_browser_message_patrol_executor(
         trigger_type="manual_browser",

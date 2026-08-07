@@ -35,8 +35,9 @@
       <strong>自动化控制：{{ automation_control.status_label }}</strong>
       {% if automation_control.paused %}
       <p class="muted">暂停原因：{{ automation_control.pause_reason or "用户手动暂停" }}</p>
+      <p class="muted">手动 Edge dry-run 巡检仍可执行只读差分；定时巡检和会生成草稿的采集会跳过。</p>
       {% else %}
-      <p class="muted">运行中。暂停后，对话采集会跳过分析和草稿生成，避免临时误触或后台巡检继续动作。</p>
+      <p class="muted">运行中。暂停后，对话采集、定时巡检和后续自动动作会跳过，避免临时误触；手动 Edge dry-run 巡检仍可使用。</p>
       {% endif %}
     </div>
     <form method="post" action="/settings/automation-control" class="form-actions">

@@ -60,12 +60,13 @@
   </div>
   {% if automation_control.paused %}
   <div class="notice compact error">当前已暂停：{{ automation_control.pause_reason or "用户手动暂停" }}</div>
+  <p class="muted">暂停会拦截对话采集、定时巡检和后续自动动作；“巡检当前 Edge 聊天页”是你主动触发的只读 dry-run，仍可使用。</p>
   <form method="post" action="/settings/automation-control" class="form-actions">
     <input type="hidden" name="return_to" value="/communications">
     <button class="button primary" type="submit" name="action" value="resume">恢复自动化</button>
   </form>
   {% else %}
-  <p class="muted">暂停后，浏览器扩展的对话采集会跳过分析和草稿生成；岗位采集、JD 分析等手动功能仍可使用。</p>
+  <p class="muted">暂停后，对话采集、定时巡检和后续自动动作会跳过；岗位采集、JD 分析、手动 Edge dry-run 巡检仍可使用。</p>
   <form method="post" action="/settings/automation-control" class="form-grid">
     <input type="hidden" name="return_to" value="/communications">
     <label>暂停原因

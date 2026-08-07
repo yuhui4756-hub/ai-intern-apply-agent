@@ -1216,10 +1216,11 @@ def test_browser_patrol_dry_run_route_uses_open_edge_observations_without_captur
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "browser-patrol-dry-run.sqlite3"))
 
     from app import main
-    from app.db import connect, init_db
+    from app.db import connect, init_db, set_setting, utc_now
 
     monkeypatch.setattr(main, "search_company", lambda *args, **kwargs: [])
     init_db()
+    set_setting("automation_control", {"paused": True, "pause_reason": "只暂停后台自动化", "updated_at": utc_now()})
     client = TestClient(main.app)
 
     job_response = client.post(
