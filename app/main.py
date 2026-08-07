@@ -120,6 +120,7 @@ def action_type_label(value: str) -> str:
         "communication_executor_dry_run": "自动回复演练",
         "communication_browser_dry_run": "浏览器发送演练",
         "communication_browser_probe": "浏览器页面探测",
+        "demo_draft_created": "演练草稿",
     }.get(value or "", value or "-")
 
 
@@ -1785,6 +1786,197 @@ def run_communication_browser_probe_dry_run(trigger_type: str = "manual_browser"
     return probe_plan
 
 
+def communication_executor_page_status(conn: Any) -> dict[str, Any]:
+    preview = build_communication_execution_plan(conn, trigger_type="page_preview")
+    latest_rows = conn.execute(
+        """
+        SELECT id, action_type, status, summary, decision_json, created_at
+        FROM agent_action_logs
+        WHERE action_type IN (
+            'communication_executor_dry_run',
+            'communication_browser_dry_run',
+            'communication_browser_probe'
+        )
+        ORDER BY id DESC
+        LIMIT 3
+        """
+    ).fetchall()
+    latest = []
+    for row in latest_rows:
+        decision = loads(row["decision_json"], {}) or {}
+        latest.append(
+            {
+                "id": row["id"],
+                "action_type": row["action_type"],
+                "status": row["status"],
+                "summary": row["summary"],
+                "created_at": row["created_at"],
+                "candidate_count": int(decision.get("candidate_count") or 0),
+                "allowed_count": int(decision.get("allowed_count") or 0),
+                "blocked_count": int(decision.get("blocked_count") or 0),
+                "browser_ready_count": int(decision.get("browser_ready_count") or 0),
+                "browser_skipped_count": int(decision.get("browser_skipped_count") or 0),
+                "page_count": int(decision.get("page_count") or 0),
+                "probe_ready_count": int(decision.get("probe_ready_count") or 0),
+                "probe_partial_count": int(decision.get("probe_partial_count") or 0),
+                "probe_not_found_count": int(decision.get("probe_not_found_count") or 0),
+                "probe_skipped_count": int(decision.get("probe_skipped_count") or 0),
+            }
+        )
+    return {
+        "preview": preview,
+        "latest": latest,
+        "pending_count": int(preview.get("candidate_count") or 0),
+        "allowed_count": int(preview.get("allowed_count") or 0),
+        "blocked_count": int(preview.get("blocked_count") or 0),
+    }
+
+
+def find_existing_demo_draft(conn: Any) -> dict[str, Any] | None:
+    row = conn.execute(
+        """
+        SELECT d.id, d.job_id, d.platform
+        FROM message_drafts d
+        WHERE d.status = '待确认'
+          AND d.draft_type = '岗位沟通'
+          AND d.reason LIKE '%本地演练%'
+        ORDER BY d.id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    return {key: row[key] for key in row.keys()} if row else None
+
+
+def create_demo_communication_draft(conn: Any) -> dict[str, Any]:
+    existing = find_existing_demo_draft(conn)
+    if existing:
+        job_id = int(existing["job_id"]) if existing.get("job_id") else None
+        log_agent_action(
+            conn,
+            action_type="demo_draft_created",
+            status="已存在",
+            summary="已有本地演练草稿，可直接执行自动回复 dry-run。",
+            platform=str(existing.get("platform") or ""),
+            job_id=job_id,
+            draft_id=int(existing["id"]),
+            decision={
+                "local_demo": True,
+                "existing": True,
+                "real_platform_data": False,
+            },
+        )
+        return {"created": False, "draft_id": int(existing["id"]), "job_id": job_id}
+
+    now = utc_now()
+    default_resume = conn.execute("SELECT id FROM resume_versions WHERE is_default = 1 ORDER BY id LIMIT 1").fetchone()
+    resume_id = int(default_resume["id"]) if default_resume else None
+    jd_text = (
+        "本地演练岗位，不来自真实招聘平台。\n"
+        "岗位名称：AI 应用开发实习生\n"
+        "公司名称：本地演练智能科技有限公司\n"
+        "工作内容：参与 Python/FastAPI/RAG/Agent 应用开发，整理需求并完成接口与工具调用演示。\n"
+        "要求：了解 Python，愿意学习大模型应用开发。"
+    )
+    cursor = conn.execute(
+        """
+        INSERT INTO job_postings (
+            platform, source_url, title, company, city, salary_text, jd_text,
+            selected_resume_id, match_score, match_level, risk_level, recommendation,
+            status, analysis_source, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "Boss 直聘",
+            "https://www.zhipin.com/job_detail/local-demo.html",
+            "AI 应用开发实习生（本地演练）",
+            "本地演练智能科技有限公司",
+            "远程/本地演练",
+            "演练数据",
+            jd_text,
+            resume_id,
+            88,
+            "高匹配",
+            "低风险",
+            "可投递",
+            "演练",
+            "local_demo",
+            now,
+            now,
+        ),
+    )
+    job_id = int(cursor.lastrowid)
+    conversation_text = (
+        "HR：您好，这里是本地演练智能科技有限公司。\n"
+        "HR：我们在招 AI 应用开发实习生，可以了解工作内容和实习安排。"
+    )
+    capture_cursor = conn.execute(
+        """
+        INSERT INTO conversation_captures (
+            job_id, platform, source_url, page_title, raw_visible_text,
+            conversation_text, ignored_lines_json, message_type, summary,
+            action_required, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            job_id,
+            "Boss 直聘",
+            "https://www.zhipin.com/job_detail/local-demo.html",
+            "本地演练 HR 对话",
+            conversation_text,
+            conversation_text,
+            "[]",
+            "岗位沟通",
+            "本地演练 HR 询问是否了解 AI 应用开发实习安排。",
+            0,
+            now,
+        ),
+    )
+    capture_id = int(capture_cursor.lastrowid)
+    message = "您好，感谢回复。我对这个 AI 应用开发实习岗位比较感兴趣，想了解主要工作内容、技术栈和实习安排。"
+    draft_cursor = conn.execute(
+        """
+        INSERT INTO message_drafts (
+            capture_id, job_id, platform, draft_type, status,
+            communication_mode, followup_index, followup_limit,
+            reason, message, risk_flags_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            capture_id,
+            job_id,
+            "Boss 直聘",
+            "岗位沟通",
+            "待确认",
+            communication_policy()["mode"],
+            0,
+            0,
+            "本地演练草稿：用于验证自动回复 dry-run 链路，不来自真实 HR 对话。",
+            message,
+            "[]",
+            now,
+            now,
+        ),
+    )
+    draft_id = int(draft_cursor.lastrowid)
+    log_agent_action(
+        conn,
+        action_type="demo_draft_created",
+        status="已创建",
+        summary="已创建本地演练草稿，用于验证自动回复 dry-run 链路。",
+        platform="Boss 直聘",
+        job_id=job_id,
+        capture_id=capture_id,
+        draft_id=draft_id,
+        decision={
+            "local_demo": True,
+            "message_length": len(message),
+            "message_text_saved": True,
+            "real_platform_data": False,
+        },
+    )
+    return {"created": True, "draft_id": draft_id, "job_id": job_id}
+
+
 def apply_communication_policy(
     conn: Any,
     decision: dict[str, Any],
@@ -2962,6 +3154,7 @@ def communications_page(request: Request) -> Any:
             LIMIT 40
             """
         ).fetchall()
+        executor_status = communication_executor_page_status(conn)
     return templates.TemplateResponse(
         request,
         "communications.html",
@@ -2975,6 +3168,7 @@ def communications_page(request: Request) -> Any:
             "communication_policy": communication_policy(),
             "automation_control": automation_control(),
             "message_patrol_policy": message_patrol_policy(),
+            "executor_status": executor_status,
             "communication_mode_label": communication_mode_label,
             "action_logs": [{key: row[key] for key in row.keys()} for row in action_logs],
             "patrol_runs": [{key: row[key] for key in row.keys()} for row in patrol_runs],
@@ -3051,6 +3245,21 @@ async def update_message_draft(draft_id: int, request: Request) -> RedirectRespo
             },
         )
     return redirect_with_notice("/communications", "草稿已更新。", "success")
+
+
+@app.post("/communication-executor/demo-draft")
+async def communication_demo_draft_route(request: Request) -> RedirectResponse:
+    form = await request.form()
+    return_to = str(form.get("return_to") or "/communications")
+    if not return_to.startswith("/") or return_to.startswith("//"):
+        return_to = "/communications"
+    with connect() as conn:
+        result = create_demo_communication_draft(conn)
+    if result["created"]:
+        message = "已创建本地演练草稿，可直接执行 dry-run。"
+    else:
+        message = "已有本地演练草稿，可直接执行 dry-run。"
+    return redirect_with_notice(return_to, message, "success")
 
 
 @app.post("/communication-executor/dry-run")

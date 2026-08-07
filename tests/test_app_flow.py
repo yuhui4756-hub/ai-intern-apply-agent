@@ -751,6 +751,84 @@ def test_send_gate_blocks_low_match_job_draft(tmp_path, monkeypatch):
     assert "低匹配" in action_log["summary"]
 
 
+def test_communications_page_shows_executor_status_and_demo_button(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "communications-executor-status.sqlite3"))
+
+    from app import main
+    from app.db import init_db
+
+    init_db()
+    client = TestClient(main.app)
+
+    response = client.get("/communications")
+
+    assert response.status_code == 200
+    assert "自动回复执行器" in response.text
+    assert "待确认候选 0" in response.text
+    assert "创建本地演练草稿" in response.text
+    assert "暂无 dry-run 记录" in response.text
+
+
+def test_demo_draft_creates_pending_candidate_for_executor(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "communication-demo-draft.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db
+
+    init_db()
+    client = TestClient(main.app)
+
+    created = client.post("/communication-executor/demo-draft", data={"return_to": "/communications"}, follow_redirects=False)
+
+    assert created.status_code == 303
+    assert created.headers["location"].startswith("/communications")
+    with connect() as conn:
+        draft = conn.execute(
+            """
+            SELECT d.status, d.draft_type, d.message, d.reason, j.analysis_source, j.status AS job_status
+            FROM message_drafts d
+            LEFT JOIN job_postings j ON j.id = d.job_id
+            WHERE d.reason LIKE '%本地演练%'
+            ORDER BY d.id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        draft_count = conn.execute("SELECT COUNT(*) AS count FROM message_drafts WHERE reason LIKE '%本地演练%'").fetchone()["count"]
+        action_log = conn.execute("SELECT action_type, status, decision_json FROM agent_action_logs ORDER BY id DESC LIMIT 1").fetchone()
+    assert draft is not None
+    assert draft_count == 1
+    assert draft["status"] == "待确认"
+    assert draft["draft_type"] == "岗位沟通"
+    assert "主要工作内容" in draft["message"]
+    assert "本地演练" in draft["reason"]
+    assert draft["analysis_source"] == "local_demo"
+    assert draft["job_status"] == "演练"
+    assert action_log["action_type"] == "demo_draft_created"
+    assert action_log["status"] == "已创建"
+    assert '"real_platform_data": false' in action_log["decision_json"]
+
+    existing = client.post("/communication-executor/demo-draft", data={"return_to": "/communications"}, follow_redirects=False)
+    assert existing.status_code == 303
+    with connect() as conn:
+        draft_count = conn.execute("SELECT COUNT(*) AS count FROM message_drafts WHERE reason LIKE '%本地演练%'").fetchone()["count"]
+        action_log = conn.execute("SELECT action_type, status FROM agent_action_logs ORDER BY id DESC LIMIT 1").fetchone()
+    assert draft_count == 1
+    assert action_log["action_type"] == "demo_draft_created"
+    assert action_log["status"] == "已存在"
+
+    dry_run = client.post("/communication-executor/dry-run", data={"return_to": "/communications"}, follow_redirects=False)
+
+    assert dry_run.status_code == 303
+    with connect() as conn:
+        action_log = conn.execute("SELECT action_type, status, summary, decision_json FROM agent_action_logs ORDER BY id DESC LIMIT 1").fetchone()
+    assert action_log["action_type"] == "communication_executor_dry_run"
+    assert action_log["status"] == "演练完成"
+    assert "计划发送 1 条" in action_log["summary"]
+    assert '"candidate_count": 1' in action_log["decision_json"]
+    assert '"allowed_count": 1' in action_log["decision_json"]
+    assert '"blocked_count": 0' in action_log["decision_json"]
+
+
 def test_communication_executor_dry_run_plans_without_sending(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "communication-executor-dry-run.sqlite3"))
 

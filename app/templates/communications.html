@@ -59,13 +59,97 @@
       <h2>自动回复执行器</h2>
       <p class="muted">当前只支持 dry-run：扫描待确认草稿，执行发送闸门，生成计划、浏览器定位策略和日志，不会发送消息。</p>
     </div>
+    <span class="badge">{{ executor_status.preview.status }}</span>
   </div>
+  <div class="form-actions table-actions">
+    <span class="badge">待确认候选 {{ executor_status.pending_count }}</span>
+    <span class="badge">计划发送 {{ executor_status.allowed_count }}</span>
+    <span class="badge">闸门拦截 {{ executor_status.blocked_count }}</span>
+  </div>
+  <p class="muted">{{ executor_status.preview.note }}</p>
+  {% if executor_status.preview.plans %}
+  <details class="debug-details">
+    <summary>查看当前候选预览</summary>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>草稿</th>
+            <th>岗位</th>
+            <th>决策</th>
+            <th>闸门原因</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for plan in executor_status.preview.plans %}
+          <tr>
+            <td>#{{ plan.draft_id }}</td>
+            <td>
+              {{ (plan.company ~ " - " if plan.company else "") ~ (plan.job_title or "未匹配岗位") }}
+              <div class="muted">{{ plan.platform or "-" }}</div>
+            </td>
+            <td>{{ plan.decision }}</td>
+            <td>{{ plan.gate_reasons | join("；") if plan.gate_reasons else "-" }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </details>
+  {% endif %}
+  <form method="post" action="/communication-executor/demo-draft" class="form-actions table-actions">
+    <input type="hidden" name="return_to" value="/communications">
+    <button class="button" type="submit">创建本地演练草稿</button>
+    <span class="muted">没有真实 HR 对话时，用本地假数据验证执行器；不会发送消息。</span>
+  </form>
   <form method="post" action="/communication-executor/dry-run" class="form-actions">
     <input type="hidden" name="return_to" value="/communications">
     <button class="button primary" type="submit">执行 dry-run</button>
     <button class="button" type="submit" formaction="/communication-executor/browser-dry-run">生成浏览器定位策略</button>
     <button class="button" type="submit" formaction="/communication-executor/browser-probe-dry-run">探测当前 Edge 页面</button>
   </form>
+  {% if executor_status.latest %}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>最近结果</th>
+          <th>状态</th>
+          <th>计数</th>
+          <th>摘要</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for log in executor_status.latest %}
+        <tr>
+          <td>
+            {{ action_type_label(log.action_type) }}
+            <div class="muted">{{ log.created_at }}</div>
+          </td>
+          <td>{{ log.status or "-" }}</td>
+          <td>
+            <span class="badge">候选 {{ log.candidate_count }}</span>
+            <span class="badge">放行 {{ log.allowed_count }}</span>
+            <span class="badge">拦截 {{ log.blocked_count }}</span>
+            {% if log.browser_ready_count or log.browser_skipped_count %}
+            <span class="badge">可定位 {{ log.browser_ready_count }}</span>
+            <span class="badge">跳过 {{ log.browser_skipped_count }}</span>
+            {% endif %}
+            {% if log.page_count or log.probe_ready_count or log.probe_not_found_count %}
+            <span class="badge">页面 {{ log.page_count }}</span>
+            <span class="badge">探测可用 {{ log.probe_ready_count }}</span>
+            <span class="badge">未找到 {{ log.probe_not_found_count }}</span>
+            {% endif %}
+          </td>
+          <td>{{ log.summary or "-" }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">暂无 dry-run 记录。可以先创建本地演练草稿，再执行 dry-run。</p>
+  {% endif %}
 </section>
 
 <section class="panel">
