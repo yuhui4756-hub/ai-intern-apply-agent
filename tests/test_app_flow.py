@@ -109,6 +109,118 @@ def test_bulk_import_and_status_update_flow(tmp_path, monkeypatch):
     assert status == "待投递"
 
 
+def test_job_status_to_pending_interview_creates_preparation(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "job-status-interview-prep.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db
+
+    monkeypatch.setattr(main, "search_company", lambda *args, **kwargs: [])
+    init_db()
+    client = TestClient(main.app)
+
+    job_response = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "job",
+            "url": "https://www.zhipin.com/job_detail/interview-prep.html",
+            "title": "AI 应用开发实习生",
+            "text": "公司名称：杭州面试准备智能科技有限公司\nAI 应用开发实习生\n要求 Python、FastAPI、RAG。",
+        },
+    )
+    assert job_response.status_code == 200
+    job_id = job_response.json()["job_id"]
+
+    response = client.post(
+        f"/jobs/{job_id}/status",
+        data={"status": "待面试", "note": "已确认线上面试，重点准备 RAG 和 FastAPI。", "skip_reason": ""},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"].startswith(f"/jobs/{job_id}")
+    with connect() as conn:
+        job = conn.execute("SELECT status FROM job_postings WHERE id = ?", (job_id,)).fetchone()
+        prep = conn.execute(
+            "SELECT source_text, review_markdown FROM interview_preparations WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        prep_count = conn.execute("SELECT COUNT(*) AS count FROM interview_preparations WHERE job_id = ?", (job_id,)).fetchone()["count"]
+        event = conn.execute("SELECT event_type FROM application_events WHERE job_id = ? ORDER BY id DESC LIMIT 1", (job_id,)).fetchone()
+        action_log = conn.execute("SELECT action_type, status, decision_json FROM agent_action_logs ORDER BY id DESC LIMIT 1").fetchone()
+    assert job["status"] == "待面试"
+    assert prep_count == 1
+    assert "RAG 和 FastAPI" in prep["source_text"]
+    assert "AI 应用开发实习生 面试复盘" in prep["review_markdown"]
+    assert event["event_type"] == "面试准备自动生成"
+    assert action_log["action_type"] == "interview_prep_auto_create"
+    assert action_log["status"] == "已创建"
+    assert '"model_called": false' in action_log["decision_json"]
+
+    detail = client.get(f"/jobs/{job_id}")
+    assert detail.status_code == 200
+    assert "面试准备 #" in detail.text
+    assert "打开最新" in detail.text
+
+    repeated = client.post(
+        f"/jobs/{job_id}/status",
+        data={"status": "待面试", "note": "重复保存状态", "skip_reason": ""},
+        follow_redirects=False,
+    )
+
+    assert repeated.status_code == 303
+    with connect() as conn:
+        prep_count = conn.execute("SELECT COUNT(*) AS count FROM interview_preparations WHERE job_id = ?", (job_id,)).fetchone()["count"]
+        action_log = conn.execute("SELECT action_type, status FROM agent_action_logs ORDER BY id DESC LIMIT 1").fetchone()
+    assert prep_count == 1
+    assert action_log["action_type"] == "interview_prep_auto_create"
+    assert action_log["status"] == "已存在"
+
+
+def test_bulk_status_to_pending_interview_creates_preparation(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "bulk-interview-prep.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db
+
+    monkeypatch.setattr(main, "search_company", lambda *args, **kwargs: [])
+    init_db()
+    client = TestClient(main.app)
+
+    job_ids = []
+    for index in range(2):
+        response = client.post(
+            "/api/extension/capture",
+            json={
+                "capture_type": "job",
+                "url": f"https://www.zhipin.com/job_detail/bulk-interview-prep-{index}.html",
+                "title": "AI Agent 开发实习生",
+                "text": f"公司名称：杭州批量面试智能科技有限公司{index}\nAI Agent 开发实习生\n要求 Python、RAG、Agent。",
+            },
+        )
+        assert response.status_code == 200
+        job_ids.append(str(response.json()["job_id"]))
+
+    response = client.post(
+        "/jobs/bulk-status",
+        data={"job_ids": job_ids, "status": "待面试"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"].startswith("/jobs")
+    with connect() as conn:
+        prep_count = conn.execute("SELECT COUNT(*) AS count FROM interview_preparations").fetchone()["count"]
+        statuses = conn.execute("SELECT status FROM job_postings ORDER BY id").fetchall()
+        created_logs = conn.execute(
+            "SELECT COUNT(*) AS count FROM agent_action_logs WHERE action_type = ? AND status = ?",
+            ("interview_prep_auto_create", "已创建"),
+        ).fetchone()["count"]
+    assert prep_count == 2
+    assert [row["status"] for row in statuses] == ["待面试", "待面试"]
+    assert created_logs == 2
+
+
 def test_import_job_from_url_flow(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "url.sqlite3"))
 

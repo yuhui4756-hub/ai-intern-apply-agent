@@ -73,6 +73,7 @@ IGNORED_MESSAGE_FINGERPRINTS_KEY = "ignored_message_fingerprints"
 PATROL_SCHEDULER_POLL_SECONDS = 10
 MESSAGE_PATROL_OBSERVATION_LIMIT = 20
 COMMUNICATION_EXECUTOR_PLAN_LIMIT = 20
+INTERVIEW_PREP_TRIGGER_STATUSES = {"待面试", "面试准备中"}
 COMMUNICATION_MODES = [
     ("off", "关闭"),
     ("draft", "草稿模式"),
@@ -121,6 +122,7 @@ def action_type_label(value: str) -> str:
         "communication_browser_dry_run": "浏览器发送演练",
         "communication_browser_probe": "浏览器页面探测",
         "demo_draft_created": "演练草稿",
+        "interview_prep_auto_create": "面试准备",
     }.get(value or "", value or "-")
 
 
@@ -3755,6 +3757,75 @@ async def import_job_url(request: Request) -> RedirectResponse:
     return redirect_with_notice(f"/jobs/{job_id}", f"已通过{fetch_mode_label(fetched.fetch_mode)}导入并完成分析。", "success")
 
 
+def ensure_interview_preparation_for_job(
+    conn: Any,
+    job_id: int,
+    *,
+    trigger_type: str,
+    source_text: str = "",
+) -> dict[str, Any]:
+    existing = conn.execute(
+        "SELECT id FROM interview_preparations WHERE job_id = ? ORDER BY id DESC LIMIT 1",
+        (job_id,),
+    ).fetchone()
+    if existing:
+        interview_id = int(existing["id"])
+        log_agent_action(
+            conn,
+            action_type="interview_prep_auto_create",
+            status="已存在",
+            summary="该岗位已有面试准备记录，未重复创建。",
+            job_id=job_id,
+            decision={
+                "trigger_type": trigger_type,
+                "interview_id": interview_id,
+                "created": False,
+                "model_called": False,
+            },
+        )
+        return {"created": False, "interview_id": interview_id}
+
+    row = conn.execute("SELECT * FROM job_postings WHERE id = ?", (job_id,)).fetchone()
+    if not row:
+        return {"created": False, "interview_id": None, "error": "job_not_found"}
+
+    job = parse_json_fields({key: row[key] for key in row.keys()})
+    title = " - ".join(item for item in [job.get("company"), job.get("title")] if item) or f"岗位 {job_id}"
+    prep_source = (source_text or "").strip()
+    if not prep_source:
+        prep_source = f"{title} 已标记为待面试，自动生成本地面试准备材料。"
+    review = build_interview_review(job, prep_source)
+    now = utc_now()
+    cursor = conn.execute(
+        """
+        INSERT INTO interview_preparations (
+            job_id, source_text, prep_plan_json, question_bank_json,
+            review_markdown, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (job_id, prep_source, dumps(review["plan"]), dumps(review["questions"]), review["markdown"], now, now),
+    )
+    interview_id = int(cursor.lastrowid)
+    conn.execute(
+        "INSERT INTO application_events (job_id, event_type, content, created_at) VALUES (?, ?, ?, ?)",
+        (job_id, "面试准备自动生成", f"{title} 已生成本地面试准备记录。", now),
+    )
+    log_agent_action(
+        conn,
+        action_type="interview_prep_auto_create",
+        status="已创建",
+        summary="岗位进入待面试阶段，已生成本地面试准备记录。",
+        job_id=job_id,
+        decision={
+            "trigger_type": trigger_type,
+            "interview_id": interview_id,
+            "created": True,
+            "model_called": False,
+        },
+    )
+    return {"created": True, "interview_id": interview_id}
+
+
 @app.post("/jobs/bulk-status")
 async def bulk_update_jobs(request: Request) -> RedirectResponse:
     form = await request.form()
@@ -3787,7 +3858,18 @@ async def bulk_update_jobs(request: Request) -> RedirectResponse:
                 "INSERT INTO application_events (job_id, event_type, content, created_at) VALUES (?, ?, ?, ?)",
                 (row["id"], "批量状态更新", f"{title} 已标记为 {status}。", now),
             )
-    return redirect_with_notice("/jobs", f"已更新 {len(valid_ids)} 条岗位为「{status}」。", "success")
+        prep_results = []
+        if status in INTERVIEW_PREP_TRIGGER_STATUSES:
+            prep_results = [
+                ensure_interview_preparation_for_job(conn, int(row["id"]), trigger_type="bulk_status_update")
+                for row in rows
+            ]
+    message = f"已更新 {len(valid_ids)} 条岗位为「{status}」。"
+    if status in INTERVIEW_PREP_TRIGGER_STATUSES:
+        created_count = sum(1 for item in prep_results if item.get("created"))
+        existing_count = sum(1 for item in prep_results if item.get("interview_id") and not item.get("created"))
+        message += f" 已创建 {created_count} 条面试准备，已有 {existing_count} 条。"
+    return redirect_with_notice("/jobs", message, "success")
 
 
 @app.get("/jobs/{job_id}")
@@ -3796,6 +3878,10 @@ def job_detail(job_id: int, request: Request) -> Any:
         job = conn.execute("SELECT * FROM job_postings WHERE id = ?", (job_id,)).fetchone()
         research = conn.execute("SELECT * FROM company_research WHERE job_id = ? ORDER BY id", (job_id,)).fetchall()
         events = conn.execute("SELECT * FROM application_events WHERE job_id = ? ORDER BY id DESC", (job_id,)).fetchall()
+        interviews = conn.execute(
+            "SELECT id, created_at FROM interview_preparations WHERE job_id = ? ORDER BY created_at DESC, id DESC",
+            (job_id,),
+        ).fetchall()
     if not job:
         return redirect("/jobs")
     return templates.TemplateResponse(
@@ -3805,6 +3891,7 @@ def job_detail(job_id: int, request: Request) -> Any:
             "job": parse_json_fields({key: job[key] for key in job.keys()}),
             "research": [{key: row[key] for key in row.keys()} for row in research],
             "events": [{key: row[key] for key in row.keys()} for row in events],
+            "interviews": [{key: row[key] for key in row.keys()} for row in interviews],
             "analysis_source_label": analysis_source_label,
             "notice": request.query_params.get("notice", ""),
             "notice_type": request.query_params.get("notice_type", "info"),
@@ -3819,7 +3906,26 @@ async def update_job_status(job_id: int, request: Request) -> RedirectResponse:
     status = str(form.get("status") or "待确认")
     note = str(form.get("note") or "").strip()
     skip_reason = str(form.get("skip_reason") or "").strip()
+    allowed_statuses = {
+        "待确认",
+        "待投递",
+        "已投递",
+        "已沟通",
+        "面试邀请",
+        "待笔试",
+        "待面试",
+        "面试准备中",
+        "已面试",
+        "已拒绝",
+        "已通过",
+        "已归档",
+    }
+    if status not in allowed_statuses:
+        return redirect_with_notice(f"/jobs/{job_id}", "状态无效，未更新。", "error")
     with connect() as conn:
+        row = conn.execute("SELECT id FROM job_postings WHERE id = ?", (job_id,)).fetchone()
+        if not row:
+            return redirect_with_notice("/jobs", "没有找到这个岗位。", "error")
         conn.execute(
             "UPDATE job_postings SET status = ?, skip_reason = ?, updated_at = ? WHERE id = ?",
             (status, skip_reason, now, job_id),
@@ -3829,7 +3935,20 @@ async def update_job_status(job_id: int, request: Request) -> RedirectResponse:
                 "INSERT INTO application_events (job_id, event_type, content, created_at) VALUES (?, ?, ?, ?)",
                 (job_id, "状态更新", note, now),
             )
-    return redirect(f"/jobs/{job_id}")
+        prep_result = None
+        if status in INTERVIEW_PREP_TRIGGER_STATUSES:
+            prep_result = ensure_interview_preparation_for_job(
+                conn,
+                job_id,
+                trigger_type="status_update",
+                source_text=note,
+            )
+    if prep_result:
+        if prep_result.get("created"):
+            return redirect_with_notice(f"/jobs/{job_id}", "状态已保存，并已创建本地面试准备。", "success")
+        if prep_result.get("interview_id"):
+            return redirect_with_notice(f"/jobs/{job_id}", "状态已保存，该岗位已有面试准备。", "info")
+    return redirect_with_notice(f"/jobs/{job_id}", "状态已保存。", "success")
 
 
 @app.post("/jobs/{job_id}/reanalyze")

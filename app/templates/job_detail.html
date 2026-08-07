@@ -119,6 +119,40 @@
     </label>
     <button class="button primary" type="submit">保存状态</button>
   </form>
+  <div class="panel">
+    <div class="panel-title">
+      <h2>面试准备</h2>
+      {% if interviews %}
+      <a href="/interviews/{{ interviews[0].id }}">打开最新</a>
+      {% endif %}
+    </div>
+    {% if interviews %}
+    <p class="muted">该岗位已有 {{ interviews | length }} 条面试准备记录。</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>记录</th>
+            <th>创建时间</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for interview in interviews %}
+          <tr>
+            <td><a href="/interviews/{{ interview.id }}">面试准备 #{{ interview.id }}</a></td>
+            <td>{{ interview.created_at }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% elif job.status in ["面试邀请", "待面试", "面试准备中"] %}
+    <p class="muted">把状态保存为“待面试”或“面试准备中”后，会自动创建本地面试准备记录。</p>
+    <a class="button" href="/interviews">手动生成准备</a>
+    {% else %}
+    <p class="empty">收到并确认面试时间后，将状态改为“待面试”，这里会出现准备材料入口。</p>
+    {% endif %}
+  </div>
 </section>
 
 <section class="grid-two">
