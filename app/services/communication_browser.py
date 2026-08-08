@@ -120,6 +120,19 @@ PLATFORM_STRATEGIES: dict[str, dict[str, object]] = {
     },
 }
 
+FILL_BLOCKING_TEXT = (
+    "身份证",
+    "银行卡",
+    "培训费",
+    "押金",
+    "贷款",
+    "付费",
+    "扫码",
+    "上传简历",
+    "发简历",
+    "附件简历",
+)
+
 
 def build_browser_send_adapter_plan(execution_plan: dict[str, object]) -> dict[str, object]:
     plans = list(execution_plan.get("plans") or [])
@@ -450,6 +463,87 @@ def browser_plan_for_item(item: dict[str, object]) -> dict[str, object]:
             "真实发送必须由用户显式开启，并保留二次确认。",
         ],
     }
+
+
+def fill_message_in_controlled_edge(
+    browser_plan_item: dict[str, object],
+    message: str,
+    *,
+    browser_channel: str = "msedge",
+) -> dict[str, object]:
+    """Fill one verified chat input without clicking any platform control."""
+    if browser_plan_item.get("browser_action") != "dry_run_ready":
+        raise ValueError(str(browser_plan_item.get("reason") or "当前草稿不能进入浏览器填入流程。"))
+    if not str(message or "").strip():
+        raise ValueError("草稿内容为空，不能填入浏览器。")
+    if normalize_browser_channel(browser_channel) != "msedge":
+        raise ValueError("当前浏览器填入先支持 Microsoft Edge。")
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise ValueError("浏览器填入需要安装 Playwright：pip install playwright。") from exc
+
+    browser = None
+    try:
+        with sync_playwright() as playwright:
+            if not wait_for_debug_endpoint(timeout_seconds=3):
+                raise ValueError("没有检测到应用打开的 Edge 调试窗口，请先打开 Edge 巡检窗口并停留在对应 HR 对话页。")
+            browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{EDGE_DEBUG_PORT}", timeout=8000)
+            pages = [page for context in browser.contexts for page in context.pages if page.url and page.url != "about:blank"]
+            candidates = []
+            for page in pages:
+                snapshot = snapshot_page_for_browser_probe(page, {"browser_plans": [browser_plan_item]})
+                blocked_signals = find_fill_blocking_signals(snapshot)
+                probe = probe_browser_plan_against_snapshots(browser_plan_item, [snapshot])
+                if probe.get("probe_status") == "probe_ready" and not blocked_signals:
+                    candidates.append((int((probe.get("matched_page") or {}).get("page_match_score") or 0), page, probe))
+            if not candidates:
+                raise ValueError("未找到可安全填入的对应聊天页，请先完成只读探测并确认页面没有简历、联系方式或付费等敏感提示。")
+            _, page, probe = max(candidates, key=lambda item: item[0])
+            selector = fill_first_visible_message_input(page, browser_plan_item, message)
+            result = {
+                "status": "已填入",
+                "note": "已填入当前 Edge 聊天输入框，未点击发送。",
+                "filled_selector": selector,
+                "matched_page": probe.get("matched_page") or {},
+                "message_filled": True,
+                "browser_clicked": False,
+                "message_text_saved": False,
+            }
+            browser.close()
+            browser = None
+            return result
+    except ValueError:
+        raise
+    except Exception as exc:
+        message_text = str(exc).strip() or exc.__class__.__name__
+        raise ValueError(f"无法填入当前 Edge 聊天输入框：{message_text[:180]}。") from exc
+    finally:
+        if browser is not None:
+            browser.close()
+
+
+def find_fill_blocking_signals(snapshot: dict[str, object]) -> list[str]:
+    text = str(snapshot.get("normalized_text") or "")
+    return [signal for signal in FILL_BLOCKING_TEXT if normalize_probe_text(signal) in text]
+
+
+def fill_first_visible_message_input(page, browser_plan_item: dict[str, object], message: str) -> str:
+    candidates = browser_plan_item.get("selector_candidates")
+    selectors = candidates.get("message_input") if isinstance(candidates, dict) else []
+    for selector in selectors if isinstance(selectors, list) else []:
+        locator = page.locator(str(selector))
+        count = min(int(locator.count()), 20)
+        for index in range(count):
+            field = locator.nth(index)
+            try:
+                if not field.is_visible(timeout=500) or not field.is_enabled(timeout=500):
+                    continue
+                field.fill(message, timeout=5000)
+                return str(selector)
+            except Exception:
+                continue
+    raise ValueError("已确认聊天页，但未能向任何可见输入框填入草稿。")
 
 
 def url_host(url: str) -> str:

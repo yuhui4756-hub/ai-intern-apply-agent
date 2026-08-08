@@ -289,6 +289,13 @@ textarea {
   min-width: 96px;
 }
 
+.browser-confirmation {
+  width: 128px;
+  min-width: 128px;
+  padding: 5px 8px;
+  font-size: 13px;
+}
+
 .table-actions {
   flex-wrap: wrap;
 }

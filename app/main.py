@@ -30,7 +30,11 @@ from .services.analyzer import (
 )
 from .services.browser_patrol import capture_browser_patrol_observations, open_message_patrol_browser
 from .services.application_browser import build_application_browser_plan, probe_application_browser_plan
-from .services.communication_browser import build_browser_send_adapter_plan, probe_browser_send_adapter_plan
+from .services.communication_browser import (
+    build_browser_send_adapter_plan,
+    fill_message_in_controlled_edge,
+    probe_browser_send_adapter_plan,
+)
 from .services.conversation import classify_conversation, prepare_conversation_text
 from .services.github_projects import (
     GitHubProjectError,
@@ -136,6 +140,7 @@ def action_type_label(value: str) -> str:
         "communication_executor_dry_run": "自动回复演练",
         "communication_browser_dry_run": "浏览器发送演练",
         "communication_browser_probe": "浏览器页面探测",
+        "communication_browser_fill": "浏览器填入草稿",
         "demo_draft_created": "演练草稿",
         "interview_prep_auto_create": "面试准备",
         "interview_feedback_update": "面试反馈",
@@ -1810,6 +1815,136 @@ def run_communication_browser_probe_dry_run(trigger_type: str = "manual_browser"
     return probe_plan
 
 
+def run_communication_browser_fill(draft_id: int, message: str) -> dict[str, Any]:
+    message = str(message or "").strip()
+    policy = communication_policy()
+    control = automation_control()
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT
+                d.*,
+                j.title AS job_title,
+                j.company AS company,
+                j.source_url AS job_source_url,
+                j.status AS job_status,
+                j.recommendation AS job_recommendation,
+                j.match_level AS job_match_level,
+                c.message_type AS capture_message_type,
+                c.source_url AS capture_source_url
+            FROM message_drafts d
+            LEFT JOIN job_postings j ON j.id = d.job_id
+            LEFT JOIN conversation_captures c ON c.id = d.capture_id
+            WHERE d.id = ?
+            """,
+            (draft_id,),
+        ).fetchone()
+        if not row:
+            return {"status": "已阻止", "note": "没有找到这条沟通草稿。", "draft_id": draft_id, "message_filled": False}
+        if policy["mode"] == "off":
+            result = {"status": "已阻止", "note": "沟通模式为关闭，不能填入浏览器。", "draft_id": draft_id, "message_filled": False}
+        elif control["paused"]:
+            result = {"status": "已阻止", "note": "自动化已暂停，恢复后才能填入浏览器。", "draft_id": draft_id, "message_filled": False}
+        else:
+            gate = evaluate_draft_send_gate(conn, row, message)
+            plan_item = {
+                "draft_id": int(row["id"]),
+                "job_id": int(row["job_id"]) if row["job_id"] else None,
+                "platform": str(row["platform"] or ""),
+                "company": str(row["company"] or ""),
+                "job_title": str(row["job_title"] or ""),
+                "source_url": str(row["capture_source_url"] or row["job_source_url"] or ""),
+                "draft_type": str(row["draft_type"] or ""),
+                "communication_mode": str(row["communication_mode"] or policy["mode"]),
+                "followup_index": int(row["followup_index"] or 0),
+                "followup_limit": int(row["followup_limit"] or 0),
+                "message_length": len(message),
+                "gate_allowed": bool(gate["allowed"]),
+                "gate_reasons": gate["reasons"],
+                "job_status": str(row["job_status"] or ""),
+                "job_recommendation": str(row["job_recommendation"] or ""),
+                "job_match_level": str(row["job_match_level"] or ""),
+                "capture_message_type": str(row["capture_message_type"] or ""),
+            }
+            browser_plan = build_browser_send_adapter_plan(
+                {
+                    "ok": True,
+                    "dry_run": True,
+                    "trigger_type": "manual_fill",
+                    "status": "演练完成",
+                    "note": "单条草稿浏览器填入准备。",
+                    "policy_mode": policy["mode"],
+                    "candidate_count": 1,
+                    "allowed_count": 1 if gate["allowed"] else 0,
+                    "blocked_count": 0 if gate["allowed"] else 1,
+                    "plans": [plan_item],
+                }
+            )["browser_plans"][0]
+            if not gate["allowed"]:
+                result = {
+                    "status": "已阻止",
+                    "note": "发送闸门拦截：" + "；".join(gate["reasons"]),
+                    "draft_id": draft_id,
+                    "gate": gate,
+                    "browser_plan": browser_plan,
+                    "message_filled": False,
+                }
+            else:
+                result = {"status": "待填入", "draft_id": draft_id, "gate": gate, "browser_plan": browser_plan, "message_filled": False}
+
+        if result["status"] == "已阻止":
+            log_agent_action(
+                conn,
+                action_type="communication_browser_fill",
+                status="已阻止",
+                summary=str(result["note"])[:500],
+                platform=str(row["platform"] or ""),
+                job_id=int(row["job_id"]) if row["job_id"] else None,
+                capture_id=int(row["capture_id"]) if row["capture_id"] else None,
+                draft_id=draft_id,
+                decision={
+                    "message_filled": False,
+                    "browser_clicked": False,
+                    "message_text_saved": False,
+                    "gate": result.get("gate") or {"checked": False},
+                },
+            )
+            return result
+
+    try:
+        browser_result = fill_message_in_controlled_edge(result["browser_plan"], message)
+        result = {**result, **browser_result}
+    except ValueError as exc:
+        result = {**result, "status": "未填入", "note": str(exc)[:500], "message_filled": False, "browser_clicked": False}
+
+    with connect() as conn:
+        current = conn.execute("SELECT * FROM message_drafts WHERE id = ?", (draft_id,)).fetchone()
+        if not current:
+            return {**result, "status": "未填入", "note": "草稿已不存在，未保留浏览器填入结果。", "message_filled": False}
+        if result["status"] == "已填入":
+            conn.execute("UPDATE message_drafts SET message = ?, updated_at = ? WHERE id = ?", (message, utc_now(), draft_id))
+        log_agent_action(
+            conn,
+            action_type="communication_browser_fill",
+            status=str(result["status"]),
+            summary=str(result.get("note") or "浏览器草稿填入完成。")[:500],
+            platform=str(current["platform"] or ""),
+            job_id=int(current["job_id"]) if current["job_id"] else None,
+            capture_id=int(current["capture_id"]) if current["capture_id"] else None,
+            draft_id=draft_id,
+            decision={
+                "message_filled": bool(result.get("message_filled")),
+                "browser_clicked": False,
+                "message_text_saved": False,
+                "filled_selector": str(result.get("filled_selector") or ""),
+                "matched_page": result.get("matched_page") or {},
+                "gate": result.get("gate") or {"checked": True},
+            },
+            error_message=str(result.get("note") or "") if result["status"] != "已填入" else "",
+        )
+    return result
+
+
 def communication_executor_page_status(conn: Any) -> dict[str, Any]:
     preview = build_communication_execution_plan(conn, trigger_type="page_preview")
     latest_rows = conn.execute(
@@ -1819,7 +1954,8 @@ def communication_executor_page_status(conn: Any) -> dict[str, Any]:
         WHERE action_type IN (
             'communication_executor_dry_run',
             'communication_browser_dry_run',
-            'communication_browser_probe'
+            'communication_browser_probe',
+            'communication_browser_fill'
         )
         ORDER BY id DESC
         LIMIT 3
@@ -3575,6 +3711,18 @@ async def update_message_draft(draft_id: int, request: Request) -> RedirectRespo
             },
         )
     return redirect_with_notice("/communications", "草稿已更新。", "success")
+
+
+@app.post("/message-drafts/{draft_id}/browser-fill")
+async def fill_message_draft_in_browser(draft_id: int, request: Request) -> RedirectResponse:
+    form = await request.form()
+    confirmation = str(form.get("confirmation") or "").strip()
+    if confirmation != "填入草稿":
+        return redirect_with_notice("/communications", "请在确认框中输入“填入草稿”后再执行。", "error")
+    message = str(form.get("message") or "").strip()
+    result = await run_in_threadpool(run_communication_browser_fill, draft_id, message)
+    notice_type = "success" if result.get("status") == "已填入" else "error"
+    return redirect_with_notice("/communications", f"浏览器填入：{result.get('note') or result.get('status')}", notice_type)
 
 
 @app.post("/communication-executor/demo-draft")

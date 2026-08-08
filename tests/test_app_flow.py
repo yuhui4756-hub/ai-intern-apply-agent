@@ -1817,6 +1817,93 @@ def test_communication_browser_probe_route_logs_dry_run_without_sending(tmp_path
     assert "主要工作内容" not in action_log["decision_json"]
 
 
+def test_communication_browser_fill_requires_confirmation_and_never_sends(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "communication-browser-fill.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db
+
+    monkeypatch.setattr(main, "search_company", lambda *args, **kwargs: [])
+    init_db()
+    client = TestClient(main.app)
+
+    job_response = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "job",
+            "url": "https://www.zhipin.com/job_detail/browser-fill.html",
+            "platform": "Boss 直聘",
+            "title": "AI 应用开发实习生",
+            "text": "公司名称：深圳填入智能科技有限公司\nAI 应用开发实习生\n要求 Python、FastAPI、RAG。",
+        },
+    )
+    assert job_response.status_code == 200
+    captured = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "conversation",
+            "url": "https://www.zhipin.com/job_detail/browser-fill.html",
+            "platform": "Boss 直聘",
+            "title": "深圳填入智能科技有限公司 HR 对话",
+            "text": "HR：可以的，你想了解工作内容还是实习周期？",
+        },
+    )
+    draft_id = captured.json()["draft_id"]
+    calls = []
+
+    def fake_fill(browser_plan, message):
+        calls.append({"plan": browser_plan, "message": message})
+        return {
+            "status": "已填入",
+            "note": "已填入当前 Edge 聊天输入框，未点击发送。",
+            "filled_selector": "textarea",
+            "matched_page": {"host": "www.zhipin.com", "text_digest": "sha256:test|len:80"},
+            "message_filled": True,
+            "browser_clicked": False,
+            "message_text_saved": False,
+        }
+
+    monkeypatch.setattr(main, "fill_message_in_controlled_edge", fake_fill)
+    rejected = client.post(
+        f"/message-drafts/{draft_id}/browser-fill",
+        data={"confirmation": "确认", "message": "您好，想请问岗位主要工作内容是什么？"},
+        follow_redirects=False,
+    )
+    assert rejected.status_code == 303
+    assert not calls
+
+    response = client.post(
+        f"/message-drafts/{draft_id}/browser-fill",
+        data={"confirmation": "填入草稿", "message": "您好，想请问岗位主要工作内容是什么？"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert response.headers["location"].startswith("/communications")
+    assert len(calls) == 1
+    assert calls[0]["plan"]["browser_action"] == "dry_run_ready"
+    assert calls[0]["message"] == "您好，想请问岗位主要工作内容是什么？"
+    with connect() as conn:
+        draft = conn.execute("SELECT status, message FROM message_drafts WHERE id = ?", (draft_id,)).fetchone()
+        action_log = conn.execute("SELECT action_type, status, decision_json FROM agent_action_logs ORDER BY id DESC LIMIT 1").fetchone()
+    assert draft["status"] == "待确认"
+    assert draft["message"] == "您好，想请问岗位主要工作内容是什么？"
+    assert action_log["action_type"] == "communication_browser_fill"
+    assert action_log["status"] == "已填入"
+    assert '"message_filled": true' in action_log["decision_json"]
+    assert '"browser_clicked": false' in action_log["decision_json"]
+    assert "岗位主要工作内容" not in action_log["decision_json"]
+
+
+def test_communication_browser_fill_blocks_sensitive_page_signals():
+    from app.services.communication_browser import find_fill_blocking_signals, normalize_probe_text
+
+    signals = find_fill_blocking_signals(
+        {"normalized_text": normalize_probe_text("HR：请先上传简历，不需要缴纳培训费或押金。")}
+    )
+
+    assert signals == ["培训费", "押金", "上传简历"]
+
+
 def test_conversation_capture_stores_cleaning_debug_and_feedback(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "conversation-feedback.sqlite3"))
 

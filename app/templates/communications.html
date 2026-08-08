@@ -247,7 +247,7 @@
 <section class="panel">
   <div class="panel-title">
     <h2>待发送队列</h2>
-    <span class="muted">只生成草稿，不自动发送。</span>
+    <span class="muted">填入 Edge 后仍不自动发送。</span>
   </div>
   {% if drafts %}
   <div class="table-wrap">
@@ -295,6 +295,8 @@
               <div class="form-actions table-actions">
                 <button class="button compact copy-button" type="button" data-copy-target="draft-{{ draft.id }}">复制</button>
                 {% if draft.status == "待确认" %}
+                <input class="browser-confirmation" name="confirmation" placeholder="输入 填入草稿" aria-label="浏览器填入确认">
+                <button class="button compact" type="submit" formaction="/message-drafts/{{ draft.id }}/browser-fill">填入 Edge</button>
                 <button class="button compact primary" type="submit" name="status" value="已发送">标记已发送</button>
                 {% endif %}
                 <button class="button compact" type="submit" name="status" value="待确认">保存编辑</button>
