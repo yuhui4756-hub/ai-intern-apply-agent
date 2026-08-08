@@ -7,6 +7,7 @@
   --accent: #1f7a6d;
   --accent-dark: #155c52;
   --warn: #a15c15;
+  --danger: #a7382b;
   --radius: 8px;
 }
 
@@ -255,6 +256,18 @@ textarea {
 
 .button.primary:hover {
   background: var(--accent-dark);
+}
+
+.button.danger {
+  color: var(--danger);
+  border-color: #dfb8b2;
+  background: #fff7f5;
+}
+
+.button.danger:hover {
+  color: #fff;
+  border-color: var(--danger);
+  background: var(--danger);
 }
 
 .form-actions {

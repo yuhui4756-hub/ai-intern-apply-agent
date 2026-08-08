@@ -665,6 +665,8 @@ def test_interview_recording_upload_and_local_transcription_refreshes_review(tmp
     assert recording["file_name"] == "mock-interview.wav"
     assert recording["status"] == "待转写"
     assert Path(recording["file_path"]).exists()
+    recording_id = int(recording["id"])
+    recording_path = Path(recording["file_path"])
 
     monkeypatch.setattr(
         main,
@@ -672,14 +674,14 @@ def test_interview_recording_upload_and_local_transcription_refreshes_review(tmp
         lambda _path, _model: {"transcript": "问：RAG 召回不准时怎么排查？\n答：先检查切分、召回、重排与评测。", "language": "zh"},
     )
     transcribed = client.post(
-        f"/interview-recordings/{recording['id']}/transcribe",
+        f"/interview-recordings/{recording_id}/transcribe",
         data={"model_size": "base"},
         follow_redirects=False,
     )
     assert transcribed.status_code == 303
     with connect() as conn:
         recording = conn.execute(
-            "SELECT status, model_size, language, transcript FROM interview_recordings WHERE id = ?", (recording["id"],)
+            "SELECT status, model_size, language, transcript FROM interview_recordings WHERE id = ?", (recording_id,)
         ).fetchone()
         review = conn.execute(
             "SELECT source_text, question_bank_json FROM interview_preparations WHERE id = ?", (review_id,)
@@ -696,6 +698,19 @@ def test_interview_recording_upload_and_local_transcription_refreshes_review(tmp
     assert '"stored_locally": true' in log["decision_json"]
     assert '"local_asr_called": true' in log["decision_json"]
     assert '"llm_called": false' in log["decision_json"]
+
+    deleted = client.post(f"/interview-recordings/{recording_id}/delete", follow_redirects=False)
+    assert deleted.status_code == 303
+    with connect() as conn:
+        removed = conn.execute("SELECT id FROM interview_recordings WHERE id = ?", (recording_id,)).fetchone()
+        review = conn.execute("SELECT source_text FROM interview_preparations WHERE id = ?", (review_id,)).fetchone()
+        log = conn.execute("SELECT action_type, status, decision_json FROM agent_action_logs ORDER BY id DESC LIMIT 1").fetchone()
+    assert removed is None
+    assert not recording_path.exists()
+    assert "录音转写" not in review["source_text"]
+    assert log["action_type"] == "interview_recording"
+    assert log["status"] == "已删除"
+    assert '"removed_transcript": true' in log["decision_json"]
 
 
 def test_import_job_from_url_flow(tmp_path, monkeypatch):

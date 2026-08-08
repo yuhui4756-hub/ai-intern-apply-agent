@@ -5099,6 +5099,67 @@ async def transcribe_interview_recording(recording_id: int, request: Request) ->
     return redirect_with_notice(f"/interviews/{review_id}", "本地转写完成，已刷新面试准备和题库。", "success")
 
 
+@app.post("/interview-recordings/{recording_id}/delete")
+async def delete_interview_recording(recording_id: int) -> RedirectResponse:
+    with connect() as conn:
+        recording = conn.execute("SELECT * FROM interview_recordings WHERE id = ?", (recording_id,)).fetchone()
+        if not recording:
+            return redirect_with_notice("/interviews", "没有找到这条录音。", "error")
+        review_id = int(recording["interview_preparation_id"])
+        review_row = conn.execute(
+            """
+            SELECT i.*, j.title AS job_title, j.company AS company
+            FROM interview_preparations i
+            LEFT JOIN job_postings j ON j.id = i.job_id
+            WHERE i.id = ?
+            """,
+            (review_id,),
+        ).fetchone()
+        if not review_row:
+            return redirect_with_notice("/interviews", "没有找到关联的面试准备。", "error")
+        review = {key: review_row[key] for key in review_row.keys()}
+        transcript = str(recording["transcript"] or "").strip()
+        source_text = str(review.get("source_text") or "")
+        if transcript:
+            section = f"【录音转写：{recording['file_name']}】\n{transcript}"
+            source_text = source_text.replace(section, "", 1)
+            source_text = re.sub(r"\n{3,}", "\n\n", source_text).strip()
+            job = parse_json_fields(review) if review.get("job_id") else None
+            refreshed = build_interview_review(job, source_text)
+            conn.execute(
+                """
+                UPDATE interview_preparations
+                SET source_text = ?, prep_plan_json = ?, question_bank_json = ?, review_markdown = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (source_text, dumps(refreshed["plan"]), dumps(refreshed["questions"]), refreshed["markdown"], utc_now(), review_id),
+            )
+        conn.execute("DELETE FROM interview_recordings WHERE id = ?", (recording_id,))
+        job_id = int(review["job_id"]) if review["job_id"] else None
+        log_agent_action(
+            conn,
+            action_type="interview_recording",
+            status="已删除",
+            summary=f"已删除本地面试录音和转写：{recording['file_name']}",
+            job_id=job_id,
+            decision={
+                "recording_id": recording_id,
+                "removed_transcript": bool(transcript),
+                "stored_locally": True,
+                "llm_called": False,
+            },
+        )
+
+    stored_path = Path(str(recording["file_path"] or "")).resolve()
+    base_dir = recordings_dir()
+    if base_dir in stored_path.parents:
+        try:
+            stored_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return redirect_with_notice(f"/interviews/{review_id}", "已删除本地录音及其转写内容。", "success")
+
+
 @app.post("/interviews/{review_id}/feedback")
 async def create_interview_feedback(review_id: int, request: Request) -> RedirectResponse:
     form = await request.form()

@@ -160,7 +160,7 @@
   {% if recordings %}
   <div class="table-wrap">
     <table>
-      <thead><tr><th>文件</th><th>状态</th><th>本地转写</th><th>结果</th></tr></thead>
+      <thead><tr><th>文件</th><th>状态</th><th>本地转写</th><th>结果</th><th>操作</th></tr></thead>
       <tbody>
         {% for item in recordings %}
         <tr>
@@ -184,6 +184,11 @@
             {% if item.transcript %}
             <details class="debug-details"><summary>查看转写</summary><pre class="pre compact-pre">{{ item.transcript }}</pre></details>
             {% else %}-{% endif %}
+          </td>
+          <td>
+            <form method="post" action="/interview-recordings/{{ item.id }}/delete" class="inline-form">
+              <button class="button compact danger" type="submit" onclick="return confirm('删除本地录音及转写内容？')">删除</button>
+            </form>
           </td>
         </tr>
         {% endfor %}
