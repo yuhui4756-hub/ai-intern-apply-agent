@@ -638,6 +638,66 @@ def test_application_browser_dry_run_requires_confirmation_and_never_fills(tmp_p
     assert '"resume_uploaded": false' in log["decision_json"]
 
 
+def test_interview_recording_upload_and_local_transcription_refreshes_review(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "interview-recording.sqlite3"))
+    monkeypatch.setenv("APP_RECORDINGS_DIR", str(tmp_path / "recordings"))
+
+    from app import main
+    from app.db import connect, init_db
+
+    init_db()
+    client = TestClient(main.app)
+    created = client.post("/interviews", data={"job_id": "", "source_text": ""}, follow_redirects=False)
+    assert created.status_code == 303
+    review_id = int(created.headers["location"].rstrip("/").split("/")[-1])
+
+    uploaded = client.post(
+        f"/interviews/{review_id}/recordings",
+        files={"recording": ("mock-interview.wav", b"RIFFmock-audio", "audio/wav")},
+        follow_redirects=False,
+    )
+    assert uploaded.status_code == 303
+    with connect() as conn:
+        recording = conn.execute(
+            "SELECT id, file_name, file_path, status FROM interview_recordings WHERE interview_preparation_id = ?",
+            (review_id,),
+        ).fetchone()
+    assert recording["file_name"] == "mock-interview.wav"
+    assert recording["status"] == "待转写"
+    assert Path(recording["file_path"]).exists()
+
+    monkeypatch.setattr(
+        main,
+        "transcribe_recording",
+        lambda _path, _model: {"transcript": "问：RAG 召回不准时怎么排查？\n答：先检查切分、召回、重排与评测。", "language": "zh"},
+    )
+    transcribed = client.post(
+        f"/interview-recordings/{recording['id']}/transcribe",
+        data={"model_size": "base"},
+        follow_redirects=False,
+    )
+    assert transcribed.status_code == 303
+    with connect() as conn:
+        recording = conn.execute(
+            "SELECT status, model_size, language, transcript FROM interview_recordings WHERE id = ?", (recording["id"],)
+        ).fetchone()
+        review = conn.execute(
+            "SELECT source_text, question_bank_json FROM interview_preparations WHERE id = ?", (review_id,)
+        ).fetchone()
+        log = conn.execute("SELECT action_type, status, decision_json FROM agent_action_logs ORDER BY id DESC LIMIT 1").fetchone()
+    assert recording["status"] == "已转写"
+    assert recording["model_size"] == "base"
+    assert recording["language"] == "zh"
+    assert "切分、召回、重排" in recording["transcript"]
+    assert "录音转写" in review["source_text"]
+    assert "RAG 召回不准" in review["question_bank_json"]
+    assert log["action_type"] == "interview_recording"
+    assert log["status"] == "已转写"
+    assert '"stored_locally": true' in log["decision_json"]
+    assert '"local_asr_called": true' in log["decision_json"]
+    assert '"llm_called": false' in log["decision_json"]
+
+
 def test_import_job_from_url_flow(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "url.sqlite3"))
 

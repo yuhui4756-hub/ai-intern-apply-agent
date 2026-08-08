@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import os
 import re
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -16,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.concurrency import run_in_threadpool
 
-from .config import ROOT_DIR, TASK_TYPES, looks_masked, mask_secret, set_env_value, suggest_api_key_env
+from .config import ROOT_DIR, TASK_TYPES, looks_masked, mask_secret, recordings_dir, set_env_value, suggest_api_key_env
 from .db import connect, dumps, get_setting, init_db, loads, set_setting, utc_now
 from .services.analyzer import (
     build_interview_review,
@@ -52,6 +53,7 @@ from .services.job_searcher import (
 from .services.llm import OpenAICompatibleClient, client_for_task
 from .services.research import search_company
 from .services.resume import read_resume_text
+from .services.transcription import ALLOWED_RECORDING_EXTENSIONS, TRANSCRIPTION_MODELS, transcribe_recording
 
 
 @asynccontextmanager
@@ -138,6 +140,7 @@ def action_type_label(value: str) -> str:
         "interview_prep_auto_create": "面试准备",
         "interview_feedback_update": "面试反馈",
         "interview_practice": "模拟面试",
+        "interview_recording": "面试录音",
         "application_preparation": "投递准备",
         "application_browser_open": "投递页面打开",
         "application_browser_probe": "投递页面演练",
@@ -4730,6 +4733,10 @@ def interview_detail(review_id: int, request: Request) -> Any:
             """,
             (review_id,),
         ).fetchall()
+        recordings = conn.execute(
+            "SELECT * FROM interview_recordings WHERE interview_preparation_id = ? ORDER BY created_at DESC, id DESC",
+            (review_id,),
+        ).fetchall()
     if not row:
         return redirect("/interviews")
     review = {key: row[key] for key in row.keys()}
@@ -4757,6 +4764,8 @@ def interview_detail(review_id: int, request: Request) -> Any:
             "feedback_rows": [{key: item[key] for key in item.keys()} for item in feedback_rows],
             "job_feedback": job_feedback,
             "feedback_statuses": INTERVIEW_FEEDBACK_STATUSES,
+            "recordings": [{key: item[key] for key in item.keys()} for item in recordings],
+            "transcription_models": TRANSCRIPTION_MODELS,
             "notice": request.query_params.get("notice", ""),
             "notice_type": request.query_params.get("notice_type", "info"),
         },
@@ -4930,6 +4939,164 @@ async def save_interview_practice_attempt(review_id: int, request: Request) -> R
     elif outcome == "答得不错" and feedback_id:
         message += " 对应薄弱点已标记为已补强。"
     return redirect_with_notice(f"/interviews/{review_id}/practice?question={next_index}", message, "success")
+
+
+@app.post("/interviews/{review_id}/recordings")
+async def upload_interview_recording(review_id: int, request: Request) -> RedirectResponse:
+    form = await request.form()
+    recording = form.get("recording")
+    if not recording or not getattr(recording, "filename", "") or not hasattr(recording, "read"):
+        return redirect_with_notice(f"/interviews/{review_id}", "请选择一个录音文件。", "error")
+    suffix = Path(recording.filename).suffix.lower()
+    if suffix not in ALLOWED_RECORDING_EXTENSIONS:
+        return redirect_with_notice(f"/interviews/{review_id}", "仅支持 mp3、m4a、wav、mp4、aac、flac、ogg 格式。", "error")
+    try:
+        recording.file.seek(0, 2)
+        size = recording.file.tell()
+        recording.file.seek(0)
+    except Exception:
+        size = 0
+    if size > 250 * 1024 * 1024:
+        return redirect_with_notice(f"/interviews/{review_id}", "录音文件不能超过 250MB。", "error")
+
+    with connect() as conn:
+        review = conn.execute("SELECT id, job_id FROM interview_preparations WHERE id = ?", (review_id,)).fetchone()
+    if not review:
+        return redirect_with_notice("/interviews", "没有找到这条面试准备记录。", "error")
+
+    original_name = Path(recording.filename).name[:180]
+    stored_path = recordings_dir() / f"{uuid.uuid4().hex}{suffix}"
+    try:
+        with stored_path.open("wb") as output:
+            while chunk := await recording.read(1024 * 1024):
+                output.write(chunk)
+    finally:
+        await recording.close()
+
+    now = utc_now()
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO interview_recordings (
+                interview_preparation_id, file_name, file_path, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (review_id, original_name, str(stored_path), "待转写", now, now),
+        )
+        recording_id = int(cursor.lastrowid)
+        job_id = int(review["job_id"]) if review["job_id"] else None
+        if job_id:
+            conn.execute(
+                "INSERT INTO application_events (job_id, event_type, content, created_at) VALUES (?, ?, ?, ?)",
+                (job_id, "面试录音上传", f"已保存本地录音：{original_name}", now),
+            )
+        log_agent_action(
+            conn,
+            action_type="interview_recording",
+            status="待转写",
+            summary=f"已保存本地面试录音：{original_name}",
+            job_id=job_id,
+            decision={"recording_id": recording_id, "stored_locally": True, "model_called": False},
+        )
+    return redirect_with_notice(f"/interviews/{review_id}", "录音已保存到本地，可以开始转写。", "success")
+
+
+@app.post("/interview-recordings/{recording_id}/transcribe")
+async def transcribe_interview_recording(recording_id: int, request: Request) -> RedirectResponse:
+    form = await request.form()
+    model_size = str(form.get("model_size") or "base").strip()
+    if model_size not in TRANSCRIPTION_MODELS:
+        return redirect_with_notice("/interviews", "转写模型无效。", "error")
+    with connect() as conn:
+        recording = conn.execute("SELECT * FROM interview_recordings WHERE id = ?", (recording_id,)).fetchone()
+        if not recording:
+            return redirect_with_notice("/interviews", "没有找到这条录音。", "error")
+        review_id = int(recording["interview_preparation_id"])
+        if recording["status"] == "已转写":
+            return redirect_with_notice(f"/interviews/{review_id}", "这条录音已经转写完成。", "info")
+        conn.execute(
+            "UPDATE interview_recordings SET status = ?, model_size = ?, error_message = '', updated_at = ? WHERE id = ?",
+            ("转写中", model_size, utc_now(), recording_id),
+        )
+
+    try:
+        transcription = await run_in_threadpool(transcribe_recording, str(recording["file_path"]), model_size)
+    except ValueError as exc:
+        error_message = str(exc)[:1000]
+        with connect() as conn:
+            conn.execute(
+                "UPDATE interview_recordings SET status = ?, error_message = ?, updated_at = ? WHERE id = ?",
+                ("转写失败", error_message, utc_now(), recording_id),
+            )
+            log_agent_action(
+                conn,
+                action_type="interview_recording",
+                status="转写失败",
+                summary=error_message[:200],
+                decision={"recording_id": recording_id, "model_size": model_size, "model_called": False},
+            )
+        return redirect_with_notice(f"/interviews/{review_id}", error_message, "error")
+
+    transcript = str(transcription["transcript"])
+    language = str(transcription.get("language") or "zh")
+    now = utc_now()
+    with connect() as conn:
+        review_row = conn.execute(
+            """
+            SELECT i.*, j.title AS job_title, j.company AS company
+            FROM interview_preparations i
+            LEFT JOIN job_postings j ON j.id = i.job_id
+            WHERE i.id = ?
+            """,
+            (review_id,),
+        ).fetchone()
+        if not review_row:
+            return redirect_with_notice("/interviews", "没有找到关联的面试准备。", "error")
+        review = {key: review_row[key] for key in review_row.keys()}
+        job = parse_json_fields(review) if review.get("job_id") else None
+        source_text = str(review.get("source_text") or "").strip()
+        recording_section = f"【录音转写：{recording['file_name']}】\n{transcript}"
+        updated_source = "\n\n".join(item for item in [source_text, recording_section] if item)
+        refreshed = build_interview_review(job, updated_source)
+        conn.execute(
+            """
+            UPDATE interview_recordings
+            SET status = ?, model_size = ?, language = ?, transcript = ?, error_message = '', updated_at = ?
+            WHERE id = ?
+            """,
+            ("已转写", model_size, language, transcript, now, recording_id),
+        )
+        conn.execute(
+            """
+            UPDATE interview_preparations
+            SET source_text = ?, prep_plan_json = ?, question_bank_json = ?, review_markdown = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (updated_source, dumps(refreshed["plan"]), dumps(refreshed["questions"]), refreshed["markdown"], now, review_id),
+        )
+        job_id = int(review["job_id"]) if review["job_id"] else None
+        if job_id:
+            conn.execute(
+                "INSERT INTO application_events (job_id, event_type, content, created_at) VALUES (?, ?, ?, ?)",
+                (job_id, "面试录音转写", f"已用本地 {model_size} 模型转写：{recording['file_name']}", now),
+            )
+        log_agent_action(
+            conn,
+            action_type="interview_recording",
+            status="已转写",
+            summary=f"本地转写完成：{recording['file_name']}",
+            job_id=job_id,
+            decision={
+                "recording_id": recording_id,
+                "model_size": model_size,
+                "language": language,
+                "transcript_length": len(transcript),
+                "stored_locally": True,
+                "local_asr_called": True,
+                "llm_called": False,
+            },
+        )
+    return redirect_with_notice(f"/interviews/{review_id}", "本地转写完成，已刷新面试准备和题库。", "success")
 
 
 @app.post("/interviews/{review_id}/feedback")

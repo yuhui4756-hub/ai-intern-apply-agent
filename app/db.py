@@ -265,6 +265,21 @@ def init_db() -> None:
                 FOREIGN KEY(interview_feedback_id) REFERENCES interview_feedback(id) ON DELETE SET NULL
             );
 
+            CREATE TABLE IF NOT EXISTS interview_recordings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                interview_preparation_id INTEGER NOT NULL,
+                file_name TEXT NOT NULL DEFAULT '',
+                file_path TEXT NOT NULL DEFAULT '',
+                model_size TEXT NOT NULL DEFAULT 'base',
+                language TEXT NOT NULL DEFAULT '',
+                transcript TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT '待转写',
+                error_message TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(interview_preparation_id) REFERENCES interview_preparations(id) ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS model_profiles (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL UNIQUE,

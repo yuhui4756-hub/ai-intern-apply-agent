@@ -113,6 +113,13 @@ def data_dir() -> Path:
     return path
 
 
+def recordings_dir() -> Path:
+    configured = os.environ.get("APP_RECORDINGS_DIR")
+    path = Path(configured).expanduser() if configured else ROOT_DIR / "private" / "recordings"
+    path.mkdir(parents=True, exist_ok=True)
+    return path.resolve()
+
+
 def database_path() -> Path:
     configured = os.environ.get("APP_DB_PATH")
     if configured:

@@ -150,6 +150,53 @@
 
 <section class="panel">
   <div class="panel-title">
+    <h2>本地录音转写</h2>
+    <span class="muted">仅保存到本机，不上传第三方服务。</span>
+  </div>
+  <form method="post" action="/interviews/{{ review.id }}/recordings" enctype="multipart/form-data" class="form-actions">
+    <input type="file" name="recording" accept=".mp3,.m4a,.wav,.mp4,.aac,.flac,.ogg" required>
+    <button class="button" type="submit">上传录音</button>
+  </form>
+  {% if recordings %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>文件</th><th>状态</th><th>本地转写</th><th>结果</th></tr></thead>
+      <tbody>
+        {% for item in recordings %}
+        <tr>
+          <td>{{ item.file_name }}<div class="muted">{{ item.created_at }}</div></td>
+          <td><span class="badge">{{ item.status }}</span>{% if item.error_message %}<p class="muted">{{ item.error_message }}</p>{% endif %}</td>
+          <td>
+            {% if item.status != "已转写" %}
+            <form method="post" action="/interview-recordings/{{ item.id }}/transcribe" class="inline-form">
+              <select name="model_size">
+                {% for model in transcription_models %}
+                <option value="{{ model }}" {% if item.model_size == model %}selected{% endif %}>{{ model }}</option>
+                {% endfor %}
+              </select>
+              <button class="button compact" type="submit">开始转写</button>
+            </form>
+            {% else %}
+            <span class="muted">{{ item.model_size }} · {{ item.language or "zh" }}</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if item.transcript %}
+            <details class="debug-details"><summary>查看转写</summary><pre class="pre compact-pre">{{ item.transcript }}</pre></details>
+            {% else %}-{% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">还没有本地录音。</p>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <div class="panel-title">
     <h2>复盘 Markdown</h2>
     <button class="button copy-button" type="button" data-copy-target="review-markdown">复制</button>
   </div>
