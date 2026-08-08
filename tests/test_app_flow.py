@@ -222,6 +222,108 @@ def test_bulk_status_to_pending_interview_creates_preparation(tmp_path, monkeypa
     assert created_logs == 2
 
 
+def test_interview_feedback_tracks_weak_questions(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "interview-feedback.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db
+
+    monkeypatch.setattr(main, "search_company", lambda *args, **kwargs: [])
+    init_db()
+    client = TestClient(main.app)
+
+    job_response = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "job",
+            "url": "https://www.zhipin.com/job_detail/interview-feedback.html",
+            "title": "AI 应用开发实习生",
+            "text": "公司名称：杭州复盘智能科技有限公司\nAI 应用开发实习生\n要求 Python、FastAPI、RAG。",
+        },
+    )
+    assert job_response.status_code == 200
+    job_id = job_response.json()["job_id"]
+    interview = client.post(
+        "/interviews",
+        data={
+            "job_id": str(job_id),
+            "source_text": "问：如果 RAG 召回不准，你会怎么排查？\n答：当时只说了调 prompt。",
+        },
+        follow_redirects=False,
+    )
+    assert interview.status_code == 303
+    review_id = int(interview.headers["location"].rstrip("/").split("/")[-1])
+    detail = client.get(f"/interviews/{review_id}")
+    assert detail.status_code == 200
+    assert "薄弱问题库" in detail.text
+
+    created = client.post(
+        f"/interviews/{review_id}/feedback",
+        data={
+            "feedback_type": "技术问题",
+            "question": "如果 RAG 召回不准，你会怎么排查？",
+            "user_answer_summary": "只提到调 prompt，没有说明检索链路。",
+            "issue_summary": "缺少切分、召回、重排、评测四个排查层次。",
+            "improvement_plan": "整理 1 分钟回答稿，并补充项目里的检索评测例子。",
+        },
+        follow_redirects=False,
+    )
+
+    assert created.status_code == 303
+    with connect() as conn:
+        feedback = conn.execute(
+            "SELECT id, status, question, improvement_plan FROM interview_feedback WHERE interview_preparation_id = ?",
+            (review_id,),
+        ).fetchone()
+        event = conn.execute("SELECT event_type FROM application_events WHERE job_id = ? ORDER BY id DESC LIMIT 1", (job_id,)).fetchone()
+        action_log = conn.execute("SELECT action_type, status, decision_json FROM agent_action_logs ORDER BY id DESC LIMIT 1").fetchone()
+    assert feedback["status"] == "待练习"
+    assert "RAG 召回不准" in feedback["question"]
+    assert "1 分钟回答稿" in feedback["improvement_plan"]
+    assert event["event_type"] == "面试反馈记录"
+    assert action_log["action_type"] == "interview_feedback_update"
+    assert action_log["status"] == "已创建"
+    assert '"model_called": false' in action_log["decision_json"]
+
+    followup = client.post(
+        "/interviews",
+        data={"job_id": str(job_id), "source_text": ""},
+        follow_redirects=False,
+    )
+
+    assert followup.status_code == 303
+    followup_id = int(followup.headers["location"].rstrip("/").split("/")[-1])
+    with connect() as conn:
+        followup_review = conn.execute(
+            "SELECT source_text, question_bank_json FROM interview_preparations WHERE id = ?",
+            (followup_id,),
+        ).fetchone()
+    assert "历史待练习薄弱点" in followup_review["source_text"]
+    assert "RAG 召回不准" in followup_review["source_text"]
+    assert "RAG 召回不准" in followup_review["question_bank_json"]
+
+    updated = client.post(
+        f"/interview-feedback/{feedback['id']}",
+        data={"status": "已补强"},
+        follow_redirects=False,
+    )
+
+    assert updated.status_code == 303
+    with connect() as conn:
+        status = conn.execute("SELECT status FROM interview_feedback WHERE id = ?", (feedback["id"],)).fetchone()["status"]
+        action_log = conn.execute("SELECT action_type, status FROM agent_action_logs ORDER BY id DESC LIMIT 1").fetchone()
+    assert status == "已补强"
+    assert action_log["action_type"] == "interview_feedback_update"
+    assert action_log["status"] == "已补强"
+
+    detail = client.get(f"/interviews/{review_id}")
+    assert "如果 RAG 召回不准" in detail.text
+    assert "已补强" in detail.text
+    listing = client.get("/interviews")
+    assert "最近薄弱点" in listing.text
+    assert "如果 RAG 召回不准" in listing.text
+
+
 def test_import_job_from_url_flow(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "url.sqlite3"))
 

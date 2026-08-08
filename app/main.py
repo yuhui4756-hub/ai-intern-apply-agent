@@ -84,6 +84,7 @@ PATROL_SCHEDULER_POLL_SECONDS = 10
 MESSAGE_PATROL_OBSERVATION_LIMIT = 20
 COMMUNICATION_EXECUTOR_PLAN_LIMIT = 20
 INTERVIEW_PREP_TRIGGER_STATUSES = {"待面试", "面试准备中"}
+INTERVIEW_FEEDBACK_STATUSES = ["待练习", "已补强", "已归档"]
 COMMUNICATION_MODES = [
     ("off", "关闭"),
     ("draft", "草稿模式"),
@@ -133,6 +134,7 @@ def action_type_label(value: str) -> str:
         "communication_browser_probe": "浏览器页面探测",
         "demo_draft_created": "演练草稿",
         "interview_prep_auto_create": "面试准备",
+        "interview_feedback_update": "面试反馈",
         "github_project_refresh": "GitHub 项目刷新",
     }.get(value or "", value or "-")
 
@@ -3960,6 +3962,33 @@ def ensure_interview_preparation_for_job(
     return {"created": True, "interview_id": interview_id}
 
 
+def interview_feedback_context(conn: Any, job_id: int | None, limit: int = 8) -> str:
+    if not job_id:
+        return ""
+    rows = conn.execute(
+        """
+        SELECT feedback_type, question, issue_summary, improvement_plan
+        FROM interview_feedback
+        WHERE job_id = ? AND status = '待练习'
+        ORDER BY updated_at DESC, id DESC
+        LIMIT ?
+        """,
+        (job_id, max(1, min(int(limit or 8), 20))),
+    ).fetchall()
+    if not rows:
+        return ""
+    lines = ["历史待练习薄弱点："]
+    for row in rows:
+        parts = [
+            str(row["feedback_type"] or "面试问题"),
+            str(row["question"] or "").strip(),
+            str(row["issue_summary"] or "").strip(),
+            str(row["improvement_plan"] or "").strip(),
+        ]
+        lines.append(" - " + "；".join(item for item in parts if item))
+    return "\n".join(lines)
+
+
 @app.post("/jobs/bulk-status")
 async def bulk_update_jobs(request: Request) -> RedirectResponse:
     form = await request.form()
@@ -4175,12 +4204,22 @@ def interviews_page(request: Request) -> Any:
             """
         ).fetchall()
         jobs = conn.execute("SELECT id, title, company FROM job_postings ORDER BY created_at DESC").fetchall()
+        feedback_rows = conn.execute(
+            """
+            SELECT f.*, j.title AS job_title, j.company AS company
+            FROM interview_feedback f
+            LEFT JOIN job_postings j ON j.id = f.job_id
+            ORDER BY f.created_at DESC, f.id DESC
+            LIMIT 12
+            """
+        ).fetchall()
     return templates.TemplateResponse(
         request,
         "interviews.html",
         {
             "interviews": [{key: row[key] for key in row.keys()} for row in rows],
             "jobs": [{key: row[key] for key in row.keys()} for row in jobs],
+            "feedback_rows": [{key: row[key] for key in row.keys()} for row in feedback_rows],
         },
     )
 
@@ -4192,20 +4231,23 @@ async def create_interview_review(request: Request) -> RedirectResponse:
     job_id = int(job_id_raw) if job_id_raw.isdigit() else None
     source_text = str(form.get("source_text") or "")
     job: dict[str, Any] | None = None
+    feedback_context = ""
     if job_id:
         with connect() as conn:
             row = conn.execute("SELECT * FROM job_postings WHERE id = ?", (job_id,)).fetchone()
             if row:
                 job = parse_json_fields({key: row[key] for key in row.keys()})
+            feedback_context = interview_feedback_context(conn, job_id)
 
-    review = build_interview_review(job, source_text)
+    review_source_text = "\n\n".join(item for item in [source_text.strip(), feedback_context] if item)
+    review = build_interview_review(job, review_source_text)
     client = client_for_task("interview_review")
     if client and client.configured and source_text:
         try:
             llm_markdown = client.complete_text(
                 [
                     {"role": "system", "content": "请生成中文面试复盘 Markdown，聚焦没答好问题、补强建议和下一轮模拟题。"},
-                    {"role": "user", "content": dumps({"job": job or {}, "transcript": source_text[:12000]})},
+                    {"role": "user", "content": dumps({"job": job or {}, "transcript": review_source_text[:12000]})},
                 ]
             )
             if llm_markdown.strip():
@@ -4222,7 +4264,7 @@ async def create_interview_review(request: Request) -> RedirectResponse:
                 review_markdown, created_at, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (job_id, source_text, dumps(review["plan"]), dumps(review["questions"]), review["markdown"], now, now),
+            (job_id, review_source_text, dumps(review["plan"]), dumps(review["questions"]), review["markdown"], now, now),
         )
         review_id = cursor.lastrowid
     return redirect(f"/interviews/{review_id}")
@@ -4240,12 +4282,142 @@ def interview_detail(review_id: int, request: Request) -> Any:
             """,
             (review_id,),
         ).fetchone()
+        feedback_rows = conn.execute(
+            """
+            SELECT *
+            FROM interview_feedback
+            WHERE interview_preparation_id = ?
+            ORDER BY created_at DESC, id DESC
+            """,
+            (review_id,),
+        ).fetchall()
     if not row:
         return redirect("/interviews")
     review = {key: row[key] for key in row.keys()}
     review["plan"] = loads(review.get("prep_plan_json"), {})
     review["questions"] = loads(review.get("question_bank_json"), [])
-    return templates.TemplateResponse(request, "interview_detail.html", {"review": review})
+    job_feedback: list[dict[str, Any]] = []
+    if review.get("job_id"):
+        with connect() as conn:
+            job_rows = conn.execute(
+                """
+                SELECT *
+                FROM interview_feedback
+                WHERE job_id = ? AND interview_preparation_id != ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT 20
+                """,
+                (review["job_id"], review_id),
+            ).fetchall()
+            job_feedback = [{key: item[key] for key in item.keys()} for item in job_rows]
+    return templates.TemplateResponse(
+        request,
+        "interview_detail.html",
+        {
+            "review": review,
+            "feedback_rows": [{key: item[key] for key in item.keys()} for item in feedback_rows],
+            "job_feedback": job_feedback,
+            "feedback_statuses": INTERVIEW_FEEDBACK_STATUSES,
+            "notice": request.query_params.get("notice", ""),
+            "notice_type": request.query_params.get("notice_type", "info"),
+        },
+    )
+
+
+@app.post("/interviews/{review_id}/feedback")
+async def create_interview_feedback(review_id: int, request: Request) -> RedirectResponse:
+    form = await request.form()
+    feedback_type = str(form.get("feedback_type") or "技术问题").strip()[:80]
+    question = str(form.get("question") or "").strip()[:500]
+    user_answer_summary = str(form.get("user_answer_summary") or "").strip()[:1000]
+    issue_summary = str(form.get("issue_summary") or "").strip()[:1000]
+    improvement_plan = str(form.get("improvement_plan") or "").strip()[:1000]
+    if not question and not issue_summary:
+        return redirect_with_notice(f"/interviews/{review_id}", "请至少填写问题或卡住点。", "error")
+
+    now = utc_now()
+    with connect() as conn:
+        review = conn.execute("SELECT id, job_id FROM interview_preparations WHERE id = ?", (review_id,)).fetchone()
+        if not review:
+            return redirect_with_notice("/interviews", "没有找到这条面试准备记录。", "error")
+        job_id = int(review["job_id"]) if review["job_id"] else None
+        cursor = conn.execute(
+            """
+            INSERT INTO interview_feedback (
+                job_id, interview_preparation_id, feedback_type, question,
+                user_answer_summary, issue_summary, improvement_plan,
+                status, source, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                job_id,
+                review_id,
+                feedback_type,
+                question,
+                user_answer_summary,
+                issue_summary,
+                improvement_plan,
+                "待练习",
+                "manual",
+                now,
+                now,
+            ),
+        )
+        feedback_id = int(cursor.lastrowid)
+        if job_id:
+            conn.execute(
+                "INSERT INTO application_events (job_id, event_type, content, created_at) VALUES (?, ?, ?, ?)",
+                (job_id, "面试反馈记录", (question or issue_summary)[:500], now),
+            )
+        log_agent_action(
+            conn,
+            action_type="interview_feedback_update",
+            status="已创建",
+            summary=f"新增面试薄弱点：{(question or issue_summary)[:120]}",
+            job_id=job_id,
+            decision={
+                "review_id": review_id,
+                "feedback_id": feedback_id,
+                "feedback_type": feedback_type,
+                "status": "待练习",
+                "model_called": False,
+            },
+        )
+    return redirect_with_notice(f"/interviews/{review_id}", "已记录面试薄弱点。", "success")
+
+
+@app.post("/interview-feedback/{feedback_id}")
+async def update_interview_feedback(feedback_id: int, request: Request) -> RedirectResponse:
+    form = await request.form()
+    status = str(form.get("status") or "").strip()
+    if status not in INTERVIEW_FEEDBACK_STATUSES:
+        return redirect_with_notice("/interviews", "反馈状态无效。", "error")
+    now = utc_now()
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM interview_feedback WHERE id = ?", (feedback_id,)).fetchone()
+        if not row:
+            return redirect_with_notice("/interviews", "没有找到这条面试反馈。", "error")
+        old_status = str(row["status"] or "")
+        conn.execute(
+            "UPDATE interview_feedback SET status = ?, updated_at = ? WHERE id = ?",
+            (status, now, feedback_id),
+        )
+        log_agent_action(
+            conn,
+            action_type="interview_feedback_update",
+            status=status,
+            summary=f"面试反馈状态：{old_status or '-'} -> {status}",
+            job_id=int(row["job_id"]) if row["job_id"] else None,
+            decision={
+                "review_id": int(row["interview_preparation_id"]) if row["interview_preparation_id"] else None,
+                "feedback_id": feedback_id,
+                "old_status": old_status,
+                "new_status": status,
+                "model_called": False,
+            },
+        )
+    review_id = int(row["interview_preparation_id"]) if row["interview_preparation_id"] else None
+    return redirect_with_notice(f"/interviews/{review_id}" if review_id else "/interviews", "面试反馈状态已更新。", "success")
 
 
 @app.get("/interviews/{review_id}/download")

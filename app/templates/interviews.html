@@ -27,6 +27,44 @@
 </section>
 
 <section class="panel">
+  <div class="panel-title">
+    <h2>最近薄弱点</h2>
+    <span class="muted">来自面试复盘和模拟面试记录。</span>
+  </div>
+  {% if feedback_rows %}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>问题</th>
+          <th>岗位</th>
+          <th>类型</th>
+          <th>状态</th>
+          <th>改进方向</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for item in feedback_rows %}
+        <tr>
+          <td>
+            <a href="/interviews/{{ item.interview_preparation_id }}">{{ item.question or item.issue_summary or "未命名问题" }}</a>
+            <div class="muted">{{ item.created_at }}</div>
+          </td>
+          <td>{{ (item.company ~ " - " if item.company else "") ~ (item.job_title or "未关联岗位") }}</td>
+          <td>{{ item.feedback_type or "-" }}</td>
+          <td><span class="badge">{{ item.status }}</span></td>
+          <td>{{ item.improvement_plan or "-" }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">还没有记录薄弱点。进入某条面试准备后，可以记录没答好的问题和补强计划。</p>
+  {% endif %}
+</section>
+
+<section class="panel">
   <h2>历史记录</h2>
   {% if interviews %}
   <div class="table-wrap">

@@ -220,6 +220,23 @@ def init_db() -> None:
                 FOREIGN KEY(job_id) REFERENCES job_postings(id) ON DELETE SET NULL
             );
 
+            CREATE TABLE IF NOT EXISTS interview_feedback (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER,
+                interview_preparation_id INTEGER,
+                feedback_type TEXT NOT NULL DEFAULT '',
+                question TEXT NOT NULL DEFAULT '',
+                user_answer_summary TEXT NOT NULL DEFAULT '',
+                issue_summary TEXT NOT NULL DEFAULT '',
+                improvement_plan TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT '待练习',
+                source TEXT NOT NULL DEFAULT 'manual',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(job_id) REFERENCES job_postings(id) ON DELETE SET NULL,
+                FOREIGN KEY(interview_preparation_id) REFERENCES interview_preparations(id) ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS model_profiles (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL UNIQUE,
