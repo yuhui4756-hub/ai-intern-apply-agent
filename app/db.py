@@ -237,6 +237,20 @@ def init_db() -> None:
                 FOREIGN KEY(interview_preparation_id) REFERENCES interview_preparations(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS interview_practice_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER,
+                interview_preparation_id INTEGER NOT NULL,
+                interview_feedback_id INTEGER,
+                question TEXT NOT NULL DEFAULT '',
+                answer_text TEXT NOT NULL DEFAULT '',
+                outcome TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(job_id) REFERENCES job_postings(id) ON DELETE SET NULL,
+                FOREIGN KEY(interview_preparation_id) REFERENCES interview_preparations(id) ON DELETE CASCADE,
+                FOREIGN KEY(interview_feedback_id) REFERENCES interview_feedback(id) ON DELETE SET NULL
+            );
+
             CREATE TABLE IF NOT EXISTS model_profiles (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL UNIQUE,

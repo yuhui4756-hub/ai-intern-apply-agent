@@ -1,0 +1,81 @@
+{% extends "layout.html" %}
+{% block title %}模拟面试 - 简历投递 Agent{% endblock %}
+{% block content %}
+<section class="page-head">
+  <div>
+    <h1>模拟面试</h1>
+    <p>{{ review.company or "未关联公司" }} · {{ review.job_title or "面试准备" }}</p>
+  </div>
+  <a class="button" href="/interviews/{{ review.id }}">返回面试准备</a>
+</section>
+
+{% if notice %}
+<section class="notice {{ notice_type }}">{{ notice }}</section>
+{% endif %}
+
+{% if current_question %}
+<section class="grid-two practice-layout">
+  <form method="post" action="/interviews/{{ review.id }}/practice" class="panel form-stack">
+    <div class="panel-title">
+      <h2>第 {{ question_index + 1 }} / {{ questions | length }} 题</h2>
+      <span class="badge">{{ current_question.source }}</span>
+    </div>
+    <p class="practice-question">{{ current_question.question }}</p>
+    <input type="hidden" name="question_index" value="{{ question_index }}">
+    <label>你的回答
+      <textarea name="answer_text" rows="11" placeholder="直接输入完整回答。建议按背景、思路、具体做法、结果和边界来组织。"></textarea>
+    </label>
+    <div class="form-actions practice-actions">
+      <button class="button primary" name="outcome" value="答得不错" type="submit">答得不错</button>
+      <button class="button" name="outcome" value="没答好" type="submit">没答好</button>
+      <button class="button" name="outcome" value="跳过" type="submit">跳过</button>
+    </div>
+  </form>
+
+  <section class="panel">
+    <h2>练习进度</h2>
+    <div class="metrics practice-metrics">
+      <div class="metric"><span>答得不错</span><strong>{{ outcome_counts["答得不错"] }}</strong></div>
+      <div class="metric"><span>没答好</span><strong>{{ outcome_counts["没答好"] }}</strong></div>
+      <div class="metric"><span>跳过</span><strong>{{ outcome_counts["跳过"] }}</strong></div>
+    </div>
+    <ol class="practice-questions">
+      {% for item in questions %}
+      <li class="{% if loop.index0 == question_index %}active{% endif %}">
+        <a href="/interviews/{{ review.id }}/practice?question={{ loop.index0 }}">{{ item.question }}</a>
+        {% if item.source == "待练习薄弱点" %}<span class="badge">待练习</span>{% endif %}
+      </li>
+      {% endfor %}
+    </ol>
+  </section>
+</section>
+{% else %}
+<section class="panel">
+  <h2>还没有练习题</h2>
+  <p class="empty">先回到面试准备补充面试邀请、转写文本或重点问题，再开始模拟面试。</p>
+</section>
+{% endif %}
+
+<section class="panel">
+  <h2>最近练习记录</h2>
+  {% if attempts %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>问题</th><th>结果</th><th>回答</th><th>时间</th></tr></thead>
+      <tbody>
+        {% for item in attempts %}
+        <tr>
+          <td>{{ item.question }}</td>
+          <td><span class="badge">{{ item.outcome }}</span></td>
+          <td>{{ item.answer_text or "-" }}</td>
+          <td>{{ item.created_at }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">还没有练习记录。</p>
+  {% endif %}
+</section>
+{% endblock %}

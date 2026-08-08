@@ -6,7 +6,10 @@
     <h1>{{ review.job_title or "面试复盘" }}</h1>
     <p>{{ review.company or "未关联公司" }} · {{ review.created_at }}</p>
   </div>
-  <a class="button" href="/interviews/{{ review.id }}/download">下载 Markdown</a>
+  <div class="form-actions">
+    <a class="button primary" href="/interviews/{{ review.id }}/practice">开始模拟面试</a>
+    <a class="button" href="/interviews/{{ review.id }}/download">下载 Markdown</a>
+  </div>
 </section>
 
 {% if notice %}

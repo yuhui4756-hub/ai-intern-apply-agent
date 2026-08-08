@@ -324,6 +324,90 @@ def test_interview_feedback_tracks_weak_questions(tmp_path, monkeypatch):
     assert "如果 RAG 召回不准" in listing.text
 
 
+def test_interview_practice_saves_attempts_and_updates_weak_points(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "interview-practice.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db
+
+    monkeypatch.setattr(main, "search_company", lambda *args, **kwargs: [])
+    init_db()
+    client = TestClient(main.app)
+
+    job_response = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "job",
+            "url": "https://www.zhipin.com/job_detail/interview-practice.html",
+            "title": "AI Agent 开发实习生",
+            "text": "公司名称：杭州模拟面试科技有限公司\nAI Agent 开发实习生\n要求 Python、FastAPI、RAG。",
+        },
+    )
+    assert job_response.status_code == 200
+    job_id = job_response.json()["job_id"]
+    created = client.post(
+        "/interviews",
+        data={"job_id": str(job_id), "source_text": ""},
+        follow_redirects=False,
+    )
+    review_id = int(created.headers["location"].rstrip("/").split("/")[-1])
+
+    practice = client.get(f"/interviews/{review_id}/practice")
+    assert practice.status_code == 200
+    assert "模拟面试" in practice.text
+    assert "RAG 项目" in practice.text
+
+    missed = client.post(
+        f"/interviews/{review_id}/practice",
+        data={
+            "question_index": "0",
+            "outcome": "没答好",
+            "answer_text": "我只说了会调 Prompt。",
+        },
+        follow_redirects=False,
+    )
+    assert missed.status_code == 303
+    with connect() as conn:
+        feedback = conn.execute(
+            "SELECT id, status, source, user_answer_summary FROM interview_feedback WHERE interview_preparation_id = ?",
+            (review_id,),
+        ).fetchone()
+        attempt = conn.execute(
+            "SELECT outcome, answer_text, interview_feedback_id FROM interview_practice_attempts WHERE interview_preparation_id = ?",
+            (review_id,),
+        ).fetchone()
+    assert feedback["status"] == "待练习"
+    assert feedback["source"] == "practice"
+    assert "调 Prompt" in feedback["user_answer_summary"]
+    assert attempt["outcome"] == "没答好"
+    assert attempt["interview_feedback_id"] == feedback["id"]
+
+    improved = client.post(
+        f"/interviews/{review_id}/practice",
+        data={
+            "question_index": "0",
+            "outcome": "答得不错",
+            "answer_text": "我会先看切分、召回、重排与评测数据。",
+        },
+        follow_redirects=False,
+    )
+    assert improved.status_code == 303
+    with connect() as conn:
+        feedback = conn.execute("SELECT status FROM interview_feedback WHERE id = ?", (feedback["id"],)).fetchone()
+        attempt_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM interview_practice_attempts WHERE interview_preparation_id = ?",
+            (review_id,),
+        ).fetchone()["count"]
+        action = conn.execute(
+            "SELECT action_type, status, decision_json FROM agent_action_logs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert feedback["status"] == "已补强"
+    assert attempt_count == 2
+    assert action["action_type"] == "interview_practice"
+    assert action["status"] == "答得不错"
+    assert '"model_called": false' in action["decision_json"]
+
+
 def test_import_job_from_url_flow(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "url.sqlite3"))
 

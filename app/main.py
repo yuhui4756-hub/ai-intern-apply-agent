@@ -135,6 +135,7 @@ def action_type_label(value: str) -> str:
         "demo_draft_created": "演练草稿",
         "interview_prep_auto_create": "面试准备",
         "interview_feedback_update": "面试反馈",
+        "interview_practice": "模拟面试",
         "github_project_refresh": "GitHub 项目刷新",
     }.get(value or "", value or "-")
 
@@ -3989,6 +3990,71 @@ def interview_feedback_context(conn: Any, job_id: int | None, limit: int = 8) ->
     return "\n".join(lines)
 
 
+def practice_question_key(question: str) -> str:
+    return re.sub(r"\s+", "", question or "").lower()
+
+
+def interview_practice_questions(conn: Any, review: dict[str, Any]) -> list[dict[str, Any]]:
+    """Combine unresolved feedback with the generated question bank, keeping weak points first."""
+    review_id = int(review["id"])
+    job_id = int(review["job_id"]) if review.get("job_id") else None
+    if job_id:
+        feedback_rows = conn.execute(
+            """
+            SELECT id, feedback_type, question, issue_summary
+            FROM interview_feedback
+            WHERE job_id = ? AND status = '待练习'
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 20
+            """,
+            (job_id,),
+        ).fetchall()
+    else:
+        feedback_rows = conn.execute(
+            """
+            SELECT id, feedback_type, question, issue_summary
+            FROM interview_feedback
+            WHERE interview_preparation_id = ? AND status = '待练习'
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 20
+            """,
+            (review_id,),
+        ).fetchall()
+
+    questions: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in feedback_rows:
+        question = str(row["question"] or row["issue_summary"] or "").strip()
+        key = practice_question_key(question)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        questions.append(
+            {
+                "question": question[:500],
+                "source": "待练习薄弱点",
+                "feedback_id": int(row["id"]),
+                "feedback_type": str(row["feedback_type"] or "面试问题"),
+            }
+        )
+
+    for item in loads(review.get("question_bank_json"), []):
+        question = str(item or "").strip()
+        key = practice_question_key(question)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        questions.append(
+            {
+                "question": question[:500],
+                "source": "面试题库",
+                "feedback_id": None,
+                "feedback_type": "",
+            }
+        )
+    return questions[:24]
+
+
 @app.post("/jobs/bulk-status")
 async def bulk_update_jobs(request: Request) -> RedirectResponse:
     form = await request.form()
@@ -4322,6 +4388,175 @@ def interview_detail(review_id: int, request: Request) -> Any:
             "notice_type": request.query_params.get("notice_type", "info"),
         },
     )
+
+
+@app.get("/interviews/{review_id}/practice")
+def interview_practice_page(review_id: int, request: Request) -> Any:
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT i.*, j.title AS job_title, j.company AS company
+            FROM interview_preparations i
+            LEFT JOIN job_postings j ON j.id = i.job_id
+            WHERE i.id = ?
+            """,
+            (review_id,),
+        ).fetchone()
+        if not row:
+            return redirect("/interviews")
+        review = {key: row[key] for key in row.keys()}
+        questions = interview_practice_questions(conn, review)
+        attempts = conn.execute(
+            """
+            SELECT *
+            FROM interview_practice_attempts
+            WHERE interview_preparation_id = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT 12
+            """,
+            (review_id,),
+        ).fetchall()
+
+    raw_index = request.query_params.get("question", "0")
+    try:
+        question_index = int(raw_index)
+    except (TypeError, ValueError):
+        question_index = 0
+    question_index = max(0, min(question_index, max(len(questions) - 1, 0)))
+    current_question = questions[question_index] if questions else None
+    outcome_counts = {"答得不错": 0, "没答好": 0, "跳过": 0}
+    for attempt in attempts:
+        outcome = str(attempt["outcome"] or "")
+        if outcome in outcome_counts:
+            outcome_counts[outcome] += 1
+    return templates.TemplateResponse(
+        request,
+        "interview_practice.html",
+        {
+            "review": review,
+            "questions": questions,
+            "current_question": current_question,
+            "question_index": question_index,
+            "attempts": [{key: item[key] for key in item.keys()} for item in attempts],
+            "outcome_counts": outcome_counts,
+            "notice": request.query_params.get("notice", ""),
+            "notice_type": request.query_params.get("notice_type", "info"),
+        },
+    )
+
+
+@app.post("/interviews/{review_id}/practice")
+async def save_interview_practice_attempt(review_id: int, request: Request) -> RedirectResponse:
+    form = await request.form()
+    try:
+        question_index = int(str(form.get("question_index") or "0"))
+    except (TypeError, ValueError):
+        question_index = 0
+    outcome = str(form.get("outcome") or "").strip()
+    if outcome not in {"答得不错", "没答好", "跳过"}:
+        return redirect_with_notice(f"/interviews/{review_id}/practice", "请选择本题结果。", "error")
+
+    answer_text = str(form.get("answer_text") or "").strip()[:4000]
+    now = utc_now()
+    with connect() as conn:
+        review_row = conn.execute("SELECT * FROM interview_preparations WHERE id = ?", (review_id,)).fetchone()
+        if not review_row:
+            return redirect_with_notice("/interviews", "没有找到这条面试准备记录。", "error")
+        review = {key: review_row[key] for key in review_row.keys()}
+        questions = interview_practice_questions(conn, review)
+        if not questions:
+            return redirect_with_notice(f"/interviews/{review_id}", "题库为空，请先补充面试准备内容。", "error")
+        question_index = max(0, min(question_index, len(questions) - 1))
+        current_question = questions[question_index]
+        question = str(current_question["question"])
+        job_id = int(review["job_id"]) if review.get("job_id") else None
+        feedback_id = current_question.get("feedback_id")
+
+        if outcome == "没答好":
+            if feedback_id:
+                conn.execute(
+                    """
+                    UPDATE interview_feedback
+                    SET user_answer_summary = CASE WHEN ? != '' THEN ? ELSE user_answer_summary END,
+                        status = '待练习', updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (answer_text, answer_text, now, feedback_id),
+                )
+            else:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO interview_feedback (
+                        job_id, interview_preparation_id, feedback_type, question,
+                        user_answer_summary, issue_summary, improvement_plan,
+                        status, source, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        job_id,
+                        review_id,
+                        "模拟面试",
+                        question,
+                        answer_text,
+                        "模拟面试中标记为没答好，待补充具体卡住点。",
+                        "复盘回答结构，补充可验证的项目例子后再次练习。",
+                        "待练习",
+                        "practice",
+                        now,
+                        now,
+                    ),
+                )
+                feedback_id = int(cursor.lastrowid)
+        elif outcome == "答得不错" and feedback_id:
+            conn.execute(
+                "UPDATE interview_feedback SET status = ?, updated_at = ? WHERE id = ?",
+                ("已补强", now, feedback_id),
+            )
+
+        cursor = conn.execute(
+            """
+            INSERT INTO interview_practice_attempts (
+                job_id, interview_preparation_id, interview_feedback_id,
+                question, answer_text, outcome, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                job_id,
+                review_id,
+                feedback_id,
+                question,
+                "" if outcome == "跳过" else answer_text,
+                outcome,
+                now,
+            ),
+        )
+        attempt_id = int(cursor.lastrowid)
+        if job_id:
+            conn.execute(
+                "INSERT INTO application_events (job_id, event_type, content, created_at) VALUES (?, ?, ?, ?)",
+                (job_id, "模拟面试", f"{outcome}：{question[:360]}", now),
+            )
+        log_agent_action(
+            conn,
+            action_type="interview_practice",
+            status=outcome,
+            summary=f"模拟面试{outcome}：{question[:120]}",
+            job_id=job_id,
+            decision={
+                "review_id": review_id,
+                "attempt_id": attempt_id,
+                "feedback_id": feedback_id,
+                "question_source": current_question["source"],
+                "model_called": False,
+            },
+        )
+    next_index = min(question_index + 1, len(questions) - 1)
+    message = "已保存本次练习。"
+    if outcome == "没答好":
+        message += " 已加入待练习薄弱点。"
+    elif outcome == "答得不错" and feedback_id:
+        message += " 对应薄弱点已标记为已补强。"
+    return redirect_with_notice(f"/interviews/{review_id}/practice?question={next_index}", message, "success")
 
 
 @app.post("/interviews/{review_id}/feedback")
