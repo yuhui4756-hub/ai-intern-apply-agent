@@ -1,0 +1,82 @@
+{% extends "layout.html" %}
+{% block title %}投递准备 - 简历投递 Agent{% endblock %}
+{% block content %}
+<section class="page-head">
+  <div>
+    <h1>投递准备</h1>
+    <p>仅整理本地候选、投递理由和简历版本；确认后只会标记为待投递，不会操作招聘平台。</p>
+  </div>
+  <form method="post" action="/applications/refresh">
+    <button class="button primary" type="submit">生成必投候选</button>
+  </form>
+</section>
+
+{% if notice %}
+<section class="notice {{ notice_type }}">{{ notice }}</section>
+{% endif %}
+
+<section class="metrics">
+  <div class="metric"><span>待确认</span><strong>{{ status_counts.get("待确认", 0) }}</strong></div>
+  <div class="metric"><span>已确认</span><strong>{{ status_counts.get("已确认", 0) }}</strong></div>
+  <div class="metric"><span>已跳过</span><strong>{{ status_counts.get("已跳过", 0) }}</strong></div>
+</section>
+
+<section class="panel">
+  {% if preparations %}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>岗位</th><th>匹配</th><th>投递理由</th><th>简历版本与备注</th><th>操作</th></tr>
+      </thead>
+      <tbody>
+        {% for item in preparations %}
+        <tr>
+          <td>
+            <a href="/jobs/{{ item.job_id }}">{{ (item.company ~ " - " if item.company else "") ~ (item.job_title or "岗位待补充") }}</a>
+            <div class="muted">{{ item.platform or "平台待补充" }} · {{ item.city or "城市待补充" }}</div>
+            <span class="badge">{{ item.status }}</span>
+          </td>
+          <td><span class="badge">{{ item.match_score }} 分 · {{ item.risk_level or "-" }}风险</span></td>
+          <td>{{ item.recommendation_reason }}</td>
+          <td>
+            <form method="post" action="/applications/{{ item.id }}" class="form-stack compact-form">
+              <label>简历
+                <select name="resume_id">
+                  <option value="">暂不选择</option>
+                  {% for resume in resumes %}
+                  <option value="{{ resume.id }}" {% if item.resume_id == resume.id %}selected{% endif %}>{{ resume.name }}{% if resume.target_role %} - {{ resume.target_role }}{% endif %}</option>
+                  {% endfor %}
+                </select>
+              </label>
+              <p class="muted">{{ item.resume_reason }}</p>
+              <label>备注
+                <textarea name="user_note" rows="3">{{ item.user_note }}</textarea>
+              </label>
+              <div class="form-actions">
+                <button class="button compact" type="submit" name="action" value="save">保存</button>
+                {% if item.status == "待确认" %}
+                <button class="button primary compact" type="submit" name="action" value="confirm">确认待投递</button>
+                <button class="button compact" type="submit" name="action" value="skip">跳过</button>
+                {% endif %}
+              </div>
+            </form>
+          </td>
+          <td>
+            {% if item.status == "已确认" %}
+            <p>已进入待投递。</p>
+            {% elif item.status == "已跳过" %}
+            <p>未改变岗位状态。</p>
+            {% else %}
+            <p>确认后不会自动上传简历或点击投递。</p>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">还没有投递准备。点击“生成必投候选”后，系统会筛选当前为“必投”且风险为“低”的待处理岗位。</p>
+  {% endif %}
+</section>
+{% endblock %}

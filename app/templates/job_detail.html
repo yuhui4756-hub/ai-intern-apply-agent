@@ -52,6 +52,46 @@
   </div>
 </section>
 
+<section class="panel">
+  <div class="panel-title">
+    <h2>投递准备</h2>
+    <a href="/applications">查看投递准备队列</a>
+  </div>
+  {% if application_preparation %}
+  <form method="post" action="/applications/{{ application_preparation.id }}" class="form-stack">
+    <p><strong>投递理由：</strong>{{ application_preparation.recommendation_reason }}</p>
+    <p><strong>简历建议：</strong>{{ application_preparation.resume_reason }}</p>
+    <label>简历版本
+      <select name="resume_id">
+        <option value="">暂不选择</option>
+        {% for resume in resumes %}
+        <option value="{{ resume.id }}" {% if application_preparation.resume_id == resume.id %}selected{% endif %}>{{ resume.name }}{% if resume.target_role %} - {{ resume.target_role }}{% endif %}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>确认前备注
+      <textarea name="user_note" rows="3" placeholder="例如：需要先确认到岗时间或补充项目描述">{{ application_preparation.user_note }}</textarea>
+    </label>
+    <input type="hidden" name="return_to" value="job">
+    <div class="form-actions">
+      <span class="badge">{{ application_preparation.status }}</span>
+      <button class="button" type="submit" name="action" value="save">保存准备</button>
+      {% if application_preparation.status == "待确认" %}
+      <button class="button primary" type="submit" name="action" value="confirm">确认进入待投递</button>
+      <button class="button" type="submit" name="action" value="skip">跳过本次准备</button>
+      {% endif %}
+    </div>
+  </form>
+  {% elif application_eligible %}
+  <p class="muted">{{ application_block_reason }}</p>
+  <form method="post" action="/jobs/{{ job.id }}/application-preparation">
+    <button class="button primary" type="submit">生成投递准备</button>
+  </form>
+  {% else %}
+  <p class="empty">{{ application_block_reason }}</p>
+  {% endif %}
+</section>
+
 <section class="grid-two">
   <div class="panel">
     <h2>JD 抽取结果</h2>

@@ -117,6 +117,20 @@ def init_db() -> None:
                 FOREIGN KEY(selected_resume_id) REFERENCES resume_versions(id) ON DELETE SET NULL
             );
 
+            CREATE TABLE IF NOT EXISTS application_preparations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER NOT NULL UNIQUE,
+                resume_id INTEGER,
+                recommendation_reason TEXT NOT NULL DEFAULT '',
+                resume_reason TEXT NOT NULL DEFAULT '',
+                user_note TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT '待确认',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(job_id) REFERENCES job_postings(id) ON DELETE CASCADE,
+                FOREIGN KEY(resume_id) REFERENCES resume_versions(id) ON DELETE SET NULL
+            );
+
             CREATE TABLE IF NOT EXISTS company_research (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 job_id INTEGER NOT NULL,

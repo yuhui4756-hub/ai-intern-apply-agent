@@ -85,6 +85,7 @@ MESSAGE_PATROL_OBSERVATION_LIMIT = 20
 COMMUNICATION_EXECUTOR_PLAN_LIMIT = 20
 INTERVIEW_PREP_TRIGGER_STATUSES = {"待面试", "面试准备中"}
 INTERVIEW_FEEDBACK_STATUSES = ["待练习", "已补强", "已归档"]
+APPLICATION_PREPARATION_STATUSES = ["待确认", "已确认", "已跳过"]
 COMMUNICATION_MODES = [
     ("off", "关闭"),
     ("draft", "草稿模式"),
@@ -136,6 +137,7 @@ def action_type_label(value: str) -> str:
         "interview_prep_auto_create": "面试准备",
         "interview_feedback_update": "面试反馈",
         "interview_practice": "模拟面试",
+        "application_preparation": "投递准备",
         "github_project_refresh": "GitHub 项目刷新",
     }.get(value or "", value or "-")
 
@@ -3244,6 +3246,141 @@ def jobs_page(request: Request, status: str = "") -> Any:
     )
 
 
+@app.get("/applications")
+def application_preparations_page(request: Request) -> Any:
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT p.*, j.title AS job_title, j.company AS company, j.city AS city,
+                   j.platform AS platform, j.match_score AS match_score,
+                   j.risk_level AS risk_level, j.status AS job_status,
+                   r.name AS resume_name
+            FROM application_preparations p
+            JOIN job_postings j ON j.id = p.job_id
+            LEFT JOIN resume_versions r ON r.id = p.resume_id
+            ORDER BY CASE p.status WHEN '待确认' THEN 0 WHEN '已确认' THEN 1 ELSE 2 END,
+                     p.updated_at DESC, p.id DESC
+            """
+        ).fetchall()
+        resumes = conn.execute("SELECT id, name, target_role FROM resume_versions ORDER BY is_default DESC, id").fetchall()
+        status_counts = {
+            row["status"]: row["count"]
+            for row in conn.execute(
+                "SELECT status, COUNT(*) AS count FROM application_preparations GROUP BY status"
+            ).fetchall()
+        }
+    return templates.TemplateResponse(
+        request,
+        "application_preparations.html",
+        {
+            "preparations": [{key: row[key] for key in row.keys()} for row in rows],
+            "resumes": [{key: row[key] for key in row.keys()} for row in resumes],
+            "status_counts": status_counts,
+            "notice": request.query_params.get("notice", ""),
+            "notice_type": request.query_params.get("notice_type", "info"),
+        },
+    )
+
+
+@app.post("/applications/refresh")
+async def refresh_application_preparations(request: Request) -> RedirectResponse:
+    with connect() as conn:
+        jobs = conn.execute(
+            """
+            SELECT id FROM job_postings
+            WHERE recommendation = '必投' AND risk_level = '低' AND status IN ('待确认', '待投递')
+            ORDER BY match_score DESC, id DESC
+            """
+        ).fetchall()
+        results = [
+            ensure_application_preparation_for_job(conn, int(row["id"]), trigger_type="batch_refresh")
+            for row in jobs
+        ]
+    created_count = sum(1 for item in results if item.get("created"))
+    existing_count = sum(1 for item in results if item.get("preparation_id") and not item.get("created"))
+    return redirect_with_notice(
+        "/applications",
+        f"已检查 {len(results)} 条必投低风险岗位：新增 {created_count} 条投递准备，已有 {existing_count} 条。",
+        "success" if created_count else "info",
+    )
+
+
+@app.post("/jobs/{job_id}/application-preparation")
+async def create_application_preparation(job_id: int, request: Request) -> RedirectResponse:
+    with connect() as conn:
+        result = ensure_application_preparation_for_job(conn, job_id, trigger_type="job_detail")
+    if result.get("created"):
+        return redirect_with_notice(f"/jobs/{job_id}", "已加入投递准备，请核对简历版本后再确认。", "success")
+    if result.get("preparation_id"):
+        return redirect_with_notice(f"/jobs/{job_id}", "该岗位已有投递准备。", "info")
+    return redirect_with_notice(f"/jobs/{job_id}", str(result.get("reason") or "暂时不能生成投递准备。"), "error")
+
+
+@app.post("/applications/{preparation_id}")
+async def update_application_preparation(preparation_id: int, request: Request) -> RedirectResponse:
+    form = await request.form()
+    action = str(form.get("action") or "save").strip()
+    if action not in {"save", "confirm", "skip"}:
+        return redirect_with_notice("/applications", "投递准备操作无效。", "error")
+    resume_id_raw = str(form.get("resume_id") or "").strip()
+    resume_id = int(resume_id_raw) if resume_id_raw.isdigit() else None
+    user_note = str(form.get("user_note") or "").strip()[:1500]
+    return_to_job = str(form.get("return_to") or "") == "job"
+    now = utc_now()
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM application_preparations WHERE id = ?", (preparation_id,)).fetchone()
+        if not row:
+            return redirect_with_notice("/applications", "没有找到这条投递准备。", "error")
+        job_id = int(row["job_id"])
+        target_path = f"/jobs/{job_id}" if return_to_job else "/applications"
+        if resume_id:
+            valid_resume = conn.execute("SELECT id FROM resume_versions WHERE id = ?", (resume_id,)).fetchone()
+            if not valid_resume:
+                return redirect_with_notice(target_path, "选择的简历版本不存在。", "error")
+        if action == "confirm" and not resume_id:
+            return redirect_with_notice(target_path, "确认待投递前，请先选择一个简历版本。", "error")
+        if action == "skip" and row["status"] != "待确认":
+            return redirect_with_notice(target_path, "只有待确认的投递准备可以跳过。", "error")
+
+        status = {"save": row["status"], "confirm": "已确认", "skip": "已跳过"}[action]
+        resume_reason = row["resume_reason"] or ""
+        if resume_id != row["resume_id"]:
+            resume_reason = "由用户在投递准备中手动选择。"
+        conn.execute(
+            """
+            UPDATE application_preparations
+            SET resume_id = ?, resume_reason = ?, user_note = ?, status = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (resume_id, resume_reason, user_note, status, now, preparation_id),
+        )
+        event_type = {"save": "投递准备更新", "confirm": "投递准备确认", "skip": "投递准备跳过"}[action]
+        event_content = {"save": "已更新投递准备。", "confirm": "已确认进入待投递；尚未在招聘平台执行投递。", "skip": "已跳过本次投递准备。"}[action]
+        if action == "confirm":
+            job = conn.execute("SELECT status FROM job_postings WHERE id = ?", (job_id,)).fetchone()
+            if job and job["status"] in {"待确认", "待投递"}:
+                conn.execute("UPDATE job_postings SET status = ?, updated_at = ? WHERE id = ?", ("待投递", now, job_id))
+        conn.execute(
+            "INSERT INTO application_events (job_id, event_type, content, created_at) VALUES (?, ?, ?, ?)",
+            (job_id, event_type, event_content, now),
+        )
+        log_agent_action(
+            conn,
+            action_type="application_preparation",
+            status=status,
+            summary=event_content,
+            job_id=job_id,
+            decision={
+                "preparation_id": preparation_id,
+                "action": action,
+                "resume_id": resume_id,
+                "model_called": False,
+            },
+        )
+    message = {"save": "投递准备已保存。", "confirm": "已进入待投递，仍需你在平台上手动执行。", "skip": "已跳过本次投递准备。"}[action]
+    return redirect_with_notice(target_path, message, "success")
+
+
 @app.get("/communications")
 def communications_page(request: Request) -> Any:
     with connect() as conn:
@@ -4055,6 +4192,120 @@ def interview_practice_questions(conn: Any, review: dict[str, Any]) -> list[dict
     return questions[:24]
 
 
+def application_preparation_eligibility(job: dict[str, Any]) -> tuple[bool, str]:
+    if job.get("recommendation") != "必投":
+        return False, "该岗位当前不是“必投”建议，暂不自动进入投递准备。"
+    if job.get("risk_level") != "低":
+        return False, "该岗位风险不是“低”，需要人工确认后再决定是否投递。"
+    if job.get("status") not in {"待确认", "待投递"}:
+        return False, f"岗位当前状态为“{job.get('status') or '未设置'}”，不在待投递阶段。"
+    return True, "岗位为必投且风险低，可进入投递准备。"
+
+
+def resume_recommendation_for_job(conn: Any, job: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
+    rows = conn.execute("SELECT * FROM resume_versions ORDER BY is_default DESC, id").fetchall()
+    resumes = [{key: row[key] for key in row.keys()} for row in rows]
+    if not resumes:
+        return None, "当前没有可用简历版本，请先在候选人画像页补充简历。"
+
+    selected_resume_id = int(job["selected_resume_id"]) if job.get("selected_resume_id") else None
+    for resume in resumes:
+        if resume["id"] == selected_resume_id:
+            return resume, "该版本是分析此 JD 时已选用的简历，优先沿用。"
+
+    job_text = " ".join(str(job.get(key) or "") for key in ("title", "jd_text")).lower()
+    focus_rules = [
+        ("agent", ["agent", "智能体", "工具调用", "function calling"]),
+        ("backend", ["后端", "backend", "fastapi", "接口", "api", "服务端"]),
+        ("application", ["ai 应用", "大模型应用", "rag", "检索", "llm"]),
+    ]
+    job_focus = {name for name, keywords in focus_rules if any(keyword in job_text for keyword in keywords)}
+
+    def score(resume: dict[str, Any]) -> int:
+        resume_text = f"{resume.get('name') or ''} {resume.get('target_role') or ''}".lower()
+        value = 4 if resume.get("is_default") else 0
+        for name, keywords in focus_rules:
+            if name in job_focus and any(keyword in resume_text for keyword in keywords):
+                value += 40 if name == "agent" else 20
+        return value
+
+    recommended = max(resumes, key=score)
+    if job_focus:
+        focus_label = "、".join(
+            {"agent": "Agent", "backend": "AI 后端", "application": "AI 应用"}[item]
+            for item in ["agent", "backend", "application"]
+            if item in job_focus
+        )
+        return recommended, f"根据岗位中的 {focus_label} 关键词，推荐目标方向最接近的版本。"
+    return recommended, "岗位方向信号不足，暂推荐默认简历版本；请在确认前人工核对。"
+
+
+def application_recommendation_reason(job: dict[str, Any]) -> str:
+    scoring = (job.get("extracted") or {}).get("scoring") or {}
+    matched_skills = [str(item) for item in scoring.get("matched_skills") or [] if str(item).strip()]
+    missing_skills = [str(item) for item in scoring.get("missing_skills") or [] if str(item).strip()]
+    parts = [f"匹配分 {job.get('match_score') or 0}，当前分析建议为“必投”，风险为“低”。"]
+    if matched_skills:
+        parts.append("已匹配：" + "、".join(matched_skills[:6]) + "。")
+    if missing_skills:
+        parts.append("投递前仍需确认：" + "、".join(missing_skills[:4]) + "。")
+    return "".join(parts)
+
+
+def ensure_application_preparation_for_job(conn: Any, job_id: int, *, trigger_type: str) -> dict[str, Any]:
+    existing = conn.execute("SELECT id, status FROM application_preparations WHERE job_id = ?", (job_id,)).fetchone()
+    if existing:
+        return {"created": False, "preparation_id": int(existing["id"]), "status": existing["status"]}
+
+    row = conn.execute("SELECT * FROM job_postings WHERE id = ?", (job_id,)).fetchone()
+    if not row:
+        return {"created": False, "preparation_id": None, "reason": "岗位不存在。"}
+    job = parse_json_fields({key: row[key] for key in row.keys()})
+    eligible, reason = application_preparation_eligibility(job)
+    if not eligible:
+        return {"created": False, "preparation_id": None, "reason": reason}
+
+    resume, resume_reason = resume_recommendation_for_job(conn, job)
+    now = utc_now()
+    cursor = conn.execute(
+        """
+        INSERT INTO application_preparations (
+            job_id, resume_id, recommendation_reason, resume_reason,
+            status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            job_id,
+            int(resume["id"]) if resume else None,
+            application_recommendation_reason(job),
+            resume_reason,
+            "待确认",
+            now,
+            now,
+        ),
+    )
+    preparation_id = int(cursor.lastrowid)
+    label = " - ".join(item for item in [job.get("company"), job.get("title")] if item) or f"岗位 {job_id}"
+    conn.execute(
+        "INSERT INTO application_events (job_id, event_type, content, created_at) VALUES (?, ?, ?, ?)",
+        (job_id, "投递准备生成", f"{label} 已进入本地投递准备，仍需人工确认。", now),
+    )
+    log_agent_action(
+        conn,
+        action_type="application_preparation",
+        status="待确认",
+        summary=f"已生成投递准备：{label}",
+        job_id=job_id,
+        decision={
+            "trigger_type": trigger_type,
+            "preparation_id": preparation_id,
+            "resume_id": int(resume["id"]) if resume else None,
+            "model_called": False,
+        },
+    )
+    return {"created": True, "preparation_id": preparation_id, "resume_name": resume.get("name") if resume else ""}
+
+
 @app.post("/jobs/bulk-status")
 async def bulk_update_jobs(request: Request) -> RedirectResponse:
     form = await request.form()
@@ -4111,16 +4362,32 @@ def job_detail(job_id: int, request: Request) -> Any:
             "SELECT id, created_at FROM interview_preparations WHERE job_id = ? ORDER BY created_at DESC, id DESC",
             (job_id,),
         ).fetchall()
+        preparation = conn.execute(
+            """
+            SELECT p.*, r.name AS resume_name
+            FROM application_preparations p
+            LEFT JOIN resume_versions r ON r.id = p.resume_id
+            WHERE p.job_id = ?
+            """,
+            (job_id,),
+        ).fetchone()
+        resumes = conn.execute("SELECT id, name, target_role FROM resume_versions ORDER BY is_default DESC, id").fetchall()
     if not job:
         return redirect("/jobs")
+    job_data = parse_json_fields({key: job[key] for key in job.keys()})
+    application_eligible, application_block_reason = application_preparation_eligibility(job_data)
     return templates.TemplateResponse(
         request,
         "job_detail.html",
         {
-            "job": parse_json_fields({key: job[key] for key in job.keys()}),
+            "job": job_data,
             "research": [{key: row[key] for key in row.keys()} for row in research],
             "events": [{key: row[key] for key in row.keys()} for row in events],
             "interviews": [{key: row[key] for key in row.keys()} for row in interviews],
+            "application_preparation": {key: preparation[key] for key in preparation.keys()} if preparation else None,
+            "application_eligible": application_eligible,
+            "application_block_reason": application_block_reason,
+            "resumes": [{key: row[key] for key in row.keys()} for row in resumes],
             "analysis_source_label": analysis_source_label,
             "notice": request.query_params.get("notice", ""),
             "notice_type": request.query_params.get("notice_type", "info"),

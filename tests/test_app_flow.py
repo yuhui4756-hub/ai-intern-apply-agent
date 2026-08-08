@@ -408,6 +408,109 @@ def test_interview_practice_saves_attempts_and_updates_weak_points(tmp_path, mon
     assert '"model_called": false' in action["decision_json"]
 
 
+def test_application_preparation_recommends_resume_and_requires_confirmation(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "application-preparation.sqlite3"))
+
+    from app import main
+    from app.db import connect, dumps, init_db, utc_now
+
+    init_db()
+    client = TestClient(main.app)
+    now = utc_now()
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO job_postings (
+                platform, title, company, city, jd_text, extracted_json,
+                match_score, match_level, risk_level, recommendation, status,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "Boss 直聘",
+                "AI Agent 开发实习生",
+                "杭州候选科技有限公司",
+                "杭州",
+                "负责 Agent 工具调用、FastAPI 接口和 RAG 检索服务。",
+                dumps({"extracted": {}, "scoring": {"matched_skills": ["Python", "FastAPI", "RAG"]}}),
+                88,
+                "高匹配",
+                "低",
+                "必投",
+                "待确认",
+                now,
+                now,
+            ),
+        )
+        job_id = int(cursor.lastrowid)
+        high_risk_job_id = int(
+            conn.execute(
+                """
+                INSERT INTO job_postings (
+                    title, company, jd_text, risk_level, recommendation, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                ("高风险 AI Agent 岗位", "风险公司", "Agent", "高", "必投", "待确认", now, now),
+            ).lastrowid
+        )
+
+    refreshed = client.post("/applications/refresh", follow_redirects=False)
+    assert refreshed.status_code == 303
+    with connect() as conn:
+        preparation = conn.execute(
+            """
+            SELECT p.id, p.status, r.name AS resume_name
+            FROM application_preparations p
+            LEFT JOIN resume_versions r ON r.id = p.resume_id
+            WHERE p.job_id = ?
+            """,
+            (job_id,),
+        ).fetchone()
+        skipped_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM application_preparations WHERE job_id = ?",
+            (high_risk_job_id,),
+        ).fetchone()["count"]
+    assert preparation["status"] == "待确认"
+    assert preparation["resume_name"] == "Agent 开发版"
+    assert skipped_count == 0
+
+    detail = client.get(f"/jobs/{job_id}")
+    assert detail.status_code == 200
+    assert "投递准备" in detail.text
+    assert "确认进入待投递" in detail.text
+
+    listing = client.get("/applications")
+    assert listing.status_code == 200
+    assert "杭州候选科技有限公司" in listing.text
+    assert "确认待投递" in listing.text
+
+    confirmed = client.post(
+        f"/applications/{preparation['id']}",
+        data={"resume_id": "2", "user_note": "先确认到岗时间", "action": "confirm"},
+        follow_redirects=False,
+    )
+    assert confirmed.status_code == 303
+    with connect() as conn:
+        preparation = conn.execute(
+            "SELECT status, user_note FROM application_preparations WHERE id = ?", (preparation["id"],)
+        ).fetchone()
+        job = conn.execute("SELECT status FROM job_postings WHERE id = ?", (job_id,)).fetchone()
+        event = conn.execute(
+            "SELECT event_type, content FROM application_events WHERE job_id = ? ORDER BY id DESC LIMIT 1", (job_id,)
+        ).fetchone()
+        action = conn.execute(
+            "SELECT action_type, status, decision_json FROM agent_action_logs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert preparation["status"] == "已确认"
+    assert preparation["user_note"] == "先确认到岗时间"
+    assert job["status"] == "待投递"
+    assert event["event_type"] == "投递准备确认"
+    assert "尚未在招聘平台执行投递" in event["content"]
+    assert action["action_type"] == "application_preparation"
+    assert action["status"] == "已确认"
+    assert '"model_called": false' in action["decision_json"]
+
+
 def test_import_job_from_url_flow(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "url.sqlite3"))
 
