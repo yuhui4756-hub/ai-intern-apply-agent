@@ -64,6 +64,14 @@
           <td>
             {% if item.status == "已确认" %}
             <p>已进入待投递。</p>
+            <form method="post" action="/applications/{{ item.id }}/open-browser">
+              <input type="hidden" name="return_to" value="/applications">
+              <button class="button compact" type="submit">打开岗位页</button>
+            </form>
+            <form method="post" action="/applications/{{ item.id }}/browser-probe">
+              <input type="hidden" name="return_to" value="/applications">
+              <button class="button compact" type="submit">只读演练</button>
+            </form>
             {% elif item.status == "已跳过" %}
             <p>未改变岗位状态。</p>
             {% else %}

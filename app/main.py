@@ -28,6 +28,7 @@ from .services.analyzer import (
     score_job,
 )
 from .services.browser_patrol import capture_browser_patrol_observations, open_message_patrol_browser
+from .services.application_browser import build_application_browser_plan, probe_application_browser_plan
 from .services.communication_browser import build_browser_send_adapter_plan, probe_browser_send_adapter_plan
 from .services.conversation import classify_conversation, prepare_conversation_text
 from .services.github_projects import (
@@ -138,6 +139,8 @@ def action_type_label(value: str) -> str:
         "interview_feedback_update": "面试反馈",
         "interview_practice": "模拟面试",
         "application_preparation": "投递准备",
+        "application_browser_open": "投递页面打开",
+        "application_browser_probe": "投递页面演练",
         "github_project_refresh": "GitHub 项目刷新",
     }.get(value or "", value or "-")
 
@@ -3381,6 +3384,54 @@ async def update_application_preparation(preparation_id: int, request: Request) 
     return redirect_with_notice(target_path, message, "success")
 
 
+@app.post("/applications/{preparation_id}/open-browser")
+async def open_application_browser(preparation_id: int, request: Request) -> RedirectResponse:
+    form = await request.form()
+    return_to = str(form.get("return_to") or "/applications")
+    if not return_to.startswith("/") or return_to.startswith("//"):
+        return_to = "/applications"
+    with connect() as conn:
+        item = application_browser_item(conn, preparation_id)
+    if not item:
+        return redirect_with_notice(return_to, "没有找到这条投递准备。", "error")
+    plan = build_application_browser_plan(item)
+    if plan.get("browser_action") == "blocked":
+        return redirect_with_notice(return_to, str(plan.get("reason") or "当前不能打开投递页面。"), "error")
+    try:
+        target_url = await run_in_threadpool(open_message_patrol_browser, str(item.get("source_url") or ""))
+    except ValueError as exc:
+        return redirect_with_notice(return_to, f"打开受控 Edge 失败：{str(exc)[:180]}", "error")
+    with connect() as conn:
+        log_agent_action(
+            conn,
+            action_type="application_browser_open",
+            status="已打开",
+            summary="已在受控 Edge 打开岗位页，尚未执行任何填写或投递。",
+            job_id=int(item["job_id"]),
+            decision={
+                "preparation_id": preparation_id,
+                "source_url_host": (urlparse(target_url).hostname or "").lower(),
+                "browser_filled": False,
+                "browser_clicked": False,
+                "resume_uploaded": False,
+                "model_called": False,
+            },
+        )
+    return redirect_with_notice(return_to, "已在受控 Edge 打开岗位页。登录并确认页面后，可执行只读演练。", "success")
+
+
+@app.post("/applications/{preparation_id}/browser-probe")
+async def probe_application_browser(preparation_id: int, request: Request) -> RedirectResponse:
+    form = await request.form()
+    return_to = str(form.get("return_to") or "/applications")
+    if not return_to.startswith("/") or return_to.startswith("//"):
+        return_to = "/applications"
+    result = await run_in_threadpool(run_application_browser_probe, preparation_id)
+    status = str(result.get("status") or "")
+    notice_type = "success" if status == "探测完成" else "error" if status in {"浏览器未连接", "未找到投递准备"} else "info"
+    return redirect_with_notice(return_to, f"投递页面只读演练：{result.get('note') or status}", notice_type)
+
+
 @app.get("/communications")
 def communications_page(request: Request) -> Any:
     with connect() as conn:
@@ -4304,6 +4355,61 @@ def ensure_application_preparation_for_job(conn: Any, job_id: int, *, trigger_ty
         },
     )
     return {"created": True, "preparation_id": preparation_id, "resume_name": resume.get("name") if resume else ""}
+
+
+def application_browser_item(conn: Any, preparation_id: int) -> dict[str, Any] | None:
+    row = conn.execute(
+        """
+        SELECT p.id AS preparation_id, p.status AS preparation_status, p.resume_id,
+               j.id AS job_id, j.platform, j.source_url, j.title AS job_title,
+               j.company, j.status AS job_status, r.name AS resume_name
+        FROM application_preparations p
+        JOIN job_postings j ON j.id = p.job_id
+        LEFT JOIN resume_versions r ON r.id = p.resume_id
+        WHERE p.id = ?
+        """,
+        (preparation_id,),
+    ).fetchone()
+    return {key: row[key] for key in row.keys()} if row else None
+
+
+def run_application_browser_probe(preparation_id: int) -> dict[str, Any]:
+    with connect() as conn:
+        item = application_browser_item(conn, preparation_id)
+    if not item:
+        return {"status": "未找到投递准备", "note": "没有找到这条投递准备。", "preparation_id": preparation_id}
+
+    plan = build_application_browser_plan(item)
+    try:
+        result = probe_application_browser_plan(plan)
+    except ValueError as exc:
+        result = {
+            **plan,
+            "status": "浏览器未连接",
+            "note": str(exc)[:500],
+            "browser_probe_dry_run": True,
+            "browser_connected": False,
+            "probe_result": None,
+        }
+    with connect() as conn:
+        log_agent_action(
+            conn,
+            action_type="application_browser_probe",
+            status=str(result.get("status") or "未知"),
+            summary=str(result.get("note") or "投递页面只读演练完成。"),
+            job_id=int(item["job_id"]),
+            decision={
+                "preparation_id": preparation_id,
+                "browser_action": result.get("browser_action"),
+                "browser_connected": bool(result.get("browser_connected")),
+                "probe_status": (result.get("probe_result") or {}).get("probe_status"),
+                "browser_filled": False,
+                "browser_clicked": False,
+                "resume_uploaded": False,
+                "model_called": False,
+            },
+        )
+    return result
 
 
 @app.post("/jobs/bulk-status")

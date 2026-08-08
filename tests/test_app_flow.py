@@ -511,6 +511,133 @@ def test_application_preparation_recommends_resume_and_requires_confirmation(tmp
     assert '"model_called": false' in action["decision_json"]
 
 
+def test_application_browser_dry_run_requires_confirmation_and_never_fills(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "application-browser.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db, utc_now
+    from app.services.application_browser import build_application_browser_plan, normalize_text, probe_application_browser_plan, text_digest
+
+    init_db()
+    client = TestClient(main.app)
+    now = utc_now()
+    with connect() as conn:
+        resume_id = conn.execute("SELECT id FROM resume_versions ORDER BY id LIMIT 1").fetchone()["id"]
+        job_id = int(
+            conn.execute(
+                """
+                INSERT INTO job_postings (
+                    platform, source_url, title, company, jd_text, risk_level, recommendation,
+                    status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "Boss 直聘",
+                    "https://www.zhipin.com/job_detail/application-browser.html",
+                    "AI Agent 开发实习生",
+                    "深圳页面演练科技有限公司",
+                    "Agent、Python、FastAPI",
+                    "低",
+                    "必投",
+                    "待确认",
+                    now,
+                    now,
+                ),
+            ).lastrowid
+        )
+        preparation_id = int(
+            conn.execute(
+                """
+                INSERT INTO application_preparations (
+                    job_id, resume_id, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (job_id, resume_id, "待确认", now, now),
+            ).lastrowid
+        )
+
+    opened: dict[str, str] = {}
+    monkeypatch.setattr(main, "open_message_patrol_browser", lambda url: opened.setdefault("url", url) or url)
+    blocked = client.post(f"/applications/{preparation_id}/open-browser", data={"return_to": "/applications"}, follow_redirects=False)
+    assert blocked.status_code == 303
+    assert "url" not in opened
+
+    with connect() as conn:
+        conn.execute("UPDATE application_preparations SET status = ? WHERE id = ?", ("已确认", preparation_id))
+        conn.execute("UPDATE job_postings SET status = ? WHERE id = ?", ("待投递", job_id))
+
+    opened_response = client.post(
+        f"/applications/{preparation_id}/open-browser",
+        data={"return_to": "/applications"},
+        follow_redirects=False,
+    )
+    assert opened_response.status_code == 303
+    assert opened["url"] == "https://www.zhipin.com/job_detail/application-browser.html"
+
+    item = {
+        "preparation_id": preparation_id,
+        "job_id": job_id,
+        "platform": "Boss 直聘",
+        "company": "深圳页面演练科技有限公司",
+        "job_title": "AI Agent 开发实习生",
+        "source_url": opened["url"],
+        "resume_id": resume_id,
+        "resume_name": "AI 应用开发版",
+        "preparation_status": "已确认",
+        "job_status": "待投递",
+    }
+    plan = build_application_browser_plan(item)
+    page_text = "深圳页面演练科技有限公司 AI Agent 开发实习生 立即沟通 选择简历"
+    apply_selector = plan["selector_candidates"]["application_button"][0]
+    resume_selector = plan["selector_candidates"]["resume_control"][0]
+    probe = probe_application_browser_plan(
+        plan,
+        page_snapshots=[
+            {
+                "url": opened["url"],
+                "title": "AI Agent 开发实习生 - 深圳页面演练科技有限公司",
+                "host": "www.zhipin.com",
+                "text_length": len(page_text),
+                "text_digest": text_digest(page_text),
+                "normalized_text": normalize_text(page_text),
+                "selectors": {apply_selector: 1, resume_selector: 1},
+            }
+        ],
+    )
+    assert probe["status"] == "探测完成"
+    assert probe["probe_result"]["probe_status"] == "probe_ready"
+    assert probe["probe_result"]["application_button_count"] == 1
+    assert probe["probe_result"]["resume_control_count"] == 1
+    assert page_text not in str(probe)
+    assert probe["browser_filled"] is False
+    assert probe["browser_clicked"] is False
+    assert probe["resume_uploaded"] is False
+
+    fake_result = {
+        **plan,
+        "status": "探测完成",
+        "note": "页面身份匹配，且已找到投递或简历控件候选。",
+        "browser_connected": True,
+        "probe_result": {"probe_status": "probe_ready"},
+    }
+    monkeypatch.setattr(main, "probe_application_browser_plan", lambda _plan: fake_result)
+    probed = client.post(
+        f"/applications/{preparation_id}/browser-probe",
+        data={"return_to": "/applications"},
+        follow_redirects=False,
+    )
+    assert probed.status_code == 303
+    with connect() as conn:
+        job = conn.execute("SELECT status FROM job_postings WHERE id = ?", (job_id,)).fetchone()
+        log = conn.execute("SELECT action_type, status, decision_json FROM agent_action_logs ORDER BY id DESC LIMIT 1").fetchone()
+    assert job["status"] == "待投递"
+    assert log["action_type"] == "application_browser_probe"
+    assert log["status"] == "探测完成"
+    assert '"browser_filled": false' in log["decision_json"]
+    assert '"browser_clicked": false' in log["decision_json"]
+    assert '"resume_uploaded": false' in log["decision_json"]
+
+
 def test_import_job_from_url_flow(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "url.sqlite3"))
 
