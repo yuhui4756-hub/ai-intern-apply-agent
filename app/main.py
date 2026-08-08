@@ -46,6 +46,7 @@ from .services.github_projects import (
     project_from_snapshot,
     repo_key,
 )
+from .services.interview_export import render_interview_review_pdf
 from .services.job_fetcher import ensure_public_http_url, fetch_job_from_url, normalize_visible_text
 from .services.job_searcher import (
     SearchResult,
@@ -5422,6 +5423,32 @@ def download_interview_review(review_id: int) -> Response:
     return Response(
         row["review_markdown"] or "",
         media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/interviews/{review_id}/download.pdf")
+def download_interview_review_pdf(review_id: int) -> Response:
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT i.review_markdown, COALESCE(j.title, 'interview-review') AS title
+            FROM interview_preparations i
+            LEFT JOIN job_postings j ON j.id = i.job_id
+            WHERE i.id = ?
+            """,
+            (review_id,),
+        ).fetchone()
+    if not row:
+        return Response("Not found", status_code=404)
+    try:
+        pdf_bytes = render_interview_review_pdf(str(row["title"] or "interview-review"), str(row["review_markdown"] or ""))
+    except ValueError as exc:
+        return Response(str(exc), status_code=503, media_type="text/plain; charset=utf-8")
+    filename = safe_filename(row["title"] or "interview-review") + ".pdf"
+    return Response(
+        pdf_bytes,
+        media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 

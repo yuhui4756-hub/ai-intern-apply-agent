@@ -713,6 +713,30 @@ def test_interview_recording_upload_and_local_transcription_refreshes_review(tmp
     assert '"removed_transcript": true' in log["decision_json"]
 
 
+def test_interview_review_pdf_download(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "interview-pdf.sqlite3"))
+
+    from app import main
+    from app.db import init_db
+
+    init_db()
+    client = TestClient(main.app)
+    created = client.post(
+        "/interviews",
+        data={"job_id": "", "source_text": "问：RAG 召回不准时怎么排查？\n答：先检查切分和评测。"},
+        follow_redirects=False,
+    )
+    assert created.status_code == 303
+    review_id = int(created.headers["location"].rstrip("/").split("/")[-1])
+
+    response = client.get(f"/interviews/{review_id}/download.pdf")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/pdf")
+    assert response.content.startswith(b"%PDF-")
+    assert len(response.content) > 500
+
+
 def test_import_job_from_url_flow(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "url.sqlite3"))
 
