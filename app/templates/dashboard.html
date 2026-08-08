@@ -1,12 +1,48 @@
 {% extends "layout.html" %}
-{% block title %}仪表盘 - 简历投递 Agent{% endblock %}
+{% block title %}求职流程 - 简历投递 Agent{% endblock %}
 {% block content %}
 <section class="page-head">
   <div>
-    <h1>仪表盘</h1>
-    <p>先把岗位筛清楚，再把每一次沟通和面试准备落到记录里。</p>
+    <h1>求职流程</h1>
+    <p>岗位筛选、受控沟通、投递确认和面试准备。</p>
   </div>
-  <a class="button primary" href="/jobs/new">分析新 JD</a>
+  <a class="button" href="/searches">岗位搜索</a>
+</section>
+
+{% if notice %}
+<section class="notice {{ notice_type }}">{{ notice }}</section>
+{% endif %}
+
+<section class="panel">
+  <div class="panel-title">
+    <div>
+      <h2>受控沟通</h2>
+      {% if workflow_active %}
+      <p class="muted">正在巡检受控 Edge 中的招聘平台聊天页。</p>
+      {% else %}
+      <p class="muted">启动后会打开专用 Edge，并启用自主询问与定时巡检。</p>
+      {% endif %}
+    </div>
+    <span class="badge">{{ "运行中" if workflow_active else "未启动" }}</span>
+  </div>
+  {% if workflow_active %}
+  <div class="form-actions table-actions">
+    <span class="badge">自主候选 {{ autonomous_candidates }}</span>
+    <span class="badge">每平台每日上限 3 条</span>
+    <span class="badge">每日总上限 5 条</span>
+    <a class="button" href="/communications">查看沟通记录</a>
+    <form method="post" action="/settings/automation-control" class="inline-form">
+      <input type="hidden" name="return_to" value="/">
+      <button class="button danger" type="submit" name="action" value="pause">暂停</button>
+    </form>
+  </div>
+  {% else %}
+  <form method="post" action="/communications/autonomous/start" class="form-actions">
+    <input type="hidden" name="return_to" value="/">
+    <button class="button primary" type="submit">启动自主沟通</button>
+    <a class="button" href="/settings">调整策略</a>
+  </form>
+  {% endif %}
 </section>
 
 <section class="metrics">

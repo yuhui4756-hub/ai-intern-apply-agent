@@ -1395,7 +1395,7 @@ def test_send_gate_blocks_low_match_job_draft(tmp_path, monkeypatch):
     assert "低匹配" in action_log["summary"]
 
 
-def test_communications_page_shows_executor_status_and_demo_button(tmp_path, monkeypatch):
+def test_communications_page_shows_primary_workflow_and_advanced_diagnostics(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "communications-executor-status.sqlite3"))
 
     from app import main
@@ -1407,10 +1407,10 @@ def test_communications_page_shows_executor_status_and_demo_button(tmp_path, mon
     response = client.get("/communications")
 
     assert response.status_code == 200
-    assert "自动回复执行器" in response.text
-    assert "待确认候选 0" in response.text
-    assert "创建本地演练草稿" in response.text
-    assert "暂无 dry-run 记录" in response.text
+    assert "受控沟通" in response.text
+    assert "启动自主沟通" in response.text
+    assert "高级诊断" in response.text
+    assert "草稿演练" in response.text
 
 
 def test_demo_draft_creates_pending_candidate_for_executor(tmp_path, monkeypatch):
@@ -1934,6 +1934,159 @@ def test_communication_browser_fill_requires_confirmation_and_never_sends(tmp_pa
     assert "岗位主要工作内容" not in action_log["decision_json"]
 
 
+def test_autonomous_communication_executor_sends_only_eligible_candidates(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "autonomous-send.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db, set_setting, utc_now
+
+    monkeypatch.setattr(main, "search_company", lambda *args, **kwargs: [])
+    init_db()
+    set_setting("communication_policy", {"mode": "autonomous", "max_auto_followups": 2})
+    set_setting("automation_control", {"paused": False, "pause_reason": "", "updated_at": utc_now()})
+    client = TestClient(main.app)
+
+    job_response = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "job",
+            "url": "https://www.zhipin.com/job_detail/autonomous-send.html",
+            "platform": "Boss 直聘",
+            "title": "AI Agent 开发实习生",
+            "text": "公司名称：深圳自动沟通科技有限公司\nAI Agent 开发实习生\n要求 Python、FastAPI、RAG，每周 5 天。",
+        },
+    )
+    job_id = job_response.json()["job_id"]
+    with connect() as conn:
+        conn.execute(
+            "UPDATE job_postings SET recommendation = ?, risk_level = ?, match_level = ? WHERE id = ?",
+            ("必投", "低", "高匹配", job_id),
+        )
+
+    captured = client.post(
+        "/api/extension/capture",
+        json={
+            "capture_type": "conversation",
+            "url": "https://www.zhipin.com/geek/chat/autonomous-send.html",
+            "platform": "Boss 直聘",
+            "title": "深圳自动沟通科技有限公司 HR 对话",
+            "text": "HR：可以的，你想了解 AI Agent 实习岗位的工作内容还是实习周期？",
+        },
+    )
+    draft_id = captured.json()["draft_id"]
+    with connect() as conn:
+        candidate = conn.execute(
+            "SELECT draft_type, status, communication_mode FROM message_drafts WHERE id = ?", (draft_id,)
+        ).fetchone()
+    assert candidate["draft_type"] == "自主询问候选"
+    assert candidate["status"] == "待确认"
+    assert candidate["communication_mode"] == "autonomous"
+    calls = []
+
+    def fake_send(browser_plan, message):
+        calls.append({"plan": browser_plan, "message": message})
+        return {
+            "status": "已发送",
+            "note": "已点击当前 Edge 聊天页的发送按钮。",
+            "filled_selector": "textarea",
+            "send_selector": "button:has-text('发送')",
+            "matched_page": {"host": "www.zhipin.com", "text_digest": "sha256:test|len:80"},
+            "message_filled": True,
+            "browser_clicked": True,
+            "message_text_saved": False,
+        }
+
+    monkeypatch.setattr(main, "send_message_in_controlled_edge", fake_send)
+    result = main.run_autonomous_communication_executor("test")
+
+    assert result["status"] == "执行完成"
+    assert result["sent_count"] == 1
+    assert len(calls) == 1
+    assert calls[0]["plan"]["browser_action"] == "dry_run_ready"
+    with connect() as conn:
+        draft = conn.execute("SELECT status FROM message_drafts WHERE id = ?", (draft_id,)).fetchone()
+        action_log = conn.execute(
+            "SELECT action_type, status, decision_json FROM agent_action_logs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert draft["status"] == "已发送"
+    assert action_log["action_type"] == "communication_autonomous_executor"
+    assert action_log["status"] == "执行完成"
+    assert '"browser_clicked": true' in action_log["decision_json"]
+    assert calls[0]["message"] not in action_log["decision_json"]
+
+
+def test_autonomous_communication_executor_blocks_noneligible_job(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "autonomous-send-blocked.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db, set_setting, utc_now
+
+    init_db()
+    set_setting("communication_policy", {"mode": "autonomous", "max_auto_followups": 2})
+    set_setting("automation_control", {"paused": False, "pause_reason": "", "updated_at": utc_now()})
+    now = utc_now()
+    with connect() as conn:
+        job_id = int(
+            conn.execute(
+                """
+                INSERT INTO job_postings (
+                    platform, source_url, title, company, jd_text, match_level,
+                    recommendation, risk_level, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "Boss 直聘",
+                    "https://www.zhipin.com/job_detail/autonomous-blocked.html",
+                    "AI Agent 开发实习生",
+                    "深圳谨慎科技有限公司",
+                    "Python、FastAPI、RAG",
+                    "中匹配",
+                    "可冲",
+                    "谨慎",
+                    "待确认",
+                    now,
+                    now,
+                ),
+            ).lastrowid
+        )
+        draft_id = int(
+            conn.execute(
+                """
+                INSERT INTO message_drafts (
+                    job_id, platform, draft_type, status, communication_mode,
+                    followup_index, followup_limit, reason, message, risk_flags_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job_id,
+                    "Boss 直聘",
+                    "自主询问候选",
+                    "待确认",
+                    "autonomous",
+                    1,
+                    2,
+                    "自主沟通测试",
+                    "您好，想了解岗位主要工作内容。",
+                    "[]",
+                    now,
+                    now,
+                ),
+            ).lastrowid
+        )
+
+    calls = []
+    monkeypatch.setattr(main, "send_message_in_controlled_edge", lambda *args: calls.append(args))
+    result = main.run_autonomous_communication_executor("test")
+
+    assert result["status"] == "执行完成"
+    assert result["sent_count"] == 0
+    assert result["blocked_count"] == 1
+    assert not calls
+    with connect() as conn:
+        draft = conn.execute("SELECT status FROM message_drafts WHERE id = ?", (draft_id,)).fetchone()
+    assert draft["status"] == "待确认"
+
+
 def test_communication_browser_fill_blocks_sensitive_page_signals():
     from app.services.communication_browser import find_fill_blocking_signals, normalize_probe_text
 
@@ -1942,6 +2095,23 @@ def test_communication_browser_fill_blocks_sensitive_page_signals():
     )
 
     assert signals == ["培训费", "押金", "上传简历"]
+
+
+def test_controlled_browser_refuses_tied_chat_page_matches():
+    from app.services.communication_browser import select_unique_verified_page
+
+    try:
+        select_unique_verified_page(
+            [
+                (50, object(), {"matched_page": {"host": "www.zhipin.com"}}),
+                (50, object(), {"matched_page": {"host": "www.zhipin.com"}}),
+            ],
+            action="发送草稿",
+        )
+    except ValueError as exc:
+        assert "多个同等匹配" in str(exc)
+    else:
+        raise AssertionError("同分聊天页不能继续自动发送")
 
 
 def test_conversation_capture_stores_cleaning_debug_and_feedback(tmp_path, monkeypatch):
@@ -2933,6 +3103,57 @@ def test_browser_patrol_open_route_delegates_to_controlled_edge(tmp_path, monkey
     assert response.status_code == 303
     assert response.headers["location"].startswith("/communications")
     assert opened["url"] == ""
+
+
+def test_autonomous_workflow_start_opens_edge_and_enables_bounded_patrol(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "autonomous-workflow.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db, set_setting, utc_now
+
+    init_db()
+    set_setting("communication_policy", {"mode": "draft", "max_auto_followups": 2})
+    set_setting("automation_control", {"paused": True, "pause_reason": "test", "updated_at": utc_now()})
+    set_setting(
+        "message_patrol_policy",
+        {
+            "enabled": False,
+            "interval_seconds": 300,
+            "cooldown_seconds": 120,
+            "last_tick_at": "",
+            "next_tick_at": "",
+            "last_status": "",
+            "updated_at": utc_now(),
+        },
+    )
+    opened: dict[str, str] = {}
+    monkeypatch.setattr(main, "open_message_patrol_browser", lambda start_url="": opened.setdefault("url", start_url) or "about:blank")
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/communications/autonomous/start",
+        data={"return_to": "/", "start_url": ""},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"].startswith("/?notice=")
+    assert opened["url"] == ""
+    assert main.communication_policy()["mode"] == "autonomous"
+    assert main.automation_control()["paused"] is False
+    assert main.message_patrol_policy()["enabled"] is True
+    with connect() as conn:
+        action_log = conn.execute(
+            "SELECT action_type, status, decision_json FROM agent_action_logs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert action_log["action_type"] == "workflow_control"
+    assert action_log["status"] == "已启动"
+    assert '"new_patrol_enabled": true' in action_log["decision_json"]
+
+    dashboard = client.get("/")
+    assert dashboard.status_code == 200
+    assert "受控沟通" in dashboard.text
+    assert "暂停" in dashboard.text
 
 
 def test_autonomous_mode_pauses_after_followup_limit(tmp_path, monkeypatch):

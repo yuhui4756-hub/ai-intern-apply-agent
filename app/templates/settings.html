@@ -35,9 +35,9 @@
       <strong>自动化控制：{{ automation_control.status_label }}</strong>
       {% if automation_control.paused %}
       <p class="muted">暂停原因：{{ automation_control.pause_reason or "用户手动暂停" }}</p>
-      <p class="muted">手动 Edge dry-run 巡检仍可执行只读差分；定时巡检和会生成草稿的采集会跳过。</p>
+      <p class="muted">手动 Edge 巡检仍可执行只读差分；定时巡检和后续自主沟通会跳过。</p>
       {% else %}
-      <p class="muted">运行中。暂停后，对话采集、定时巡检和后续自动动作会跳过，避免临时误触；手动 Edge dry-run 巡检仍可使用。</p>
+      <p class="muted">运行中。暂停后，对话采集、定时巡检和后续自主沟通会跳过；手动 Edge 巡检仍可使用。</p>
       {% endif %}
     </div>
     <form method="post" action="/settings/automation-control" class="form-actions">
@@ -61,7 +61,7 @@
     </label>
     <label>自主询问最多轮次
       <input name="max_auto_followups" type="number" min="0" max="10" step="1" value="{{ communication_policy.max_auto_followups }}">
-      <span class="muted">默认 2 轮。当前阶段仍不会自动发送消息，超过上限会转为需要我处理。</span>
+      <span class="muted">默认 2 轮。只有自主沟通工作流已启动、岗位低风险且页面身份唯一时才允许自动发送；超过上限转为需要我处理。</span>
     </label>
     <div class="form-actions">
       <button class="button primary" type="submit">保存沟通设置</button>
@@ -70,7 +70,7 @@
   <div class="panel-title">
     <div>
       <strong>定时巡检：{{ message_patrol_policy.status_label }}</strong>
-      <p class="muted">开启后，到点会尝试读取受控 Edge 已打开的招聘平台聊天页可见文本，并以 dry-run 做本地差分；无新内容不调用模型。</p>
+      <p class="muted">开启后，到点会读取受控 Edge 已打开的招聘平台聊天页并做本地差分；无新内容不调用模型。自主询问模式下，新内容还会进入受限发送闸门。</p>
       {% if message_patrol_policy.last_tick_at %}
       <p class="muted">上次 tick：{{ message_patrol_policy.last_tick_at }} / {{ message_patrol_policy.last_status or "-" }}</p>
       {% endif %}
@@ -98,7 +98,7 @@
     <label class="check"><input name="enabled" type="checkbox" {% if message_patrol_policy.enabled %}checked{% endif %}> 开启定时巡检调度</label>
     <label>巡检间隔（秒）
       <input name="interval_seconds" type="number" min="30" max="3600" step="30" value="{{ message_patrol_policy.interval_seconds }}">
-      <span class="muted">只做 dry-run 观察和差分，不自动发送。</span>
+      <span class="muted">草稿模式只观察和差分；自主询问模式仅对通过全部安全闸门的新消息执行受控发送。</span>
     </label>
     <label>手动 tick cooldown（秒）
       <input name="cooldown_seconds" type="number" min="0" max="3600" step="10" value="{{ message_patrol_policy.cooldown_seconds }}">

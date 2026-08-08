@@ -1,26 +1,13 @@
 {% extends "layout.html" %}
-{% block title %}沟通草稿 - 简历投递 Agent{% endblock %}
+{% block title %}沟通记录 - 简历投递 Agent{% endblock %}
 {% block content %}
 <section class="page-head">
   <div>
-    <h1>沟通草稿</h1>
-    <p>从当前 HR 对话采集可见文本，生成待确认草稿或转人工提示。</p>
+    <h1>沟通记录</h1>
+    <p>受控 Edge 巡检、岗位沟通与人工处理记录。</p>
   </div>
-  <div class="form-actions">
-    <a class="button" href="/jobs">岗位列表</a>
-    <a class="button primary" href="/applications">投递准备</a>
-  </div>
+  <a class="button" href="/jobs">岗位列表</a>
 </section>
-
-{% if automation_control.paused %}
-<section class="notice error automation-notice">
-  当前已暂停：{{ automation_control.pause_reason or "用户手动暂停" }}
-  <form method="post" action="/settings/automation-control" class="inline-form">
-    <input type="hidden" name="return_to" value="/communications">
-    <button class="button compact" type="submit" name="action" value="resume">恢复自动化</button>
-  </form>
-</section>
-{% endif %}
 
 {% if notice %}
 <section class="notice {{ notice_type }}">{{ notice }}</section>
@@ -30,165 +17,98 @@
   <div class="metric"><span>自动化</span><strong>{{ automation_control.status_label }}</strong></div>
   <div class="metric"><span>沟通模式</span><strong>{{ communication_policy.mode_label }}</strong></div>
   <div class="metric"><span>定时巡检</span><strong>{{ message_patrol_policy.status_label }}</strong></div>
-  <div class="metric"><span>待确认</span><strong>{{ draft_counts.get("待确认", 0) }}</strong></div>
+  <div class="metric"><span>自主候选</span><strong>{{ draft_type_counts.get("自主询问候选", 0) }}</strong></div>
   <div class="metric"><span>需要我处理</span><strong>{{ draft_counts.get("需要我处理", 0) }}</strong></div>
   <div class="metric"><span>已发送</span><strong>{{ draft_counts.get("已发送", 0) }}</strong></div>
-  <div class="metric"><span>已驳回</span><strong>{{ draft_counts.get("已驳回", 0) }}</strong></div>
-  <div class="metric"><span>自主询问候选</span><strong>{{ draft_type_counts.get("自主询问候选", 0) }}</strong></div>
-  <div class="metric"><span>误判反馈</span><strong>{{ feedback_counts.get("误判", 0) }}</strong></div>
 </section>
 
 <section class="panel">
   <div class="panel-title">
     <div>
-      <h2>巡检调度</h2>
-      <p class="muted">当前已接入 Edge dry-run 巡检：只读取受控 Edge 已打开的招聘平台聊天页可见文本，做本地差分，不自动回复。</p>
-      {% if message_patrol_policy.next_tick_at %}
-      <p class="muted">下次计划：{{ message_patrol_policy.next_tick_at }}</p>
+      <h2>受控沟通</h2>
+      {% if communication_policy.mode == "autonomous" and not automation_control.paused and message_patrol_policy.enabled %}
+      <p class="muted">受控 Edge 已进入巡检流程。新消息经分类、岗位匹配和安全闸门后才可能自主发送。</p>
+      {% if message_patrol_policy.next_tick_at %}<p class="muted">下次巡检：{{ message_patrol_policy.next_tick_at }}</p>{% endif %}
+      {% else %}
+      <p class="muted">启动后会打开专用 Edge、恢复自动化并启用定时巡检。</p>
       {% endif %}
     </div>
-    <span class="badge">{{ message_patrol_policy.status_label }}</span>
+    <span class="badge">{{ "运行中" if communication_policy.mode == "autonomous" and not automation_control.paused and message_patrol_policy.enabled else "未启动" }}</span>
   </div>
-  <form method="post" action="/message-patrol/open-browser" class="form-grid">
+  {% if communication_policy.mode == "autonomous" and not automation_control.paused and message_patrol_policy.enabled %}
+  <form method="post" action="/settings/automation-control" class="form-actions">
     <input type="hidden" name="return_to" value="/communications">
-    <label>起始链接（可选）
-      <input name="start_url" placeholder="可粘贴招聘平台聊天页；留空打开空白巡检窗口">
-    </label>
-    <div class="form-actions">
-      <button class="button" type="submit">打开 Edge 巡检窗口</button>
-    </div>
+    <button class="button danger" type="submit" name="action" value="pause">暂停自主沟通</button>
+    <a class="button" href="/settings">调整策略</a>
   </form>
-  <form method="post" action="/message-patrol/tick" class="form-actions">
+  {% else %}
+  <form method="post" action="/communications/autonomous/start" class="form-actions">
     <input type="hidden" name="return_to" value="/communications">
-    <button class="button" type="submit">手动 tick</button>
-    <button class="button primary" type="submit" formaction="/message-patrol/browser-dry-run">巡检当前 Edge 聊天页</button>
-    <a class="button" href="/settings">巡检设置</a>
+    <button class="button primary" type="submit">启动自主沟通</button>
+    <a class="button" href="/settings">调整策略</a>
   </form>
+  {% endif %}
 </section>
 
-<section class="panel">
+<section id="pending-drafts" class="panel">
   <div class="panel-title">
     <div>
-      <h2>自动回复执行器</h2>
-      <p class="muted">当前只支持 dry-run：扫描待确认草稿，执行发送闸门，生成计划、浏览器定位策略和日志，不会发送消息。</p>
+      <h2>沟通队列</h2>
+      <p class="muted">自主候选由受控流程处理；需要人工处理的内容不会自动发送。</p>
     </div>
-    <span class="badge">{{ executor_status.preview.status }}</span>
+    <span class="badge">待确认 {{ draft_counts.get("待确认", 0) }}</span>
   </div>
-  <div class="form-actions table-actions">
-    <span class="badge">待确认候选 {{ executor_status.pending_count }}</span>
-    <span class="badge">计划发送 {{ executor_status.allowed_count }}</span>
-    <span class="badge">闸门拦截 {{ executor_status.blocked_count }}</span>
-  </div>
-  <p class="muted">{{ executor_status.preview.note }}</p>
-  {% if executor_status.preview.plans %}
-  <details class="debug-details">
-    <summary>查看当前候选预览</summary>
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th>草稿</th>
-            <th>岗位</th>
-            <th>决策</th>
-            <th>闸门原因</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for plan in executor_status.preview.plans %}
-          <tr>
-            <td>#{{ plan.draft_id }}</td>
-            <td>
-              {{ (plan.company ~ " - " if plan.company else "") ~ (plan.job_title or "未匹配岗位") }}
-              <div class="muted">{{ plan.platform or "-" }}</div>
-            </td>
-            <td>{{ plan.decision }}</td>
-            <td>{{ plan.gate_reasons | join("；") if plan.gate_reasons else "-" }}</td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    </div>
-  </details>
-  {% endif %}
-  <form method="post" action="/communication-executor/demo-draft" class="form-actions table-actions">
-    <input type="hidden" name="return_to" value="/communications">
-    <button class="button" type="submit">创建本地演练草稿</button>
-    <span class="muted">没有真实 HR 对话时，用本地假数据验证执行器；不会发送消息。</span>
-  </form>
-  <form method="post" action="/communication-executor/dry-run" class="form-actions">
-    <input type="hidden" name="return_to" value="/communications">
-    <button class="button primary" type="submit">执行 dry-run</button>
-    <button class="button" type="submit" formaction="/communication-executor/browser-dry-run">生成浏览器定位策略</button>
-    <button class="button" type="submit" formaction="/communication-executor/browser-probe-dry-run">探测当前 Edge 页面</button>
-    <a class="button" href="#pending-drafts">前往待发送草稿（填入 Edge）</a>
-  </form>
-  {% if executor_status.latest %}
+  {% if drafts %}
   <div class="table-wrap">
     <table>
       <thead>
-        <tr>
-          <th>最近结果</th>
-          <th>状态</th>
-          <th>计数</th>
-          <th>摘要</th>
-        </tr>
+        <tr><th>岗位</th><th>类型</th><th>状态</th><th>原因 / 风险</th><th>草稿</th></tr>
       </thead>
       <tbody>
-        {% for log in executor_status.latest %}
+        {% for draft in drafts %}
         <tr>
           <td>
-            {{ action_type_label(log.action_type) }}
-            <div class="muted">{{ log.created_at }}</div>
+            {% if draft.job_id %}
+            <a href="/jobs/{{ draft.job_id }}">{{ (draft.company ~ " - " if draft.company else "") ~ (draft.job_title or "岗位") }}</a>
+            <div class="muted">{{ draft.job_status or "-" }}</div>
+            {% else %}<span class="empty">未匹配岗位</span>{% endif %}
           </td>
-          <td>{{ log.status or "-" }}</td>
           <td>
-            <span class="badge">候选 {{ log.candidate_count }}</span>
-            <span class="badge">放行 {{ log.allowed_count }}</span>
-            <span class="badge">拦截 {{ log.blocked_count }}</span>
-            {% if log.browser_ready_count or log.browser_skipped_count %}
-            <span class="badge">可定位 {{ log.browser_ready_count }}</span>
-            <span class="badge">跳过 {{ log.browser_skipped_count }}</span>
-            {% endif %}
-            {% if log.page_count or log.probe_ready_count or log.probe_not_found_count %}
-            <span class="badge">页面 {{ log.page_count }}</span>
-            <span class="badge">探测可用 {{ log.probe_ready_count }}</span>
-            <span class="badge">未找到 {{ log.probe_not_found_count }}</span>
-            {% endif %}
+            {{ draft.draft_type or "-" }}
+            {% if draft.communication_mode %}<div class="muted">{{ communication_mode_label(draft.communication_mode) }}</div>{% endif %}
+            {% if draft.followup_limit %}<span class="badge">第 {{ draft.followup_index }} / {{ draft.followup_limit }} 轮</span>{% endif %}
           </td>
-          <td>{{ log.summary or "-" }}</td>
+          <td>{{ draft.status }}</td>
+          <td>
+            <p>{{ draft.reason or "-" }}</p>
+            {% for flag in loads(draft.risk_flags_json, []) %}<div class="notice compact">{{ flag }}</div>{% endfor %}
+          </td>
+          <td>
+            <details class="debug-details">
+              <summary>查看与处理草稿</summary>
+              <form method="post" action="/message-drafts/{{ draft.id }}" class="form-stack">
+                <textarea id="draft-{{ draft.id }}" name="message" rows="5">{{ draft.message }}</textarea>
+                <div class="form-actions table-actions">
+                  <button class="button compact copy-button" type="button" data-copy-target="draft-{{ draft.id }}">复制</button>
+                  {% if draft.status == "待确认" %}
+                  <input class="browser-confirmation" name="confirmation" placeholder="输入 填入草稿" aria-label="浏览器填入确认">
+                  <button class="button compact" type="submit" formaction="/message-drafts/{{ draft.id }}/browser-fill">填入 Edge</button>
+                  <button class="button compact primary" type="submit" name="status" value="已发送">标记已发送</button>
+                  {% endif %}
+                  <button class="button compact" type="submit" name="status" value="待确认">保存编辑</button>
+                  <button class="button compact" type="submit" name="status" value="需要我处理">需要我处理</button>
+                  <button class="button compact" type="submit" name="status" value="已驳回">驳回</button>
+                </div>
+              </form>
+            </details>
+          </td>
         </tr>
         {% endfor %}
       </tbody>
     </table>
   </div>
   {% else %}
-  <p class="empty">暂无 dry-run 记录。可以先创建本地演练草稿，再执行 dry-run。</p>
-  {% endif %}
-</section>
-
-<section class="panel">
-  <div class="panel-title">
-    <h2>自动化控制</h2>
-    <span class="badge">{{ automation_control.status_label }}</span>
-  </div>
-  {% if automation_control.paused %}
-  <div class="notice compact error">当前已暂停：{{ automation_control.pause_reason or "用户手动暂停" }}</div>
-  <p class="muted">暂停会拦截对话采集、定时巡检和后续自动动作；“巡检当前 Edge 聊天页”是你主动触发的只读 dry-run，仍可使用。</p>
-  <form method="post" action="/settings/automation-control" class="form-actions">
-    <input type="hidden" name="return_to" value="/communications">
-    <button class="button primary" type="submit" name="action" value="resume">恢复自动化</button>
-  </form>
-  {% else %}
-  <p class="muted">暂停后，对话采集、定时巡检和后续自动动作会跳过；岗位采集、JD 分析、手动 Edge dry-run 巡检仍可使用。</p>
-  <form method="post" action="/settings/automation-control" class="form-grid">
-    <input type="hidden" name="return_to" value="/communications">
-    <label>暂停原因
-      <input name="pause_reason" placeholder="例如：今天不再自动处理 HR 消息">
-    </label>
-    <div class="form-actions">
-      <button class="button" type="submit" name="action" value="pause">暂停自动化</button>
-    </div>
-  </form>
+  <p class="empty">暂无沟通草稿。</p>
   {% endif %}
 </section>
 
@@ -201,40 +121,16 @@
   <div class="table-wrap">
     <table>
       <thead>
-        <tr>
-          <th>时间</th>
-          <th>平台</th>
-          <th>岗位</th>
-          <th>状态</th>
-          <th>计数</th>
-          <th>备注</th>
-          <th>操作</th>
-        </tr>
+        <tr><th>时间</th><th>平台</th><th>岗位</th><th>状态</th><th>计数</th><th>备注</th><th>操作</th></tr>
       </thead>
       <tbody>
         {% for run in patrol_runs %}
         <tr>
           <td>{{ run.created_at }}</td>
-          <td>
-            {{ run.platform or "-" }}
-            <div class="muted">{{ run.trigger_type or "-" }}</div>
-          </td>
-          <td>
-            {% if run.job_id %}
-            <a href="/jobs/{{ run.job_id }}">{{ (run.company ~ " - " if run.company else "") ~ (run.job_title or "岗位") }}</a>
-            {% else %}
-            <span class="empty">未匹配岗位</span>
-            {% endif %}
-          </td>
+          <td>{{ run.platform or "-" }}<div class="muted">{{ run.trigger_type or "-" }}</div></td>
+          <td>{% if run.job_id %}<a href="/jobs/{{ run.job_id }}">{{ (run.company ~ " - " if run.company else "") ~ (run.job_title or "岗位") }}</a>{% else %}<span class="empty">未匹配岗位</span>{% endif %}</td>
           <td>{{ run.status or "-" }}</td>
-          <td>
-            <span class="badge">查 {{ run.checked_count }}</span>
-            <span class="badge">新 {{ run.new_count }}</span>
-            <span class="badge">跳 {{ run.skipped_count }}</span>
-            {% if run.error_count %}
-            <span class="badge">错 {{ run.error_count }}</span>
-            {% endif %}
-          </td>
+          <td><span class="badge">查 {{ run.checked_count }}</span> <span class="badge">新 {{ run.new_count }}</span> <span class="badge">跳 {{ run.skipped_count }}</span>{% if run.error_count %} <span class="badge">错 {{ run.error_count }}</span>{% endif %}</td>
           <td>{{ run.note or "-" }}</td>
           <td>
             {% if run.fingerprint_key and run.fingerprint and run.status != "已忽略" %}
@@ -242,221 +138,92 @@
               <input type="hidden" name="return_to" value="/communications">
               <button class="button compact" type="submit">忽略相同消息</button>
             </form>
-            {% elif run.status == "已忽略" %}
-            <span class="badge">已忽略</span>
-            {% else %}
-            <span class="empty">-</span>
-            {% endif %}
+            {% elif run.status == "已忽略" %}<span class="badge">已忽略</span>{% else %}<span class="empty">-</span>{% endif %}
           </td>
         </tr>
         {% endfor %}
       </tbody>
     </table>
   </div>
-  {% else %}
-  <p class="empty">暂无巡检记录。</p>
-  {% endif %}
-</section>
-
-<section id="pending-drafts" class="panel">
-  <div class="panel-title">
-    <h2>待发送队列</h2>
-    <span class="muted">填入 Edge 后仍不自动发送。</span>
-  </div>
-  {% if drafts %}
-  <div class="table-wrap">
-    <table>
-      <thead>
-        <tr>
-          <th>岗位</th>
-          <th>类型</th>
-          <th>状态</th>
-          <th>原因 / 风险</th>
-          <th>草稿</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for draft in drafts %}
-        <tr>
-          <td>
-            {% if draft.job_id %}
-            <a href="/jobs/{{ draft.job_id }}">{{ (draft.company ~ " - " if draft.company else "") ~ (draft.job_title or "岗位") }}</a>
-            <div class="muted">{{ draft.job_status or "-" }}</div>
-            {% else %}
-            <span class="empty">未匹配岗位</span>
-            {% endif %}
-          </td>
-          <td>
-            {{ draft.draft_type or "-" }}
-            {% if draft.communication_mode %}
-            <div class="muted">{{ communication_mode_label(draft.communication_mode) }}</div>
-            {% endif %}
-            {% if draft.followup_limit %}
-            <span class="badge">第 {{ draft.followup_index }} / {{ draft.followup_limit }} 轮</span>
-            {% endif %}
-          </td>
-          <td>{{ draft.status }}</td>
-          <td>
-            <p>{{ draft.reason or "-" }}</p>
-            {% set flags = loads(draft.risk_flags_json, []) %}
-            {% for flag in flags %}
-            <div class="notice compact">{{ flag }}</div>
-            {% endfor %}
-          </td>
-          <td>
-            <form method="post" action="/message-drafts/{{ draft.id }}" class="form-stack">
-              <textarea id="draft-{{ draft.id }}" name="message" rows="5">{{ draft.message }}</textarea>
-              <div class="form-actions table-actions">
-                <button class="button compact copy-button" type="button" data-copy-target="draft-{{ draft.id }}">复制</button>
-                {% if draft.status == "待确认" %}
-                <input class="browser-confirmation" name="confirmation" placeholder="输入 填入草稿" aria-label="浏览器填入确认">
-                <button class="button compact" type="submit" formaction="/message-drafts/{{ draft.id }}/browser-fill">填入 Edge</button>
-                <button class="button compact primary" type="submit" name="status" value="已发送">标记已发送</button>
-                {% endif %}
-                <button class="button compact" type="submit" name="status" value="待确认">保存编辑</button>
-                <button class="button compact" type="submit" name="status" value="需要我处理">需要我处理</button>
-                <button class="button compact" type="submit" name="status" value="已驳回">驳回</button>
-              </div>
-            </form>
-          </td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
-  {% else %}
-  <p class="empty">还没有草稿。打开招聘平台当前 HR 对话页后，用扩展点击“采集当前对话”。</p>
-  {% endif %}
+  {% else %}<p class="empty">暂无巡检记录。</p>{% endif %}
 </section>
 
 <section class="panel">
-  <div class="panel-title">
-    <h2>最近行为日志</h2>
-    <span class="muted">记录采集、草稿处理、反馈和设置变更。</span>
-  </div>
-  {% if action_logs %}
-  <div class="table-wrap">
-    <table>
-      <thead>
-        <tr>
-          <th>时间</th>
-          <th>动作</th>
-          <th>状态</th>
-          <th>对象</th>
-          <th>摘要</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for log in action_logs %}
-        <tr>
-          <td>{{ log.created_at }}</td>
-          <td>{{ action_type_label(log.action_type) }}</td>
-          <td>{{ log.status or "-" }}</td>
-          <td>
-            {% if log.job_id %}
-            <a href="/jobs/{{ log.job_id }}">{{ (log.company ~ " - " if log.company else "") ~ (log.job_title or "岗位") }}</a>
-            {% else %}
-            <span class="empty">全局</span>
-            {% endif %}
-            <div class="muted">{{ log.platform or "-" }}</div>
-          </td>
-          <td>
-            <p>{{ log.summary or "-" }}</p>
-            {% set decision = loads(log.decision_json, {}) %}
-            {% if decision %}
-            <details class="debug-details">
-              <summary>查看决策摘要</summary>
-              <pre class="pre compact-pre">{{ decision }}</pre>
-            </details>
-            {% endif %}
-            {% if log.error_message %}
-            <div class="notice compact error">{{ log.error_message }}</div>
-            {% endif %}
-          </td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
-  {% else %}
-  <p class="empty">暂无行为日志。</p>
-  {% endif %}
-</section>
-
-<section class="panel">
-  <div class="panel-title">
-    <h2>最近对话采集</h2>
-  </div>
+  <div class="panel-title"><h2>最近对话采集</h2><span class="badge">误判反馈 {{ feedback_counts.get("误判", 0) }}</span></div>
   {% if captures %}
   <div class="table-wrap">
     <table>
-      <thead>
-        <tr>
-          <th>时间</th>
-          <th>岗位</th>
-          <th>类型</th>
-          <th>摘要</th>
-          <th>校准反馈</th>
-        </tr>
-      </thead>
+      <thead><tr><th>时间</th><th>岗位</th><th>类型</th><th>摘要</th><th>反馈</th></tr></thead>
       <tbody>
         {% for capture in captures %}
         <tr>
           <td>{{ capture.created_at }}</td>
-          <td>
-            {% if capture.job_id %}
-            <a href="/jobs/{{ capture.job_id }}">{{ (capture.company ~ " - " if capture.company else "") ~ (capture.job_title or "岗位") }}</a>
-            {% else %}
-            <span class="empty">未匹配岗位</span>
-            {% endif %}
-            <div class="muted">{{ capture.platform or "-" }}</div>
-          </td>
+          <td>{% if capture.job_id %}<a href="/jobs/{{ capture.job_id }}">{{ (capture.company ~ " - " if capture.company else "") ~ (capture.job_title or "岗位") }}</a>{% else %}<span class="empty">未匹配岗位</span>{% endif %}<div class="muted">{{ capture.platform or "-" }}</div></td>
           <td>{{ capture.message_type or "-" }}</td>
           <td>
             <p>{{ capture.summary or "-" }}</p>
             <details class="debug-details">
               <summary>查看采集依据</summary>
               {% set ignored = loads(capture.ignored_lines_json, []) %}
-              {% if ignored %}
-              <p class="muted">已过滤页面按钮 / 系统噪声</p>
-              <pre class="pre compact-pre">{{ ignored | join("\n") }}</pre>
-              {% endif %}
-              <p class="muted">清洗后文本</p>
-              <pre class="pre compact-pre">{{ capture.conversation_text or "-" }}</pre>
-              <p class="muted">原始可见文本</p>
-              <pre class="pre compact-pre">{{ capture.raw_visible_text or capture.conversation_text or "-" }}</pre>
+              {% if ignored %}<p class="muted">已过滤页面按钮 / 系统噪声</p><pre class="pre compact-pre">{{ ignored | join("\n") }}</pre>{% endif %}
+              <p class="muted">清洗后文本</p><pre class="pre compact-pre">{{ capture.conversation_text or "-" }}</pre>
+              <p class="muted">原始可见文本</p><pre class="pre compact-pre">{{ capture.raw_visible_text or capture.conversation_text or "-" }}</pre>
             </details>
           </td>
           <td>
-            <form method="post" action="/conversation-captures/{{ capture.id }}" class="form-stack compact-form">
-              <label>反馈
-                <select name="feedback_status">
-                  {% for status in ["", "正确", "误判", "待观察"] %}
-                  <option value="{{ status }}" {% if capture.feedback_status == status %}selected{% endif %}>{{ status or "未标记" }}</option>
-                  {% endfor %}
-                </select>
-              </label>
-              <label>期望分类
-                <select name="expected_message_type">
-                  <option value="" {% if not capture.expected_message_type %}selected{% endif %}>不指定</option>
-                  {% for message_type in message_types %}
-                  <option value="{{ message_type }}" {% if capture.expected_message_type == message_type %}selected{% endif %}>{{ message_type }}</option>
-                  {% endfor %}
-                </select>
-              </label>
-              <label>备注
-                <textarea name="feedback_note" rows="3" placeholder="比如：猎聘底部按钮发简历被误判">{{ capture.feedback_note }}</textarea>
-              </label>
-              <button class="button compact" type="submit">保存反馈</button>
-            </form>
+            <details class="debug-details">
+              <summary>校准分类</summary>
+              <form method="post" action="/conversation-captures/{{ capture.id }}" class="form-stack compact-form">
+                <label>反馈
+                  <select name="feedback_status">{% for status in ["", "正确", "误判", "待观察"] %}<option value="{{ status }}" {% if capture.feedback_status == status %}selected{% endif %}>{{ status or "未标记" }}</option>{% endfor %}</select>
+                </label>
+                <label>期望分类
+                  <select name="expected_message_type"><option value="" {% if not capture.expected_message_type %}selected{% endif %}>不指定</option>{% for message_type in message_types %}<option value="{{ message_type }}" {% if capture.expected_message_type == message_type %}selected{% endif %}>{{ message_type }}</option>{% endfor %}</select>
+                </label>
+                <label>备注<textarea name="feedback_note" rows="3">{{ capture.feedback_note }}</textarea></label>
+                <button class="button compact" type="submit">保存反馈</button>
+              </form>
+            </details>
           </td>
         </tr>
         {% endfor %}
       </tbody>
     </table>
   </div>
-  {% else %}
-  <p class="empty">暂无对话采集记录。</p>
-  {% endif %}
+  {% else %}<p class="empty">暂无对话采集记录。</p>{% endif %}
+</section>
+
+<section class="panel">
+  <details class="debug-details">
+    <summary>高级诊断</summary>
+    <div class="panel-title"><div><h2>浏览器与执行器演练</h2><p class="muted">以下操作不会自动发送真实消息。</p></div><span class="badge">{{ executor_status.preview.status }}</span></div>
+    <form method="post" action="/message-patrol/open-browser" class="form-grid">
+      <input type="hidden" name="return_to" value="/communications">
+      <label>Edge 起始链接（可选）<input name="start_url" placeholder="招聘平台聊天页"></label>
+      <div class="form-actions"><button class="button" type="submit">打开受控 Edge</button></div>
+    </form>
+    <form method="post" action="/message-patrol/tick" class="form-actions table-actions">
+      <input type="hidden" name="return_to" value="/communications">
+      <button class="button" type="submit">手动 tick</button>
+      <button class="button" type="submit" formaction="/message-patrol/browser-dry-run">巡检当前 Edge</button>
+      <button class="button" type="submit" formaction="/communication-executor/dry-run">执行草稿演练</button>
+      <button class="button" type="submit" formaction="/communication-executor/browser-probe-dry-run">探测聊天页</button>
+    </form>
+    <p class="muted">{{ executor_status.preview.note }}</p>
+    {% if executor_status.preview.plans %}
+    <div class="table-wrap"><table><thead><tr><th>草稿</th><th>岗位</th><th>决策</th><th>闸门原因</th></tr></thead><tbody>{% for plan in executor_status.preview.plans %}<tr><td>#{{ plan.draft_id }}</td><td>{{ (plan.company ~ " - " if plan.company else "") ~ (plan.job_title or "未匹配岗位") }}<div class="muted">{{ plan.platform or "-" }}</div></td><td>{{ plan.decision }}</td><td>{{ plan.gate_reasons | join("；") if plan.gate_reasons else "-" }}</td></tr>{% endfor %}</tbody></table></div>
+    {% endif %}
+  </details>
+</section>
+
+<section class="panel">
+  <details class="debug-details">
+    <summary>行为日志</summary>
+    {% if action_logs %}
+    <div class="table-wrap"><table><thead><tr><th>时间</th><th>动作</th><th>状态</th><th>对象</th><th>摘要</th></tr></thead><tbody>
+      {% for log in action_logs %}<tr><td>{{ log.created_at }}</td><td>{{ action_type_label(log.action_type) }}</td><td>{{ log.status or "-" }}</td><td>{% if log.job_id %}<a href="/jobs/{{ log.job_id }}">{{ (log.company ~ " - " if log.company else "") ~ (log.job_title or "岗位") }}</a>{% else %}<span class="empty">全局</span>{% endif %}<div class="muted">{{ log.platform or "-" }}</div></td><td><p>{{ log.summary or "-" }}</p>{% set decision = loads(log.decision_json, {}) %}{% if decision %}<details class="debug-details"><summary>查看决策摘要</summary><pre class="pre compact-pre">{{ decision }}</pre></details>{% endif %}{% if log.error_message %}<div class="notice compact error">{{ log.error_message }}</div>{% endif %}</td></tr>{% endfor %}
+    </tbody></table></div>
+    {% else %}<p class="empty">暂无行为日志。</p>{% endif %}
+  </details>
 </section>
 {% endblock %}

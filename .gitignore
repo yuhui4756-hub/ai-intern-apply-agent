@@ -21,6 +21,7 @@ local_data/
 exports/
 logs/
 .playwright-cli/
+output/playwright/
 
 # Resume and interview private artifacts
 private/

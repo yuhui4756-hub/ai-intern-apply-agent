@@ -34,6 +34,7 @@ from .services.communication_browser import (
     build_browser_send_adapter_plan,
     fill_message_in_controlled_edge,
     probe_browser_send_adapter_plan,
+    send_message_in_controlled_edge,
 )
 from .services.conversation import classify_conversation, prepare_conversation_text
 from .services.github_projects import (
@@ -91,6 +92,9 @@ IGNORED_MESSAGE_FINGERPRINTS_KEY = "ignored_message_fingerprints"
 PATROL_SCHEDULER_POLL_SECONDS = 10
 MESSAGE_PATROL_OBSERVATION_LIMIT = 20
 COMMUNICATION_EXECUTOR_PLAN_LIMIT = 20
+AUTONOMOUS_DAILY_SEND_LIMIT = 5
+AUTONOMOUS_PLATFORM_DAILY_SEND_LIMIT = 3
+AUTONOMOUS_MESSAGE_BLOCKING_TEXT = ("简历", "附件", "电话", "微信", "邮箱", "身份证", "银行卡", "押金", "培训费", "贷款", "报价")
 INTERVIEW_PREP_TRIGGER_STATUSES = {"待面试", "面试准备中"}
 INTERVIEW_FEEDBACK_STATUSES = ["待练习", "已补强", "已归档"]
 APPLICATION_PREPARATION_STATUSES = ["待确认", "已确认", "已跳过"]
@@ -144,6 +148,9 @@ def action_type_label(value: str) -> str:
         "communication_browser_dry_run": "浏览器发送演练",
         "communication_browser_probe": "浏览器页面探测",
         "communication_browser_fill": "浏览器填入草稿",
+        "communication_autonomous_send": "自主沟通发送",
+        "communication_autonomous_executor": "自主沟通执行",
+        "workflow_control": "求职流程控制",
         "demo_draft_created": "演练草稿",
         "interview_prep_auto_create": "面试准备",
         "interview_feedback_update": "面试反馈",
@@ -169,6 +176,8 @@ def communication_policy() -> dict[str, Any]:
         "mode": mode,
         "mode_label": communication_mode_label(mode),
         "max_auto_followups": max(0, min(max_followups, 10)),
+        "daily_send_limit": AUTONOMOUS_DAILY_SEND_LIMIT,
+        "platform_daily_send_limit": AUTONOMOUS_PLATFORM_DAILY_SEND_LIMIT,
     }
 
 
@@ -236,6 +245,68 @@ def save_message_patrol_policy(policy: dict[str, Any]) -> None:
             "updated_at": str(policy.get("updated_at") or utc_now()),
         },
     )
+
+
+def start_autonomous_communication_workflow(start_url: str = "") -> dict[str, Any]:
+    """Open the controlled browser, then explicitly enable the bounded messaging workflow."""
+    target_url = open_message_patrol_browser(start_url)
+    old_policy = communication_policy()
+    old_control = automation_control()
+    old_patrol = message_patrol_policy()
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat(timespec="seconds")
+    interval_seconds = int(old_patrol["interval_seconds"])
+    next_tick_at = (now_dt + timedelta(seconds=min(30, interval_seconds))).isoformat(timespec="seconds")
+
+    set_setting(
+        COMMUNICATION_POLICY_KEY,
+        {
+            "mode": "autonomous",
+            "max_auto_followups": old_policy["max_auto_followups"],
+        },
+    )
+    set_setting(
+        AUTOMATION_CONTROL_KEY,
+        {
+            "paused": False,
+            "pause_reason": "",
+            "updated_at": now,
+        },
+    )
+    save_message_patrol_policy(
+        {
+            **old_patrol,
+            "enabled": True,
+            "next_tick_at": next_tick_at,
+            "updated_at": now,
+        }
+    )
+    with connect() as conn:
+        log_agent_action(
+            conn,
+            action_type="workflow_control",
+            status="已启动",
+            summary="已打开受控 Edge，并启用自主询问和定时巡检。",
+            decision={
+                "target_url": target_url,
+                "old_mode": old_policy["mode"],
+                "new_mode": "autonomous",
+                "old_paused": old_control["paused"],
+                "new_paused": False,
+                "old_patrol_enabled": old_patrol["enabled"],
+                "new_patrol_enabled": True,
+                "interval_seconds": interval_seconds,
+                "next_tick_at": next_tick_at,
+                "daily_send_limit": AUTONOMOUS_DAILY_SEND_LIMIT,
+                "platform_daily_send_limit": AUTONOMOUS_PLATFORM_DAILY_SEND_LIMIT,
+                "message_text_saved": False,
+            },
+        )
+    return {
+        "target_url": target_url,
+        "interval_seconds": interval_seconds,
+        "next_tick_at": next_tick_at,
+    }
 
 
 def log_agent_action(
@@ -516,8 +587,16 @@ def run_message_patrol_tick(trigger_type: str = "manual", force: bool = False) -
         checked_count = 0
         skipped_count = 1
     else:
+        autonomous = communication_policy()["mode"] == "autonomous"
         executor_trigger = "scheduled_executor" if trigger_type == "scheduler" else "manual_browser"
-        result = run_browser_message_patrol_executor(trigger_type=executor_trigger, dry_run=True)
+        result = run_browser_message_patrol_executor(trigger_type=executor_trigger, dry_run=not autonomous)
+        if autonomous and result.get("new_count"):
+            autonomous_result = run_autonomous_communication_executor(executor_trigger)
+            result = {
+                **result,
+                "autonomous_result": autonomous_result,
+                "note": f"{result['note']} 自主沟通：{autonomous_result['note']}",
+            }
         next_tick_at = ""
         if policy["enabled"]:
             next_tick_at = (now_dt + timedelta(seconds=int(policy["interval_seconds"]))).isoformat(timespec="seconds")
@@ -1362,7 +1441,8 @@ def find_job_for_conversation(
     existing = find_existing_job_by_source_url(conn, source_url)
     if existing and source_url_identifies_job(source_url) and platform_matches(platform, str(existing["platform"] or "")):
         return {key: existing[key] for key in existing.keys()}
-    clean_text = text or ""
+    # Chat pages often place the company name in the tab title rather than the visible message area.
+    clean_text = "\n".join(item for item in [page_title, text] if item)
     rows = conn.execute("SELECT * FROM job_postings ORDER BY updated_at DESC, id DESC LIMIT 300").fetchall()
     for row in rows:
         company = str(row["company"] or "")
@@ -1662,6 +1742,8 @@ def build_communication_execution_plan(
             j.status AS job_status,
             j.recommendation AS job_recommendation,
             j.match_level AS job_match_level,
+            j.risk_level AS job_risk_level,
+            j.analysis_source AS job_analysis_source,
             c.message_type AS capture_message_type,
             c.source_url AS capture_source_url
         FROM message_drafts d
@@ -1697,6 +1779,8 @@ def build_communication_execution_plan(
                 "job_status": str(row["job_status"] or ""),
                 "job_recommendation": str(row["job_recommendation"] or ""),
                 "job_match_level": str(row["job_match_level"] or ""),
+                "job_risk_level": str(row["job_risk_level"] or ""),
+                "job_analysis_source": str(row["job_analysis_source"] or ""),
                 "capture_message_type": str(row["capture_message_type"] or ""),
             }
         )
@@ -1946,6 +2030,296 @@ def run_communication_browser_fill(draft_id: int, message: str) -> dict[str, Any
             error_message=str(result.get("note") or "") if result["status"] != "已填入" else "",
         )
     return result
+
+
+def load_communication_draft_with_context(conn: Any, draft_id: int) -> Any:
+    return conn.execute(
+        """
+        SELECT
+            d.*,
+            j.title AS job_title,
+            j.company AS company,
+            j.source_url AS job_source_url,
+            j.status AS job_status,
+            j.recommendation AS job_recommendation,
+            j.match_level AS job_match_level,
+            j.risk_level AS job_risk_level,
+            j.analysis_source AS job_analysis_source,
+            c.message_type AS capture_message_type,
+            c.source_url AS capture_source_url
+        FROM message_drafts d
+        LEFT JOIN job_postings j ON j.id = d.job_id
+        LEFT JOIN conversation_captures c ON c.id = d.capture_id
+        WHERE d.id = ?
+        """,
+        (draft_id,),
+    ).fetchone()
+
+
+def evaluate_autonomous_send_gate(conn: Any, draft: Any, message: str) -> dict[str, Any]:
+    policy = communication_policy()
+    gate = dict(evaluate_draft_send_gate(conn, draft, message))
+    reasons = list(gate["reasons"])
+    job_id = int(draft["job_id"]) if draft["job_id"] else None
+    platform = str(draft["platform"] or "")
+
+    if policy["mode"] != "autonomous":
+        reasons.append("沟通模式不是自主询问模式")
+    if automation_control()["paused"]:
+        reasons.append("自动化已暂停")
+    if str(draft["communication_mode"] or "") != "autonomous":
+        reasons.append("草稿不是在自主询问模式下生成")
+    if str(draft["draft_type"] or "") != "自主询问候选":
+        reasons.append("草稿不是自主询问候选")
+    if str(draft["job_recommendation"] or "") not in APPLICATION_ELIGIBLE_RECOMMENDATIONS:
+        reasons.append("岗位当前不属于必投或可投递")
+    if str(draft["job_risk_level"] or "") not in APPLICATION_LOW_RISK_LEVELS:
+        reasons.append("岗位风险不是低或低风险")
+    if str(draft["job_analysis_source"] or "") == "local_demo":
+        reasons.append("本地演练数据禁止自动发送")
+    if int(draft["followup_index"] or 0) <= 0 or int(draft["followup_index"] or 0) > policy["max_auto_followups"]:
+        reasons.append("自主询问轮次不在允许范围内")
+
+    text = str(message or "")
+    for token in AUTONOMOUS_MESSAGE_BLOCKING_TEXT:
+        if token in text:
+            reasons.append(f"消息包含需要人工确认的内容：{token}")
+
+    day_start = f"{utc_now()[:10]}T00:00:00"
+    sent_today = int(
+        conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM message_drafts
+            WHERE status = '已发送' AND communication_mode = 'autonomous' AND updated_at >= ?
+            """,
+            (day_start,),
+        ).fetchone()["count"]
+    )
+    sent_on_platform = int(
+        conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM message_drafts
+            WHERE status = '已发送' AND communication_mode = 'autonomous'
+              AND platform = ? AND updated_at >= ?
+            """,
+            (platform, day_start),
+        ).fetchone()["count"]
+    )
+    if sent_today >= policy["daily_send_limit"]:
+        reasons.append(f"今日自主沟通已达到 {policy['daily_send_limit']} 条上限")
+    if sent_on_platform >= policy["platform_daily_send_limit"]:
+        reasons.append(f"该平台今日自主沟通已达到 {policy['platform_daily_send_limit']} 条上限")
+
+    return {
+        **gate,
+        "allowed": not reasons,
+        "reasons": dedupe_texts(reasons),
+        "autonomous": True,
+        "daily_send_limit": policy["daily_send_limit"],
+        "platform_daily_send_limit": policy["platform_daily_send_limit"],
+        "sent_today": sent_today,
+        "sent_on_platform": sent_on_platform,
+        "job_id": job_id,
+    }
+
+
+def browser_plan_for_communication_draft(draft: Any, message: str, gate: dict[str, Any], *, trigger_type: str) -> dict[str, Any]:
+    plan_item = {
+        "draft_id": int(draft["id"]),
+        "job_id": int(draft["job_id"]) if draft["job_id"] else None,
+        "platform": str(draft["platform"] or ""),
+        "company": str(draft["company"] or ""),
+        "job_title": str(draft["job_title"] or ""),
+        "source_url": str(draft["capture_source_url"] or draft["job_source_url"] or ""),
+        "draft_type": str(draft["draft_type"] or ""),
+        "communication_mode": str(draft["communication_mode"] or ""),
+        "followup_index": int(draft["followup_index"] or 0),
+        "followup_limit": int(draft["followup_limit"] or 0),
+        "message_length": len(message),
+        "gate_allowed": bool(gate["allowed"]),
+        "gate_reasons": gate["reasons"],
+        "job_status": str(draft["job_status"] or ""),
+        "job_recommendation": str(draft["job_recommendation"] or ""),
+        "job_match_level": str(draft["job_match_level"] or ""),
+        "job_risk_level": str(draft["job_risk_level"] or ""),
+        "capture_message_type": str(draft["capture_message_type"] or ""),
+    }
+    return build_browser_send_adapter_plan(
+        {
+            "ok": True,
+            "dry_run": False,
+            "trigger_type": trigger_type,
+            "status": "执行准备",
+            "note": "单条自主沟通发送准备。",
+            "policy_mode": "autonomous",
+            "candidate_count": 1,
+            "allowed_count": 1 if gate["allowed"] else 0,
+            "blocked_count": 0 if gate["allowed"] else 1,
+            "plans": [plan_item],
+        }
+    )["browser_plans"][0]
+
+
+def run_autonomous_draft_send(draft_id: int, trigger_type: str) -> dict[str, Any]:
+    with connect() as conn:
+        draft = load_communication_draft_with_context(conn, draft_id)
+        if not draft:
+            return {"status": "已阻止", "note": "没有找到这条自主沟通草稿。", "draft_id": draft_id, "browser_clicked": False}
+        message = str(draft["message"] or "").strip()
+        gate = evaluate_autonomous_send_gate(conn, draft, message)
+        browser_plan = browser_plan_for_communication_draft(draft, message, gate, trigger_type=trigger_type)
+        if not gate["allowed"]:
+            result = {
+                "status": "已阻止",
+                "note": "自主沟通闸门拦截：" + "；".join(gate["reasons"]),
+                "draft_id": draft_id,
+                "gate": gate,
+                "browser_plan": browser_plan,
+                "message_filled": False,
+                "browser_clicked": False,
+            }
+            log_agent_action(
+                conn,
+                action_type="communication_autonomous_send",
+                status=result["status"],
+                summary=result["note"][:500],
+                platform=str(draft["platform"] or ""),
+                job_id=int(draft["job_id"]) if draft["job_id"] else None,
+                capture_id=int(draft["capture_id"]) if draft["capture_id"] else None,
+                draft_id=draft_id,
+                decision={
+                    "trigger_type": trigger_type,
+                    "gate": gate,
+                    "message_filled": False,
+                    "browser_clicked": False,
+                    "message_text_saved": False,
+                },
+            )
+            return result
+
+    try:
+        result = send_message_in_controlled_edge(browser_plan, message)
+    except ValueError as exc:
+        result = {
+            "status": "未发送",
+            "note": str(exc)[:500],
+            "draft_id": draft_id,
+            "gate": gate,
+            "message_filled": False,
+            "browser_clicked": False,
+        }
+
+    with connect() as conn:
+        current = load_communication_draft_with_context(conn, draft_id)
+        if not current:
+            return {**result, "status": "未发送", "note": "草稿已不存在，未保留浏览器发送结果。", "browser_clicked": False}
+        if result["status"] == "已发送":
+            updated = conn.execute(
+                "UPDATE message_drafts SET status = ?, updated_at = ? WHERE id = ? AND status = '待确认'",
+                ("已发送", utc_now(), draft_id),
+            )
+            if updated.rowcount:
+                event = f"Agent 已在受控 Edge 自主发送第 {int(current['followup_index'] or 0)} 轮岗位相关询问。"
+                conn.execute(
+                    "INSERT INTO application_events (job_id, event_type, content, created_at) VALUES (?, ?, ?, ?)",
+                    (current["job_id"], "自主沟通已发送", event, utc_now()),
+                )
+            else:
+                result = {
+                    **result,
+                    "status": "已发送待核对",
+                    "note": "浏览器已点击发送，但本地草稿状态已变化，未覆盖原状态。",
+                }
+        log_agent_action(
+            conn,
+            action_type="communication_autonomous_send",
+            status=str(result["status"]),
+            summary=str(result.get("note") or "自主沟通发送完成。")[:500],
+            platform=str(current["platform"] or ""),
+            job_id=int(current["job_id"]) if current["job_id"] else None,
+            capture_id=int(current["capture_id"]) if current["capture_id"] else None,
+            draft_id=draft_id,
+            decision={
+                "trigger_type": trigger_type,
+                "gate": gate,
+                "message_filled": bool(result.get("message_filled")),
+                "browser_clicked": bool(result.get("browser_clicked")),
+                "filled_selector": str(result.get("filled_selector") or ""),
+                "send_selector": str(result.get("send_selector") or ""),
+                "matched_page": result.get("matched_page") or {},
+                "message_text_saved": False,
+            },
+            error_message=str(result.get("note") or "") if result["status"] not in {"已发送", "已发送待核对"} else "",
+        )
+    return result
+
+
+def run_autonomous_communication_executor(trigger_type: str) -> dict[str, Any]:
+    policy = communication_policy()
+    control = automation_control()
+    if policy["mode"] != "autonomous":
+        return {"status": "未启用", "note": "沟通模式不是自主询问模式。", "candidate_count": 0, "sent_count": 0, "blocked_count": 0, "failed_count": 0}
+    if control["paused"]:
+        return {"status": "已暂停", "note": "自动化已暂停，未执行自主沟通。", "candidate_count": 0, "sent_count": 0, "blocked_count": 0, "failed_count": 0}
+
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id FROM message_drafts
+            WHERE status = '待确认' AND communication_mode = 'autonomous' AND draft_type = '自主询问候选'
+            ORDER BY created_at ASC, id ASC
+            LIMIT ?
+            """,
+            (COMMUNICATION_EXECUTOR_PLAN_LIMIT,),
+        ).fetchall()
+    results = [run_autonomous_draft_send(int(row["id"]), trigger_type) for row in rows]
+    sent_count = sum(1 for item in results if item["status"] in {"已发送", "已发送待核对"})
+    blocked_count = sum(1 for item in results if item["status"] == "已阻止")
+    failed_count = len(results) - sent_count - blocked_count
+    if not results:
+        status = "无候选"
+        note = "没有待发送的自主询问候选。"
+    elif failed_count:
+        status = "部分完成"
+        note = f"已发送 {sent_count} 条，拦截 {blocked_count} 条，失败 {failed_count} 条。"
+    else:
+        status = "执行完成"
+        note = f"已发送 {sent_count} 条，拦截 {blocked_count} 条。"
+
+    with connect() as conn:
+        log_agent_action(
+            conn,
+            action_type="communication_autonomous_executor",
+            status=status,
+            summary=note,
+            decision={
+                "trigger_type": trigger_type,
+                "candidate_count": len(results),
+                "sent_count": sent_count,
+                "blocked_count": blocked_count,
+                "failed_count": failed_count,
+                "results": [
+                    {
+                        "draft_id": item.get("draft_id"),
+                        "status": item.get("status"),
+                        "browser_clicked": bool(item.get("browser_clicked")),
+                    }
+                    for item in results
+                ],
+                "message_text_saved": False,
+            },
+        )
+    return {
+        "status": status,
+        "note": note,
+        "candidate_count": len(results),
+        "sent_count": sent_count,
+        "blocked_count": blocked_count,
+        "failed_count": failed_count,
+        "results": results,
+    }
 
 
 def communication_executor_page_status(conn: Any) -> dict[str, Any]:
@@ -2224,7 +2598,7 @@ def apply_communication_policy(
             item
             for item in [
                 reason,
-                f"当前为自主询问模式，已发送 {sent_count}/{max_followups} 轮；本阶段仍需人工确认发送。",
+                f"当前为自主询问模式，已发送 {sent_count}/{max_followups} 轮；仅通过全部安全闸门时允许受控发送。",
             ]
             if item
         )
@@ -3153,10 +3527,35 @@ def dashboard(request: Request) -> Any:
             for row in conn.execute("SELECT * FROM job_postings ORDER BY created_at DESC LIMIT 6").fetchall()
         ]
         resumes = conn.execute("SELECT COUNT(*) AS count FROM resume_versions").fetchone()["count"]
+        autonomous_candidates = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM message_drafts
+            WHERE status = '待确认' AND communication_mode = 'autonomous' AND draft_type = '自主询问候选'
+            """
+        ).fetchone()["count"]
+    communication = communication_policy()
+    control = automation_control()
+    patrol = message_patrol_policy()
+    workflow_active = bool(
+        communication["mode"] == "autonomous" and not control["paused"] and patrol["enabled"]
+    )
     return templates.TemplateResponse(
         request,
         "dashboard.html",
-        {"counts": counts, "recent_jobs": recent_jobs, "resumes": resumes, "token_stats": token_stats()},
+        {
+            "counts": counts,
+            "recent_jobs": recent_jobs,
+            "resumes": resumes,
+            "token_stats": token_stats(),
+            "communication_policy": communication,
+            "automation_control": control,
+            "message_patrol_policy": patrol,
+            "workflow_active": workflow_active,
+            "autonomous_candidates": autonomous_candidates,
+            "notice": request.query_params.get("notice", ""),
+            "notice_type": request.query_params.get("notice_type", "info"),
+        },
     )
 
 
@@ -5756,6 +6155,23 @@ async def open_message_patrol_browser_route(request: Request) -> RedirectRespons
     if target_url == "about:blank":
         return redirect_with_notice(return_to, "已打开 Edge 巡检窗口，请在该窗口登录招聘平台并打开 HR 对话页。", "success")
     return redirect_with_notice(return_to, f"已打开 Edge 巡检窗口：{target_url}", "success")
+
+
+@app.post("/communications/autonomous/start")
+async def start_autonomous_communication_route(request: Request) -> RedirectResponse:
+    form = await request.form()
+    return_to = str(form.get("return_to") or "/")
+    if not return_to.startswith("/") or return_to.startswith("//"):
+        return_to = "/"
+    try:
+        result = await run_in_threadpool(start_autonomous_communication_workflow, str(form.get("start_url") or ""))
+    except Exception as exc:
+        return redirect_with_notice(return_to, f"未能启动自主沟通：{str(exc)[:180]}", "error")
+    return redirect_with_notice(
+        return_to,
+        f"自主沟通已启动。已打开受控 Edge，首次巡检将在约 30 秒后开始。",
+        "success",
+    )
 
 
 @app.post("/message-patrol/browser-dry-run")

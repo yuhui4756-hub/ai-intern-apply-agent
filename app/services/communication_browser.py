@@ -129,7 +129,6 @@ FILL_BLOCKING_TEXT = (
     "付费",
     "扫码",
     "上传简历",
-    "发简历",
     "附件简历",
 )
 
@@ -438,7 +437,7 @@ def browser_plan_for_item(item: dict[str, object]) -> dict[str, object]:
         **base,
         "browser_action": "dry_run_ready",
         "supported": True,
-        "reason": "已生成浏览器 dry-run 定位策略；当前版本不会点击发送。",
+        "reason": "已生成受控浏览器定位策略；只有自主沟通工作流的全部闸门通过时才允许发送。",
         "page_match": {
             "domains": strategy["domains"],
             "chat_url_tokens": strategy["chat_url_tokens"],
@@ -460,7 +459,7 @@ def browser_plan_for_item(item: dict[str, object]) -> dict[str, object]:
             "发送前重新执行发送闸门。",
             "页面岗位或公司不匹配时停止。",
             "页面出现面试、联系方式、简历附件、押金、培训费等敏感内容时停止。",
-            "真实发送必须由用户显式开启，并保留二次确认。",
+            "真实发送必须由用户显式启动自主沟通工作流，并保留审计日志。",
         ],
     }
 
@@ -497,9 +496,7 @@ def fill_message_in_controlled_edge(
                 probe = probe_browser_plan_against_snapshots(browser_plan_item, [snapshot])
                 if probe.get("probe_status") == "probe_ready" and not blocked_signals:
                     candidates.append((int((probe.get("matched_page") or {}).get("page_match_score") or 0), page, probe))
-            if not candidates:
-                raise ValueError("未找到可安全填入的对应聊天页，请先完成只读探测并确认页面没有简历、联系方式或付费等敏感提示。")
-            _, page, probe = max(candidates, key=lambda item: item[0])
+            _, page, probe = select_unique_verified_page(candidates, action="填入草稿")
             selector = fill_first_visible_message_input(page, browser_plan_item, message)
             result = {
                 "status": "已填入",
@@ -523,9 +520,85 @@ def fill_message_in_controlled_edge(
             browser.close()
 
 
+def send_message_in_controlled_edge(
+    browser_plan_item: dict[str, object],
+    message: str,
+    *,
+    browser_channel: str = "msedge",
+) -> dict[str, object]:
+    """Fill and send one message only after the chat page is re-verified."""
+    if browser_plan_item.get("browser_action") != "dry_run_ready":
+        raise ValueError(str(browser_plan_item.get("reason") or "当前草稿不能进入浏览器发送流程。"))
+    if not str(message or "").strip():
+        raise ValueError("草稿内容为空，不能发送。")
+    if normalize_browser_channel(browser_channel) != "msedge":
+        raise ValueError("当前浏览器发送先支持 Microsoft Edge。")
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise ValueError("浏览器发送需要安装 Playwright：pip install playwright。") from exc
+
+    browser = None
+    try:
+        with sync_playwright() as playwright:
+            if not wait_for_debug_endpoint(timeout_seconds=3):
+                raise ValueError("没有检测到应用打开的 Edge 调试窗口，请先打开 Edge 巡检窗口并停留在对应 HR 对话页。")
+            browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{EDGE_DEBUG_PORT}", timeout=8000)
+            pages = [page for context in browser.contexts for page in context.pages if page.url and page.url != "about:blank"]
+            candidates = []
+            for page in pages:
+                snapshot = snapshot_page_for_browser_probe(page, {"browser_plans": [browser_plan_item]})
+                blocked_signals = find_fill_blocking_signals(snapshot)
+                probe = probe_browser_plan_against_snapshots(browser_plan_item, [snapshot])
+                if probe.get("probe_status") == "probe_ready" and not blocked_signals:
+                    candidates.append((int((probe.get("matched_page") or {}).get("page_match_score") or 0), page, probe))
+            _, page, probe = select_unique_verified_page(candidates, action="发送草稿")
+            filled_selector = fill_first_visible_message_input(page, browser_plan_item, message)
+
+            # Re-check after filling. The page can change while the action is in progress.
+            post_fill_snapshot = snapshot_page_for_browser_probe(page, {"browser_plans": [browser_plan_item]})
+            post_fill_probe = probe_browser_plan_against_snapshots(browser_plan_item, [post_fill_snapshot])
+            blocked_signals = find_fill_blocking_signals(post_fill_snapshot)
+            if post_fill_probe.get("probe_status") != "probe_ready" or blocked_signals:
+                raise ValueError("填写后页面状态发生变化，已停止点击发送按钮。")
+
+            send_selector = click_first_visible_send_button(page, browser_plan_item)
+            result = {
+                "status": "已发送",
+                "note": "已点击当前 Edge 聊天页的发送按钮。",
+                "filled_selector": filled_selector,
+                "send_selector": send_selector,
+                "matched_page": probe.get("matched_page") or {},
+                "message_filled": True,
+                "browser_clicked": True,
+                "message_text_saved": False,
+            }
+            browser.close()
+            browser = None
+            return result
+    except ValueError:
+        raise
+    except Exception as exc:
+        message_text = str(exc).strip() or exc.__class__.__name__
+        raise ValueError(f"无法发送当前 Edge 聊天草稿：{message_text[:180]}。") from exc
+    finally:
+        if browser is not None:
+            browser.close()
+
+
 def find_fill_blocking_signals(snapshot: dict[str, object]) -> list[str]:
     text = str(snapshot.get("normalized_text") or "")
     return [signal for signal in FILL_BLOCKING_TEXT if normalize_probe_text(signal) in text]
+
+
+def select_unique_verified_page(candidates: list[tuple[int, object, dict[str, object]]], *, action: str):
+    if not candidates:
+        raise ValueError(f"未找到可安全{action}的对应聊天页，请先确认页面没有简历、联系方式或付费等敏感提示。")
+    best_score = max(item[0] for item in candidates)
+    best_matches = [item for item in candidates if item[0] == best_score]
+    if len(best_matches) != 1:
+        raise ValueError(f"找到多个同等匹配的聊天页，已停止{action}。")
+    return best_matches[0]
 
 
 def fill_first_visible_message_input(page, browser_plan_item: dict[str, object], message: str) -> str:
@@ -544,6 +617,32 @@ def fill_first_visible_message_input(page, browser_plan_item: dict[str, object],
             except Exception:
                 continue
     raise ValueError("已确认聊天页，但未能向任何可见输入框填入草稿。")
+
+
+def click_first_visible_send_button(page, browser_plan_item: dict[str, object]) -> str:
+    candidates = browser_plan_item.get("selector_candidates")
+    selectors = candidates.get("send_button") if isinstance(candidates, dict) else []
+    for selector in selectors if isinstance(selectors, list) else []:
+        locator = page.locator(str(selector))
+        count = min(int(locator.count()), 20)
+        visible_buttons = []
+        for index in range(count):
+            button = locator.nth(index)
+            try:
+                if not button.is_visible(timeout=500) or not button.is_enabled(timeout=500):
+                    continue
+                label = str(button.inner_text(timeout=500) or "").strip().replace(" ", "")
+                if label not in {"发送", "发送消息"}:
+                    continue
+                visible_buttons.append(button)
+            except Exception:
+                continue
+        if len(visible_buttons) > 1:
+            raise ValueError("当前聊天页存在多个可用的发送按钮，已停止发送。")
+        if len(visible_buttons) == 1:
+            visible_buttons[0].click(timeout=5000)
+            return str(selector)
+    raise ValueError("已确认聊天页，但未能找到唯一可用的发送按钮。")
 
 
 def url_host(url: str) -> str:
