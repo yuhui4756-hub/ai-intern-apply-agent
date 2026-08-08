@@ -6,9 +6,12 @@
     <h1>投递准备</h1>
     <p>仅整理本地候选、投递理由和简历版本；确认后只会标记为待投递，不会操作招聘平台。</p>
   </div>
-  <form method="post" action="/applications/refresh">
-    <button class="button primary" type="submit">生成必投候选</button>
-  </form>
+  <div class="form-actions">
+    <a class="button" href="/jobs">岗位列表</a>
+    <form method="post" action="/applications/refresh">
+      <button class="button primary" type="submit">生成投递候选</button>
+    </form>
+  </div>
 </section>
 
 {% if notice %}
@@ -36,7 +39,7 @@
             <div class="muted">{{ item.platform or "平台待补充" }} · {{ item.city or "城市待补充" }}</div>
             <span class="badge">{{ item.status }}</span>
           </td>
-          <td><span class="badge">{{ item.match_score }} 分 · {{ item.risk_level or "-" }}风险</span></td>
+          <td><span class="badge">{{ item.match_score }} 分 · 风险：{{ item.risk_level or "-" }}</span></td>
           <td>{{ item.recommendation_reason }}</td>
           <td>
             <form method="post" action="/applications/{{ item.id }}" class="form-stack compact-form">
@@ -84,7 +87,7 @@
     </table>
   </div>
   {% else %}
-  <p class="empty">还没有投递准备。点击“生成必投候选”后，系统会筛选当前为“必投”且风险为“低”的待处理岗位。</p>
+  <p class="empty">还没有投递准备。点击“生成投递候选”后，系统会筛选当前为“必投/可投递”且风险为“低/低风险”的待处理岗位。</p>
   {% endif %}
 </section>
 {% endblock %}

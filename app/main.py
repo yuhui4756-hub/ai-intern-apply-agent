@@ -94,6 +94,8 @@ COMMUNICATION_EXECUTOR_PLAN_LIMIT = 20
 INTERVIEW_PREP_TRIGGER_STATUSES = {"待面试", "面试准备中"}
 INTERVIEW_FEEDBACK_STATUSES = ["待练习", "已补强", "已归档"]
 APPLICATION_PREPARATION_STATUSES = ["待确认", "已确认", "已跳过"]
+APPLICATION_ELIGIBLE_RECOMMENDATIONS = {"必投", "可投递"}
+APPLICATION_LOW_RISK_LEVELS = {"低", "低风险"}
 COMMUNICATION_MODES = [
     ("off", "关闭"),
     ("draft", "草稿模式"),
@@ -3431,7 +3433,9 @@ async def refresh_application_preparations(request: Request) -> RedirectResponse
         jobs = conn.execute(
             """
             SELECT id FROM job_postings
-            WHERE recommendation = '必投' AND risk_level = '低' AND status IN ('待确认', '待投递')
+            WHERE recommendation IN ('必投', '可投递')
+              AND risk_level IN ('低', '低风险')
+              AND status IN ('待确认', '待投递')
             ORDER BY match_score DESC, id DESC
             """
         ).fetchall()
@@ -3443,7 +3447,7 @@ async def refresh_application_preparations(request: Request) -> RedirectResponse
     existing_count = sum(1 for item in results if item.get("preparation_id") and not item.get("created"))
     return redirect_with_notice(
         "/applications",
-        f"已检查 {len(results)} 条必投低风险岗位：新增 {created_count} 条投递准备，已有 {existing_count} 条。",
+        f"已检查 {len(results)} 条建议投递且低风险岗位：新增 {created_count} 条投递准备，已有 {existing_count} 条。",
         "success" if created_count else "info",
     )
 
@@ -4396,13 +4400,15 @@ def interview_practice_questions(conn: Any, review: dict[str, Any]) -> list[dict
 
 
 def application_preparation_eligibility(job: dict[str, Any]) -> tuple[bool, str]:
-    if job.get("recommendation") != "必投":
-        return False, "该岗位当前不是“必投”建议，暂不自动进入投递准备。"
-    if job.get("risk_level") != "低":
-        return False, "该岗位风险不是“低”，需要人工确认后再决定是否投递。"
+    recommendation = str(job.get("recommendation") or "")
+    risk_level = str(job.get("risk_level") or "")
+    if recommendation not in APPLICATION_ELIGIBLE_RECOMMENDATIONS:
+        return False, "该岗位当前不是“必投”或“可投递”建议，暂不自动进入投递准备。"
+    if risk_level not in APPLICATION_LOW_RISK_LEVELS:
+        return False, "该岗位风险不是“低/低风险”，需要人工确认后再决定是否投递。"
     if job.get("status") not in {"待确认", "待投递"}:
         return False, f"岗位当前状态为“{job.get('status') or '未设置'}”，不在待投递阶段。"
-    return True, "岗位为必投且风险低，可进入投递准备。"
+    return True, "岗位建议投递且风险低，可进入投递准备。"
 
 
 def resume_recommendation_for_job(conn: Any, job: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
@@ -4447,7 +4453,10 @@ def application_recommendation_reason(job: dict[str, Any]) -> str:
     scoring = (job.get("extracted") or {}).get("scoring") or {}
     matched_skills = [str(item) for item in scoring.get("matched_skills") or [] if str(item).strip()]
     missing_skills = [str(item) for item in scoring.get("missing_skills") or [] if str(item).strip()]
-    parts = [f"匹配分 {job.get('match_score') or 0}，当前分析建议为“必投”，风险为“低”。"]
+    parts = [
+        f"匹配分 {job.get('match_score') or 0}，当前分析建议为“{job.get('recommendation') or '待确认'}”，"
+        f"风险为“{job.get('risk_level') or '待确认'}”。"
+    ]
     if matched_skills:
         parts.append("已匹配：" + "、".join(matched_skills[:6]) + "。")
     if missing_skills:

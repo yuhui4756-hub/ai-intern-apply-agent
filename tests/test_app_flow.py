@@ -511,6 +511,22 @@ def test_application_preparation_recommends_resume_and_requires_confirmation(tmp
     assert '"model_called": false' in action["decision_json"]
 
 
+def test_application_preparation_accepts_legacy_low_risk_recommendation_labels():
+    from app.main import application_preparation_eligibility
+
+    allowed, reason = application_preparation_eligibility(
+        {"recommendation": "可投递", "risk_level": "低风险", "status": "待确认"}
+    )
+    blocked, blocked_reason = application_preparation_eligibility(
+        {"recommendation": "可投递", "risk_level": "谨慎", "status": "待确认"}
+    )
+
+    assert allowed is True
+    assert "建议投递" in reason
+    assert blocked is False
+    assert "低/低风险" in blocked_reason
+
+
 def test_application_browser_dry_run_requires_confirmation_and_never_fills(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "application-browser.sqlite3"))
 
