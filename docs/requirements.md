@@ -30,7 +30,7 @@
 
 - GitHub：<https://github.com/yuhui4756-hub>
 - 已有项目：<https://github.com/yuhui4756-hub/ai-companion>
-- 本项目：简历投递 Agent，GitHub 仓库待创建或绑定远程地址。
+- 本项目：简历投递 Agent，GitHub 仓库为 <https://github.com/yuhui4756-hub/ai-intern-apply-agent>。
 
 协作约定：
 
@@ -131,7 +131,7 @@
 - JD 分析和内容生成使用 OpenAI-compatible API，具体模型和服务地址可配置。
 - OpenAI-compatible API 不内置默认服务商，由用户自行配置。
 - API Key 允许保存在本地 `.env` 文件中，也应支持环境变量读取。
-- GitHub 仓库信息第一版不自动读取，后续再考虑接入。
+- GitHub 仓库信息支持手动刷新具体仓库的 README、语言和最近提交，用于候选人项目事实库；不自动扫描整个账号。
 - 公司风险判断第一版允许联网搜索公开信息。
 - 多份简历默认包含：AI 应用开发版、Agent 开发版、AI 后端版、通用版。
 - 支持黑名单公司和黑名单关键词。
@@ -809,7 +809,6 @@ ASR 选型原则：
 - 对接真实付费招聘 API
 - 将简历和投递记录上传云端
 - CSV/Excel 批量导入 JD
-- 自动读取 GitHub 仓库 README、语言和提交记录
 - 自动点击投递或发送消息
 - 默认上传面试录音到第三方转写服务
 

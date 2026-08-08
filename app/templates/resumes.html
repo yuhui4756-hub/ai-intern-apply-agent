@@ -8,8 +8,17 @@
   </div>
 </section>
 
+{% if notice %}
+<section class="notice {{ notice_type }}">{{ notice }}</section>
+{% endif %}
+
 <section class="panel">
-  <h2>基础画像</h2>
+  <div class="panel-title">
+    <h2>基础画像</h2>
+    <form method="post" action="/resumes/github-refresh">
+      <button class="button" type="submit">刷新 GitHub 项目资料</button>
+    </form>
+  </div>
   <form method="post" action="/resumes/profile" class="form-grid">
     <label>姓名
       <input name="name" value="{{ profile.name or '' }}" placeholder="可暂时留空">
@@ -29,10 +38,54 @@
     <label>技能标签，每行一个
       <textarea name="skills" rows="8">{{ (loads(profile.skills_json, []) if profile else []) | join('\n') }}</textarea>
     </label>
+    <label>项目事实库，每行一个：项目名 | GitHub 链接 | 亮点1；亮点2
+      <textarea name="projects" rows="10" placeholder="例如：所依 | https://github.com/yuhui4756-hub/ai-companion | 本地优先 RAG；FastAPI；SQLite">{{ project_lines }}</textarea>
+    </label>
     <div class="form-actions">
       <button class="button primary" type="submit">保存画像</button>
     </div>
   </form>
+  <p class="muted">GitHub 刷新只读取公开仓库 README、语言和最近提交；这些内容会作为项目事实，不会自动写成夸大的技能描述。</p>
+</section>
+
+<section class="panel">
+  <div class="panel-title">
+    <h2>项目事实</h2>
+    <span class="badge">{{ projects | length }} 个</span>
+  </div>
+  {% if projects %}
+  <div class="cards">
+    {% for project in projects %}
+    <article class="card">
+      <div class="card-head">
+        <strong>{{ project.name or "未命名项目" }}</strong>
+        {% if project.source == "github" %}<span class="badge">GitHub</span>{% endif %}
+      </div>
+      {% if project.url %}
+      <a href="{{ project.url }}" target="_blank" rel="noreferrer">{{ project.url }}</a>
+      {% endif %}
+      {% if project.description %}
+      <p>{{ project.description }}</p>
+      {% endif %}
+      {% if project.languages %}
+      <p><strong>语言 / 技术：</strong>{{ project.languages | join("、") }}</p>
+      {% endif %}
+      {% if project.highlights %}
+      <ul>
+        {% for highlight in project.highlights %}
+        <li>{{ highlight }}</li>
+        {% endfor %}
+      </ul>
+      {% endif %}
+      {% if project.recent_commits %}
+      <p class="muted">近期提交：{{ project.recent_commits[:3] | join("；") }}</p>
+      {% endif %}
+    </article>
+    {% endfor %}
+  </div>
+  {% else %}
+  <p class="empty">还没有项目事实。先保存项目链接，再点击“刷新 GitHub 项目资料”。</p>
+  {% endif %}
 </section>
 
 <section class="panel">

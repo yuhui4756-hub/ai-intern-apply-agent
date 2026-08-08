@@ -1,4 +1,5 @@
 import asyncio
+import base64
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -2721,6 +2722,118 @@ def test_manual_edge_search_launch_uses_debug_profile(tmp_path, monkeypatch):
     assert "--new-window" in args
     assert any(str(tmp_path / "AIInternApplyAgent" / "browser" / "manual-msedge") in arg for arg in args)
     assert kwargs["stdout"] == job_searcher.subprocess.DEVNULL
+
+
+def test_github_project_service_parses_and_summarizes_snapshot():
+    from app.services.github_projects import (
+        fetch_github_repo_snapshot,
+        project_from_snapshot,
+        repo_key,
+        summarize_readme,
+    )
+
+    readme = "# AI Companion\n\n本地优先 RAG 知识库。\n\n![badge](x)\n\n支持 FastAPI 和 SQLite。"
+
+    def fake_fetch(url):
+        if url.endswith("/repos/yuhui4756-hub/ai-companion"):
+            return {
+                "name": "ai-companion",
+                "full_name": "yuhui4756-hub/ai-companion",
+                "html_url": "https://github.com/yuhui4756-hub/ai-companion",
+                "description": "本地优先 AI 伴侣",
+                "language": "Python",
+                "topics": ["rag", "local-first"],
+                "stargazers_count": 1,
+                "forks_count": 0,
+                "pushed_at": "2026-08-08T00:00:00Z",
+            }
+        if url.endswith("/languages"):
+            return {"Python": 1200, "HTML": 300}
+        if "/commits" in url:
+            return [{"commit": {"message": "Add RAG evaluation\n\nDetails"}}, {"commit": {"message": "Update README"}}]
+        if url.endswith("/readme"):
+            return {"content": base64.b64encode(readme.encode("utf-8")).decode("ascii")}
+        raise AssertionError(url)
+
+    snapshot = fetch_github_repo_snapshot("git@github.com:yuhui4756-hub/ai-companion.git", json_fetcher=fake_fetch)
+    project = project_from_snapshot(snapshot)
+
+    assert repo_key(project["url"]) == "yuhui4756-hub/ai-companion"
+    assert project["languages"] == ["Python", "HTML"]
+    assert "本地优先 AI 伴侣" in project["highlights"][0]
+    assert "近期提交" in project["highlights"][-1]
+    assert "badge" not in summarize_readme(readme)
+
+
+def test_profile_project_facts_save_and_github_refresh(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "profile-github.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db, loads
+
+    init_db()
+    client = TestClient(main.app)
+
+    page = client.get("/resumes")
+    assert page.status_code == 200
+    assert "项目事实库" in page.text
+    assert "刷新 GitHub 项目资料" in page.text
+
+    saved = client.post(
+        "/resumes/profile",
+        data={
+            "name": "",
+            "education": "智能科学与技术本科在读",
+            "github_url": "https://github.com/yuhui4756-hub",
+            "demo_url": "https://github.com/yuhui4756-hub/ai-companion",
+            "target_roles": "AI 应用开发实习\nAgent 开发实习",
+            "skills": "Python\nFastAPI\nSQLite",
+            "projects": "所依 | https://github.com/yuhui4756-hub/ai-companion | 本地优先 RAG；SQLite 检索",
+        },
+        follow_redirects=False,
+    )
+
+    assert saved.status_code == 303
+    with connect() as conn:
+        profile = conn.execute("SELECT projects_json FROM candidate_profile ORDER BY id LIMIT 1").fetchone()
+    projects = loads(profile["projects_json"], [])
+    assert projects[0]["name"] == "所依"
+    assert projects[0]["url"] == "https://github.com/yuhui4756-hub/ai-companion"
+    assert projects[0]["highlights"] == ["本地优先 RAG", "SQLite 检索"]
+
+    def fake_snapshot(url):
+        assert url == "https://github.com/yuhui4756-hub/ai-companion"
+        return {
+            "name": "ai-companion",
+            "full_name": "yuhui4756-hub/ai-companion",
+            "url": url,
+            "description": "本地优先 AI 伴侣与 RAG 知识库应用",
+            "languages": ["Python", "HTML"],
+            "topics": ["rag"],
+            "readme_excerpt": "支持文档解析、混合检索和来源追踪。",
+            "recent_commits": ["Add benchmark summary", "Update local privacy docs"],
+            "pushed_at": "2026-08-08T00:00:00Z",
+        }
+
+    monkeypatch.setattr(main, "fetch_github_repo_snapshot", fake_snapshot)
+    refreshed = client.post("/resumes/github-refresh", follow_redirects=False)
+
+    assert refreshed.status_code == 303
+    assert refreshed.headers["location"].startswith("/resumes")
+    with connect() as conn:
+        profile = conn.execute("SELECT projects_json FROM candidate_profile ORDER BY id LIMIT 1").fetchone()
+        action_log = conn.execute("SELECT action_type, status, decision_json FROM agent_action_logs ORDER BY id DESC LIMIT 1").fetchone()
+    projects = loads(profile["projects_json"], [])
+    assert projects[0]["source"] == "github"
+    assert projects[0]["languages"] == ["Python", "HTML"]
+    assert "README 摘要" in " ".join(projects[0]["highlights"])
+    assert action_log["action_type"] == "github_project_refresh"
+    assert action_log["status"] == "已刷新"
+    assert '"model_called": false' in action_log["decision_json"]
+
+    refreshed_page = client.get("/resumes")
+    assert "本地优先 AI 伴侣与 RAG 知识库应用" in refreshed_page.text
+    assert "Python、HTML" in refreshed_page.text
 
 
 def test_failed_auto_search_creates_failed_run(tmp_path, monkeypatch):

@@ -30,6 +30,16 @@ from .services.analyzer import (
 from .services.browser_patrol import capture_browser_patrol_observations, open_message_patrol_browser
 from .services.communication_browser import build_browser_send_adapter_plan, probe_browser_send_adapter_plan
 from .services.conversation import classify_conversation, prepare_conversation_text
+from .services.github_projects import (
+    GitHubProjectError,
+    dedupe_urls,
+    fetch_github_repo_snapshot,
+    github_repo_urls_from_projects,
+    merge_project_facts,
+    normalize_repo_url,
+    project_from_snapshot,
+    repo_key,
+)
 from .services.job_fetcher import ensure_public_http_url, fetch_job_from_url, normalize_visible_text
 from .services.job_searcher import (
     SearchResult,
@@ -123,6 +133,7 @@ def action_type_label(value: str) -> str:
         "communication_browser_probe": "浏览器页面探测",
         "demo_draft_created": "演练草稿",
         "interview_prep_auto_create": "面试准备",
+        "github_project_refresh": "GitHub 项目刷新",
     }.get(value or "", value or "-")
 
 
@@ -3004,15 +3015,57 @@ def resumes_page(request: Request) -> Any:
     with connect() as conn:
         profile = conn.execute("SELECT * FROM candidate_profile ORDER BY id LIMIT 1").fetchone()
         resumes = conn.execute("SELECT * FROM resume_versions ORDER BY id").fetchall()
+    profile_dict = {key: profile[key] for key in profile.keys()} if profile else {}
+    projects = loads(profile_dict.get("projects_json"), []) if profile_dict else []
     return templates.TemplateResponse(
         request,
         "resumes.html",
         {
-            "profile": {key: profile[key] for key in profile.keys()} if profile else {},
+            "profile": profile_dict,
             "resumes": [{key: row[key] for key in row.keys()} for row in resumes],
+            "projects": projects if isinstance(projects, list) else [],
+            "project_lines": format_project_lines(projects if isinstance(projects, list) else []),
             "loads": loads,
+            "notice": request.query_params.get("notice", ""),
+            "notice_type": request.query_params.get("notice_type", "info"),
         },
     )
+
+
+def parse_project_lines(value: str) -> list[dict[str, Any]]:
+    projects: list[dict[str, Any]] = []
+    for line in (value or "").splitlines():
+        raw = line.strip()
+        if not raw:
+            continue
+        parts = [part.strip() for part in raw.split("|")]
+        name = parts[0] if parts else ""
+        url = parts[1] if len(parts) > 1 else ""
+        highlights_raw = parts[2] if len(parts) > 2 else ""
+        highlights = [item.strip() for item in re.split(r"[;；]", highlights_raw) if item.strip()]
+        if not name and url:
+            name = url.rstrip("/").split("/")[-1]
+        if not name:
+            continue
+        project: dict[str, Any] = {"name": name, "url": url, "highlights": highlights}
+        if repo_key(url):
+            project["source"] = "github"
+        projects.append(project)
+    return projects[:20]
+
+
+def format_project_lines(projects: list[dict[str, Any]]) -> str:
+    lines = []
+    for project in projects:
+        name = str(project.get("name") or "").strip()
+        url = str(project.get("url") or "").strip()
+        highlights = project.get("highlights") or []
+        if not isinstance(highlights, list):
+            highlights = []
+        highlight_text = "；".join(str(item).strip() for item in highlights if str(item).strip())
+        if name or url or highlight_text:
+            lines.append(" | ".join([name, url, highlight_text]).rstrip(" |"))
+    return "\n".join(lines)
 
 
 @app.post("/resumes/profile")
@@ -3028,6 +3081,7 @@ async def update_profile(request: Request) -> RedirectResponse:
             str(form.get("demo_url") or ""),
             dumps([item.strip() for item in str(form.get("target_roles") or "").splitlines() if item.strip()]),
             dumps([item.strip() for item in str(form.get("skills") or "").splitlines() if item.strip()]),
+            dumps(parse_project_lines(str(form.get("projects") or ""))),
             now,
         )
         if profile:
@@ -3035,12 +3089,92 @@ async def update_profile(request: Request) -> RedirectResponse:
                 """
                 UPDATE candidate_profile
                 SET name = ?, education = ?, github_url = ?, demo_url = ?,
-                    target_roles = ?, skills_json = ?, updated_at = ?
+                    target_roles = ?, skills_json = ?, projects_json = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (*values, profile["id"]),
             )
-    return redirect("/resumes")
+    return redirect_with_notice("/resumes", "候选人画像已保存。", "success")
+
+
+def refresh_github_projects_for_profile(conn: Any, profile_id: int) -> dict[str, Any]:
+    profile = conn.execute("SELECT * FROM candidate_profile WHERE id = ?", (profile_id,)).fetchone()
+    if not profile:
+        return {"refreshed_count": 0, "error_count": 1, "errors": ["没有找到候选人画像。"]}
+    existing_projects = loads(profile["projects_json"], []) or []
+    if not isinstance(existing_projects, list):
+        existing_projects = []
+    urls = github_repo_urls_from_projects(existing_projects)
+    for candidate in [str(profile["demo_url"] or ""), str(profile["github_url"] or "")]:
+        if repo_key(candidate):
+            urls.append(normalize_repo_url(candidate))
+    urls = dedupe_urls(urls)
+    if not urls:
+        log_agent_action(
+            conn,
+            action_type="github_project_refresh",
+            status="无仓库",
+            summary="没有找到可刷新的具体 GitHub 仓库链接。",
+            decision={"model_called": False, "repo_count": 0},
+        )
+        return {
+            "refreshed_count": 0,
+            "error_count": 0,
+            "errors": [],
+            "repo_count": 0,
+            "message": "请先在项目事实库或作品链接里填写具体 GitHub 仓库链接。",
+        }
+
+    refreshed: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for url in urls[:8]:
+        try:
+            snapshot = fetch_github_repo_snapshot(url)
+            refreshed.append(project_from_snapshot(snapshot))
+        except GitHubProjectError as exc:
+            errors.append(f"{url}: {str(exc)[:160]}")
+    merged = merge_project_facts(existing_projects, refreshed)
+    now = utc_now()
+    conn.execute(
+        "UPDATE candidate_profile SET projects_json = ?, updated_at = ? WHERE id = ?",
+        (dumps(merged), now, profile_id),
+    )
+    status = "已刷新" if refreshed else "刷新失败"
+    summary = f"GitHub 项目刷新：成功 {len(refreshed)} 个，失败 {len(errors)} 个。"
+    log_agent_action(
+        conn,
+        action_type="github_project_refresh",
+        status=status,
+        summary=summary,
+        decision={
+            "model_called": False,
+            "repo_count": len(urls),
+            "refreshed_count": len(refreshed),
+            "error_count": len(errors),
+            "errors": errors[:5],
+        },
+    )
+    return {
+        "refreshed_count": len(refreshed),
+        "error_count": len(errors),
+        "errors": errors,
+        "repo_count": len(urls),
+        "message": summary,
+    }
+
+
+@app.post("/resumes/github-refresh")
+async def refresh_github_projects(request: Request) -> RedirectResponse:
+    with connect() as conn:
+        profile = conn.execute("SELECT id FROM candidate_profile ORDER BY id LIMIT 1").fetchone()
+        if not profile:
+            return redirect_with_notice("/resumes", "没有找到候选人画像。", "error")
+        result = refresh_github_projects_for_profile(conn, int(profile["id"]))
+    if result.get("refreshed_count"):
+        notice_type = "warning" if result.get("error_count") else "success"
+    else:
+        notice_type = "error" if result.get("error_count") else "info"
+    return redirect_with_notice("/resumes", str(result.get("message") or "GitHub 项目刷新完成。"), notice_type)
 
 
 @app.post("/resumes/{resume_id}")
