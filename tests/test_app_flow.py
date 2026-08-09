@@ -3782,6 +3782,60 @@ def test_discovery_candidate_screening_accepts_ascii_signals_and_blocks_non_engi
     accepted, reason = main.discovery_candidate_screening({"title": "AI 产品运营实习生", "summary": "内容运营"})
     assert accepted is False
     assert "非研发方向" in reason
+    accepted, reason = main.discovery_candidate_screening(
+        {"title": "AI 应用开发实习生", "summary": "薪资 120-180 元/天，Python FastAPI RAG"},
+        {"min_salary_per_day": 200},
+    )
+    assert accepted is False
+    assert "低于本轮底线 200 元/天" in reason
+    assert main.discovery_candidate_screening(
+        {"title": "AI 应用开发实习生", "summary": "薪资 3-5K/月，Python FastAPI RAG"},
+        {"min_salary_per_day": 200},
+    )[0] is True
+
+
+def test_controlled_discovery_skips_explicit_low_daily_salary_before_jd_read(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "discovery-summary-salary.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db, loads
+
+    init_db()
+    fetch_calls = []
+
+    def fake_search(platform, keyword, city, limit):
+        return SearchResult(
+            platform=platform,
+            keyword=keyword,
+            city=city,
+            search_url=f"https://jobs.example.com/{platform}",
+            browser_channel="msedge",
+            candidates=[
+                SearchCandidate(
+                    title="AI 应用开发实习生",
+                    company=f"低薪测试 {platform}",
+                    city=city,
+                    source_url=f"https://jobs.example.com/{platform}/low-salary",
+                    summary="Python、FastAPI、RAG，薪资 120-180 元/天。",
+                )
+            ],
+        )
+
+    monkeypatch.setattr(main, "search_jobs_in_controlled_edge", fake_search)
+    monkeypatch.setattr(main, "fetch_job_from_controlled_edge", lambda url: fetch_calls.append(url))
+
+    result = main.run_controlled_job_discovery({"min_salary_per_day": 200})
+
+    assert result["status"] == "完成"
+    assert result["imported_count"] == 0
+    assert result["salary_screened_out_count"] == 3
+    assert fetch_calls == []
+    with connect() as conn:
+        candidates = conn.execute("SELECT status, error_message FROM job_candidates ORDER BY id").fetchall()
+        action = conn.execute("SELECT decision_json FROM agent_action_logs ORDER BY id DESC LIMIT 1").fetchone()
+    assert all(candidate["status"] == "初筛跳过" for candidate in candidates)
+    assert all("低于本轮底线 200 元/天" in candidate["error_message"] for candidate in candidates)
+    assert loads(action["decision_json"], {})["salary_screened_out_count"] == 3
 
 
 def test_discovery_filters_persist_override_plan_and_archive_low_daily_salary(tmp_path, monkeypatch):

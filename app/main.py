@@ -22,6 +22,7 @@ from .db import connect, dumps, get_setting, init_db, loads, set_setting, utc_no
 from .services.analyzer import (
     build_interview_review,
     clean_extracted,
+    daily_salary_bounds,
     extract_salary,
     generate_message,
     looks_like_salary_text,
@@ -1454,11 +1455,23 @@ def controlled_job_discovery_plan(
     return plan, int(resume["id"]) if resume else None
 
 
-def discovery_candidate_screening(candidate: dict[str, Any]) -> tuple[bool, str]:
+def discovery_candidate_screening(
+    candidate: dict[str, Any], matching_preferences: dict[str, Any] | None = None
+) -> tuple[bool, str]:
     text = " ".join([str(candidate.get("title") or ""), str(candidate.get("summary") or "")]).lower()
     if any(signal.lower() in text for signal in JOB_DISCOVERY_NON_ENGINEERING_SIGNALS):
         return False, "自动初筛识别为非研发方向，未读取 JD；可手动导入复核。"
     if any(signal.lower() in text for signal in JOB_DISCOVERY_ROLE_SIGNALS):
+        preferences = matching_preferences if isinstance(matching_preferences, dict) else {}
+        minimum_daily_salary = preferences.get("min_salary_per_day")
+        minimum_daily_salary = minimum_daily_salary if isinstance(minimum_daily_salary, int) and minimum_daily_salary > 0 else None
+        salary_text = extract_salary(str(candidate.get("summary") or ""))
+        daily_bounds = daily_salary_bounds(salary_text)
+        if daily_bounds and minimum_daily_salary and daily_bounds[0] < minimum_daily_salary:
+            return (
+                False,
+                f"搜索摘要日薪最低 {daily_bounds[0]} 元/天，低于本轮底线 {minimum_daily_salary} 元/天；未读取 JD，可手动导入复核。",
+            )
         return True, ""
     return False, "自动初筛未识别到 AI/Agent/大模型方向，未读取 JD；可手动导入复核。"
 
@@ -1556,6 +1569,7 @@ def run_controlled_job_discovery(filters: dict[str, Any] | None = None) -> dict[
     candidate_ids: list[int] = []
     search_errors: list[str] = []
     screened_out_count = 0
+    salary_screened_out_count = 0
     candidate_count = 0
     seen_urls: set[str] = set()
     for item in plan:
@@ -1577,7 +1591,7 @@ def run_controlled_job_discovery(filters: dict[str, Any] | None = None) -> dict[
         run_ids.append(run_id)
         with connect() as conn:
             rows = conn.execute(
-                "SELECT id, title, summary, source_url FROM job_candidates WHERE search_run_id = ? ORDER BY id",
+                "SELECT id, title, city, summary, source_url FROM job_candidates WHERE search_run_id = ? ORDER BY id",
                 (run_id,),
         ).fetchall()
         for row in rows:
@@ -1589,14 +1603,16 @@ def run_controlled_job_discovery(filters: dict[str, Any] | None = None) -> dict[
                 continue
             seen_urls.add(key)
             candidate_count += 1
-            should_import, screening_note = discovery_candidate_screening(candidate)
+            should_import, screening_note = discovery_candidate_screening(candidate, effective_filters)
             if not should_import:
                 with connect() as conn:
+                    is_salary_filter = screening_note.startswith("搜索摘要日薪最低")
                     conn.execute(
                         "UPDATE job_candidates SET status = ?, error_message = ?, updated_at = ? WHERE id = ?",
-                        ("初筛待确认", screening_note, utc_now(), int(row["id"])),
+                        ("初筛跳过" if is_salary_filter else "初筛待确认", screening_note, utc_now(), int(row["id"])),
                 )
                 screened_out_count += 1
+                salary_screened_out_count += int(is_salary_filter)
                 continue
             candidate_ids.append(int(row["id"]))
 
@@ -1618,7 +1634,9 @@ def run_controlled_job_discovery(filters: dict[str, Any] | None = None) -> dict[
         f"自动评分 {imported_count} 个岗位。"
     )
     if screened_out_count:
-        note += f" {screened_out_count} 个非目标方向候选未读取 JD。"
+        note += f" {screened_out_count} 个候选未读取 JD。"
+    if salary_screened_out_count:
+        note += f" 其中 {salary_screened_out_count} 个搜索摘要已明确低于日薪底线。"
     if pending_count:
         note += f" {pending_count} 个详情页待补充。"
     if failed_count:
@@ -1641,6 +1659,7 @@ def run_controlled_job_discovery(filters: dict[str, Any] | None = None) -> dict[
                 "candidate_count": candidate_count,
                 "auto_import_candidate_count": len(candidate_ids),
                 "screened_out_count": screened_out_count,
+                "salary_screened_out_count": salary_screened_out_count,
                 "imported_count": imported_count,
                 "pending_detail_count": pending_count,
                 "failed_import_count": failed_count,
@@ -1658,6 +1677,7 @@ def run_controlled_job_discovery(filters: dict[str, Any] | None = None) -> dict[
         "candidate_count": candidate_count,
         "auto_import_candidate_count": len(candidate_ids),
         "screened_out_count": screened_out_count,
+        "salary_screened_out_count": salary_screened_out_count,
         "imported_count": imported_count,
         "pending_detail_count": pending_count,
         "failed_import_count": failed_count,
