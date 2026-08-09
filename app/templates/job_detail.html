@@ -33,8 +33,12 @@
     <h2>匹配解释</h2>
     {% set scoring = job.extracted.get("scoring", {}) %}
     {% set extracted = job.extracted.get("extracted", {}) %}
+    <p><strong>匹配证据：</strong>{{ scoring.get("matching_evidence", "历史分析") }}</p>
     <p><strong>已匹配技能：</strong>{{ scoring.get("matched_skills", []) | join("、") or "-" }}</p>
     <p><strong>缺口：</strong>{{ scoring.get("missing_skills", []) | join("、") or "-" }}</p>
+    {% if scoring.get("alternative_requirement_groups", []) %}<p><strong>可替代要求：</strong>{{ scoring.get("alternative_requirement_groups", []) | join("；") }}</p>{% endif %}
+    {% if scoring.get("non_blocking_skills", []) %}<p><strong>不计为能力缺口：</strong>{{ scoring.get("non_blocking_skills", []) | join("、") }}</p>{% endif %}
+    {% if scoring.get("fit_notes", []) %}<p><strong>匹配提醒：</strong>{{ scoring.get("fit_notes", []) | join("；") }}</p>{% endif %}
     {% if scoring.get("preference_notes", []) %}
     <p><strong>偏好提醒：</strong>{{ scoring.get("preference_notes", []) | join("；") }}</p>
     {% endif %}
@@ -140,7 +144,10 @@
         </select>
       </label>
     </div>
-    <button class="button primary" type="submit">重新分析</button>
+    <div class="form-actions">
+      <button class="button" type="submit" formaction="/jobs/{{ job.id }}/rescore">按最新本地规则重新评分</button>
+      <button class="button primary" type="submit">重新分析</button>
+    </div>
   </form>
 </section>
 

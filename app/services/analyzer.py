@@ -77,6 +77,39 @@ GOOD_GROWTH_KEYWORDS = [
     "Docker",
 ]
 
+AI_CODING_ASSISTANT_MARKERS = (
+    "claude code",
+    "codex",
+    "cursor",
+    "copilot",
+    "windsurf",
+    "codeium",
+    "trae",
+    "ai coding",
+    "ai编程",
+    "ai 编程",
+    "aigc工具",
+    "vibe coding",
+)
+ALTERNATIVE_REQUIREMENT_MARKERS = (
+    "至少一种",
+    "至少一项",
+    "至少一门",
+    "以下之一",
+    "其中一种",
+    "任意一种",
+    "任一种",
+)
+HIGH_BAR_REQUIREMENT_MARKERS = (
+    "深入掌握",
+    "精通",
+    "扎实",
+    "生产级",
+    "高并发",
+    "年以上",
+    "全栈开发经验",
+)
+
 CITIES = ["北京", "上海", "广州", "深圳", "杭州", "重庆", "成都", "南京", "苏州", "厦门", "武汉", "长沙"]
 UNKNOWN_VALUES = {"?", "？", "未知", "未填写", "未填", "无", "暂无", "N/A", "n/a", "None", "null"}
 SALARY_NUMBER = r"\d+(?:\.\d+)?"
@@ -291,19 +324,77 @@ def split_section(text: str, markers: list[str]) -> list[str]:
     return [line[:180] for line in lines[:5]]
 
 
+def skill_is_non_blocking(skill: str) -> bool:
+    lowered = normalize(skill).lower()
+    return any(marker in lowered for marker in AI_CODING_ASSISTANT_MARKERS)
+
+
+def alternative_skill_groups(required_skills: list[str], jd_text: str) -> list[list[str]]:
+    """Find requirement groups where the JD explicitly accepts any one listed skill."""
+    groups: list[list[str]] = []
+    for sentence in re.split(r"[。；;\n]", jd_text or ""):
+        lowered = sentence.lower()
+        marker = next((value for value in ALTERNATIVE_REQUIREMENT_MARKERS if value in sentence), "")
+        if not marker:
+            continue
+        marker_index = sentence.index(marker)
+        # "Python/Go 中的至少一种" puts its list before the marker, while
+        # "至少精通以下之一：Python/Go" puts it after the marker.
+        scope = sentence[marker_index + len(marker) :] if marker == "以下之一" else sentence[:marker_index]
+        scope_lower = scope.lower()
+        members = [skill for skill in required_skills if skill.lower() in scope_lower]
+        if len(members) < 2:
+            continue
+        normalized_members = list(dict.fromkeys(members))
+        if normalized_members not in groups:
+            groups.append(normalized_members)
+    return groups
+
+
 def score_job(
     extracted: dict[str, Any],
     jd_text: str,
     resume_text: str = "",
     preferences: dict[str, Any] | None = None,
+    matching_evidence: str = "简历正文",
 ) -> dict[str, Any]:
     text = jd_text or ""
     preferences = preferences if isinstance(preferences, dict) else {}
-    required_skills = extracted.get("required_skills") or find_skills(text)
+    required_skills = list(dict.fromkeys(extracted.get("required_skills") or find_skills(text)))
     resume_lower = (resume_text or "").lower()
-    matched_skills = [skill for skill in required_skills if skill.lower() in resume_lower or skill in ["Python", "FastAPI", "SQLite", "RAG"]]
+    matched_skills = [skill for skill in required_skills if skill.lower() in resume_lower]
+    non_blocking_skills = [skill for skill in required_skills if skill_is_non_blocking(skill)]
+    alternative_groups = alternative_skill_groups(required_skills, text)
+    alternative_members = {skill for group in alternative_groups for skill in group}
+    required_units = [skill for skill in required_skills if skill not in alternative_members and skill not in non_blocking_skills]
+    matched_units = sum(1 for skill in required_units if skill in matched_skills)
+    missing_skills = [skill for skill in required_units if skill not in matched_skills]
+    alternative_labels: list[str] = []
+    for group in alternative_groups:
+        active_group = [skill for skill in group if skill not in non_blocking_skills]
+        if len(active_group) < 2:
+            continue
+        group_matches = [skill for skill in active_group if skill in matched_skills]
+        label = " / ".join(active_group) + "（满足其一）"
+        alternative_labels.append(label)
+        if group_matches:
+            matched_units += 1
+        else:
+            missing_skills.append(label)
 
-    tech_score = min(35, 8 + len(matched_skills) * 4 + ("RAG" in required_skills) * 4 + ("Agent" in required_skills) * 3)
+    total_requirement_units = len(required_units) + len(alternative_labels)
+    technical_coverage = matched_units / total_requirement_units if total_requirement_units else 0
+    tech_score = min(35, 8 + int(27 * technical_coverage))
+    fit_notes: list[str] = []
+    if total_requirement_units >= 8 and technical_coverage < 0.4:
+        fit_notes.append(
+            f"岗位列出 {total_requirement_units} 项技术要求，当前简历可证实匹配 {matched_units} 项，技术门槛较高。"
+        )
+    high_bar_markers = [marker for marker in HIGH_BAR_REQUIREMENT_MARKERS if marker.lower() in text.lower()]
+    if high_bar_markers and total_requirement_units >= 8 and technical_coverage < 0.65:
+        penalty = 7 if total_requirement_units >= 15 and technical_coverage < 0.5 else 4
+        tech_score = max(0, tech_score - penalty)
+        fit_notes.append("岗位明确要求" + "、".join(high_bar_markers[:3]) + "等高门槛能力，技术分已保守下调。")
     growth_score = min(25, 8 + sum(3 for keyword in GOOD_GROWTH_KEYWORDS if keyword.lower() in text.lower()))
     min_salary_per_day = preferences.get("min_salary_per_day")
     target_salary_per_day = preferences.get("target_salary_per_day")
@@ -387,7 +478,11 @@ def score_job(
         "risk_level": risk_level,
         "skip_reason": skip_reason,
         "matched_skills": matched_skills,
-        "missing_skills": [skill for skill in required_skills if skill not in matched_skills],
+        "missing_skills": missing_skills,
+        "alternative_requirement_groups": alternative_labels,
+        "non_blocking_skills": non_blocking_skills,
+        "fit_notes": fit_notes,
+        "matching_evidence": matching_evidence,
         "caution_signals": caution_signals,
         "risk_signals": risk_signals,
         "preference_notes": preference_notes,
@@ -398,6 +493,8 @@ def score_job(
             "location_time": location_score,
             "company_risk": risk_score,
             "salary_daily_range": list(daily_bounds) if daily_bounds else [],
+            "required_units": total_requirement_units,
+            "matched_requirement_units": matched_units,
         },
     }
 

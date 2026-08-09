@@ -90,3 +90,47 @@ def test_daily_salary_preference_does_not_guess_from_monthly_salary():
     monthly_jd = "AI 应用开发实习生，Python、FastAPI、RAG，薪资 3-5K/月。"
     monthly_scoring = score_job(rule_extract_jd(monthly_jd), monthly_jd, "Python FastAPI RAG", {"min_salary_per_day": 200})
     assert "薪资最低" not in monthly_scoring["skip_reason"]
+
+
+def test_score_treats_explicit_language_alternatives_as_one_requirement():
+    jd = "岗位要求：熟悉 Python/Java/Go/php 中的至少一种，且熟悉 LangChain。"
+    extracted = {
+        "required_skills": ["Python", "Java", "Go", "php", "LangChain"],
+        "salary_text": "200-300元/天",
+    }
+
+    scoring = score_job(extracted, jd, "Python RAG")
+
+    assert "Python" in scoring["matched_skills"]
+    assert not {"Java", "Go", "php"} & set(scoring["missing_skills"])
+    assert "LangChain" in scoring["missing_skills"]
+    assert "Python / Java / Go / php（满足其一）" in scoring["alternative_requirement_groups"]
+
+
+def test_score_does_not_count_ai_coding_tools_as_skill_gaps():
+    jd = "要求熟练使用 Claude Code、Codex、Cursor 等 AI 编程工具，熟悉 Python 和 Redis。"
+    extracted = {
+        "required_skills": ["Python", "Redis", "Claude Code", "Codex", "Cursor", "AI编程工具"],
+        "salary_text": "200-300元/天",
+    }
+
+    scoring = score_job(extracted, jd, "Python")
+
+    assert scoring["missing_skills"] == ["Redis"]
+    assert scoring["non_blocking_skills"] == ["Claude Code", "Codex", "Cursor", "AI编程工具"]
+
+
+def test_score_reduces_technical_points_when_many_requirements_are_unmatched():
+    jd = "AI Agent 开发岗位，要求 Python、RAG、LangChain、LangGraph、Kubernetes、Milvus、vLLM、LoRA、MLOps、Prometheus。"
+    extracted = {
+        "required_skills": ["Python", "RAG", "LangChain", "LangGraph", "Kubernetes", "Milvus", "vLLM", "LoRA", "MLOps", "Prometheus"],
+        "salary_text": "20-35k",
+    }
+
+    scoring = score_job(extracted, jd, "Python RAG")
+
+    assert scoring["score_breakdown"]["technical"] == 13
+    assert scoring["score_breakdown"]["required_units"] == 10
+    assert scoring["score_breakdown"]["matched_requirement_units"] == 2
+    assert scoring["score"] < 70
+    assert scoring["fit_notes"]

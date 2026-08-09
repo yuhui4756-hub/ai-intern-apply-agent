@@ -199,6 +199,7 @@ def action_type_label(value: str) -> str:
         "workflow_control": "求职流程控制",
         "job_discovery": "岗位发现",
         "job_candidate_feedback": "候选校准",
+        "job_rescore": "本地重新评分",
         "demo_draft_created": "演练草稿",
         "interview_prep_auto_create": "面试准备",
         "interview_feedback_update": "面试反馈",
@@ -759,6 +760,19 @@ def get_resume_text(resume_id: int | None) -> tuple[dict[str, Any] | None, str]:
         return resume_dict, parsed
 
 
+def get_matching_evidence(resume_id: int | None) -> tuple[str, str]:
+    _resume, resume_text = get_resume_text(resume_id)
+    if resume_text.strip():
+        return resume_text, "简历正文"
+    with connect() as conn:
+        profile = conn.execute("SELECT skills_json FROM candidate_profile ORDER BY id LIMIT 1").fetchone()
+    skills = loads(profile["skills_json"], []) if profile else []
+    explicit_skills = [str(skill).strip() for skill in skills if str(skill).strip()]
+    if explicit_skills:
+        return "\n".join(explicit_skills), "候选人画像技能"
+    return "", "无可用简历或画像技能"
+
+
 def try_llm_jd_extract(jd_text: str) -> tuple[dict[str, Any] | None, str]:
     client = client_for_task("jd_extract")
     if not client or not client.configured:
@@ -834,7 +848,7 @@ def analyze_job_payload(
     generate_messages: bool = True,
     matching_preferences: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    _resume, resume_text = get_resume_text(resume_id)
+    resume_text, matching_evidence = get_matching_evidence(resume_id)
     analysis_text = strip_platform_safety_notice(jd_text)
     fallback_extract = rule_extract_jd(
         analysis_text,
@@ -864,7 +878,13 @@ def analyze_job_payload(
             profile = conn.execute("SELECT * FROM candidate_profile ORDER BY id LIMIT 1").fetchone()
         profile_data = {key: profile[key] for key in profile.keys()} if profile else {}
         matching_preferences = discovery_filters_from_profile(profile_data)
-    scoring = score_job(extracted, analysis_text, resume_text, matching_preferences)
+    scoring = score_job(
+        extracted,
+        analysis_text,
+        resume_text,
+        matching_preferences,
+        matching_evidence=matching_evidence,
+    )
     messages = try_llm_message(extracted, scoring, generate_message(extracted, scoring)) if generate_messages and analysis_text else {"message": "", "email": ""}
     final_depth = auto_search_depth(scoring, extracted) if search_depth == "auto" else search_depth
     source = "llm_plus_rules" if llm_extract else "local_rules"
@@ -880,6 +900,78 @@ def analyze_job_payload(
         "analysis_error": analysis_error,
         "analysis_source": source,
     }
+
+
+def rescore_saved_job(conn: Any, job_id: int) -> dict[str, Any]:
+    row = conn.execute("SELECT * FROM job_postings WHERE id = ?", (job_id,)).fetchone()
+    if not row:
+        raise ValueError("没有找到要重新评分的岗位。")
+    job = {key: row[key] for key in row.keys()}
+    stored = loads(job.get("extracted_json"), {})
+    stored_extracted = stored.get("extracted") if isinstance(stored, dict) else {}
+    analysis_text = strip_platform_safety_notice(str(job.get("jd_text") or ""))
+    fallback_extract = rule_extract_jd(
+        analysis_text,
+        fallback_title=str(job.get("title") or ""),
+        fallback_company=str(job.get("company") or ""),
+        fallback_city=str(job.get("city") or ""),
+        fallback_salary=str(job.get("salary_text") or ""),
+    )
+    extracted = clean_extracted(stored_extracted or fallback_extract)
+    if not extracted.get("required_skills"):
+        extracted["required_skills"] = fallback_extract["required_skills"]
+    apply_blacklists(extracted, analysis_text)
+    resume_id = job.get("selected_resume_id")
+    resume_text, matching_evidence = get_matching_evidence(int(resume_id) if resume_id else None)
+    profile = conn.execute("SELECT * FROM candidate_profile ORDER BY id LIMIT 1").fetchone()
+    profile_data = {key: profile[key] for key in profile.keys()} if profile else {}
+    preferences = discovery_filters_from_profile(profile_data)
+    scoring = score_job(
+        extracted,
+        analysis_text,
+        resume_text,
+        preferences,
+        matching_evidence=matching_evidence,
+    )
+    now = utc_now()
+    conn.execute(
+        """
+        UPDATE job_postings
+        SET extracted_json = ?, match_score = ?, match_level = ?, risk_level = ?,
+            recommendation = ?, skip_reason = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (
+            dumps({"extracted": extracted, "scoring": scoring}),
+            scoring["score"],
+            scoring["level"],
+            scoring["risk_level"],
+            scoring["recommendation"],
+            scoring["skip_reason"],
+            now,
+            job_id,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO application_events (job_id, event_type, content, created_at) VALUES (?, ?, ?, ?)",
+        (job_id, "本地重新评分", "按当前本地规则重算匹配度，不调用模型或重新抓取 JD。", now),
+    )
+    log_agent_action(
+        conn,
+        action_type="job_rescore",
+        status="完成",
+        summary=f"本地重新评分：{job.get('title') or '岗位'}",
+        platform=str(job.get("platform") or ""),
+        job_id=job_id,
+        decision={
+            "model_called": False,
+            "score": scoring["score"],
+            "recommendation": scoring["recommendation"],
+            "required_units": scoring["score_breakdown"]["required_units"],
+            "matched_requirement_units": scoring["score_breakdown"]["matched_requirement_units"],
+        },
+    )
+    return scoring
 
 
 def insert_company_research(conn: Any, job_id: int, company: str, title: str, city: str, search_depth: str) -> None:
@@ -5799,6 +5891,16 @@ async def reanalyze_job(job_id: int, request: Request) -> RedirectResponse:
             analysis["search_depth"],
         )
     return redirect_with_notice(f"/jobs/{job_id}", "已重新分析岗位。", "success")
+
+
+@app.post("/jobs/{job_id}/rescore")
+def rescore_job(job_id: int) -> RedirectResponse:
+    try:
+        with connect() as conn:
+            rescore_saved_job(conn, job_id)
+    except ValueError as exc:
+        return redirect_with_notice("/jobs", str(exc), "error")
+    return redirect_with_notice(f"/jobs/{job_id}", "已按当前本地规则重新评分，未调用模型。", "success")
 
 
 @app.get("/interviews")

@@ -3791,6 +3791,84 @@ def test_search_candidate_feedback_persists_calibration_and_audit_log(tmp_path, 
     assert "误判 1" in detail.text
 
 
+def test_rescore_saved_job_uses_local_rules_without_llm_or_status_change(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "rescore-job.sqlite3"))
+
+    from app import main
+    from app.db import connect, dumps, init_db, loads
+
+    monkeypatch.setattr(main, "try_llm_jd_extract", lambda _text: ({}, ""))
+    init_db()
+    with connect() as conn:
+        resume_id = conn.execute("SELECT id FROM resume_versions ORDER BY id LIMIT 1").fetchone()["id"]
+        conn.execute("UPDATE resume_versions SET parsed_text = 'Python RAG' WHERE id = ?", (resume_id,))
+        job_id, _analysis = main.create_job_record(
+            conn,
+            jd_text="AI Agent 开发岗位。岗位要求：熟悉 Python/Java/Go/php 中的至少一种。",
+            resume_id=resume_id,
+            title="AI Agent 开发",
+            platform="测试平台",
+        )
+        extracted = {
+            "title": "AI Agent 开发",
+            "company": "测试公司",
+            "city": "北京",
+            "salary_text": "200-300元/天",
+            "internship_days": "",
+            "internship_duration": "",
+            "responsibilities": [],
+            "requirements": [],
+            "required_skills": ["Python", "Java", "Go", "php", "Cursor", "Redis"],
+            "bonus_skills": [],
+            "risk_signals": [],
+            "caution_signals": [],
+        }
+        conn.execute(
+            "UPDATE job_postings SET status = ?, extracted_json = ? WHERE id = ?",
+            ("已沟通", dumps({"extracted": extracted, "scoring": {}}), job_id),
+        )
+
+    client = TestClient(main.app)
+    monkeypatch.setattr(main, "try_llm_jd_extract", lambda _text: (_ for _ in ()).throw(AssertionError("不应调用 LLM")))
+    response = client.post(f"/jobs/{job_id}/rescore", follow_redirects=False)
+
+    assert response.status_code == 303
+    with connect() as conn:
+        job = conn.execute("SELECT status, extracted_json FROM job_postings WHERE id = ?", (job_id,)).fetchone()
+        action = conn.execute("SELECT action_type, decision_json FROM agent_action_logs ORDER BY id DESC LIMIT 1").fetchone()
+    scoring = loads(job["extracted_json"], {})["scoring"]
+    assert job["status"] == "已沟通"
+    assert not {"Java", "Go", "php", "Cursor"} & set(scoring["missing_skills"])
+    assert scoring["non_blocking_skills"] == ["Cursor"]
+    assert action["action_type"] == "job_rescore"
+    assert loads(action["decision_json"], {})["model_called"] is False
+
+
+def test_analysis_uses_explicit_profile_skills_when_resume_text_is_empty(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "profile-skill-evidence.sqlite3"))
+
+    from app import main
+    from app.db import connect, dumps, init_db
+
+    monkeypatch.setattr(main, "try_llm_jd_extract", lambda _text: ({}, ""))
+    init_db()
+    with connect() as conn:
+        conn.execute(
+            "UPDATE candidate_profile SET skills_json = ?",
+            (dumps(["Python", "RAG", "FastAPI"]),),
+        )
+        resume_id = conn.execute("SELECT id FROM resume_versions ORDER BY id LIMIT 1").fetchone()["id"]
+
+    analysis = main.analyze_job_payload(
+        "AI 应用开发实习生，要求 Python、RAG、FastAPI。",
+        resume_id,
+        generate_messages=False,
+    )
+
+    assert analysis["scoring"]["matching_evidence"] == "候选人画像技能"
+    assert {"Python", "RAG", "FastAPI"} <= set(analysis["scoring"]["matched_skills"])
+
+
 def test_controlled_discovery_plan_ignores_generic_search_history(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "controlled-discovery-plan.sqlite3"))
 
