@@ -59,6 +59,7 @@ class SearchResult:
     browser_channel: str
     candidates: list[SearchCandidate]
     note: str = ""
+    retry_count: int = 0
 
 
 def build_search_url(platform: str, keyword: str, city: str = "") -> str:
@@ -179,13 +180,40 @@ def capture_current_search_page(
     if channel != "msedge":
         raise ValueError("当前页面采集先支持 Microsoft Edge。")
     try:
+        (final_url, anchors), retry_count = retry_controlled_edge_read(
+            lambda: _capture_current_search_page_once(platform, expected_url)
+        )
+    except ValueError:
+        raise
+    except Exception as exc:
+        message = str(exc).strip() or exc.__class__.__name__
+        raise ValueError(f"无法连接当前 Edge 页面：{message[:160]}。请先点击“打开 Edge 搜索页”，完成登录或筛选后再采集。") from exc
+
+    candidates = extract_candidates_from_anchors(anchors, platform, city, final_url, limit=limit)
+    note = "" if candidates else "没有从当前页面识别到岗位候选，可尝试打开搜索结果页或岗位列表页后再采集。"
+    if retry_count:
+        note = append_controlled_edge_retry_note(note, retry_count)
+    return SearchResult(
+        platform=platform,
+        keyword=keyword,
+        city=city,
+        search_url=final_url,
+        browser_channel=channel,
+        candidates=candidates,
+        note=note,
+        retry_count=retry_count,
+    )
+
+
+def _capture_current_search_page_once(platform: str, expected_url: str) -> tuple[str, list[dict]]:
+    try:
         from playwright.sync_api import sync_playwright
     except ImportError as exc:
         raise ValueError("当前页面采集需要安装 Playwright：pip install playwright。") from exc
 
     browser = None
-    try:
-        with sync_playwright() as playwright:
+    with sync_playwright() as playwright:
+        try:
             if not wait_for_debug_endpoint(timeout_seconds=3):
                 raise ValueError("没有检测到应用打开的 Edge 调试窗口，请先点击“打开 Edge 搜索页”。")
             browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{EDGE_DEBUG_PORT}", timeout=8000)
@@ -198,22 +226,9 @@ def capture_current_search_page(
             except Exception:
                 pass
             page.wait_for_timeout(1500)
-            final_url = ensure_public_http_url(page.url)
-            anchors = extract_anchor_dicts_from_page(page)
-            browser.close()
-            browser = None
-    except ValueError:
-        raise
-    except Exception as exc:
-        message = str(exc).strip() or exc.__class__.__name__
-        raise ValueError(f"无法连接当前 Edge 页面：{message[:160]}。请先点击“打开 Edge 搜索页”，完成登录或筛选后再采集。") from exc
-    finally:
-        if browser is not None:
-            browser.close()
-
-    candidates = extract_candidates_from_anchors(anchors, platform, city, final_url, limit=limit)
-    note = "" if candidates else "没有从当前页面识别到岗位候选，可尝试打开搜索结果页或岗位列表页后再采集。"
-    return SearchResult(platform=platform, keyword=keyword, city=city, search_url=final_url, browser_channel=channel, candidates=candidates, note=note)
+            return ensure_public_http_url(page.url), extract_anchor_dicts_from_page(page)
+        finally:
+            close_safely(browser)
 
 
 def search_jobs_in_controlled_edge(
@@ -238,6 +253,28 @@ def fetch_job_from_controlled_edge(url: str) -> FetchResult:
     """Read one job-detail page through the controlled Edge login session without submitting anything."""
     safe_url = ensure_public_http_url(url)
     try:
+        (final_url, title, text), retry_count = retry_controlled_edge_read(
+            lambda: _fetch_job_from_controlled_edge_once(safe_url)
+        )
+    except ValueError:
+        raise
+    except Exception as exc:
+        message = str(exc).strip() or exc.__class__.__name__
+        raise ValueError(f"无法通过受控 Edge 抓取岗位详情：{message[:180]}。") from exc
+
+    return FetchResult(
+        url=safe_url,
+        final_url=final_url,
+        title=title,
+        text=validate_fetched_text(text),
+        fetch_mode="controlled_edge",
+        note=append_controlled_edge_retry_note("", retry_count) if retry_count else "",
+        retry_count=retry_count,
+    )
+
+
+def _fetch_job_from_controlled_edge_once(safe_url: str) -> tuple[str, str, str]:
+    try:
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
         from playwright.sync_api import sync_playwright
     except ImportError as exc:
@@ -245,8 +282,8 @@ def fetch_job_from_controlled_edge(url: str) -> FetchResult:
 
     browser = None
     page = None
-    try:
-        with sync_playwright() as playwright:
+    with sync_playwright() as playwright:
+        try:
             if not wait_for_debug_endpoint(timeout_seconds=3):
                 raise ValueError("没有检测到受控 Edge，请先启动岗位发现或自主沟通。")
             browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{EDGE_DEBUG_PORT}", timeout=8000)
@@ -259,37 +296,60 @@ def fetch_job_from_controlled_edge(url: str) -> FetchResult:
             except PlaywrightTimeoutError:
                 pass
             page.wait_for_timeout(1000)
-            final_url = ensure_public_http_url(page.url)
-            title = normalize_text(page.title())[:120]
-            text = page.locator("body").inner_text(timeout=8000)
-            page.close()
-            page = None
-            browser.close()
-            browser = None
-    except ValueError:
-        raise
-    except Exception as exc:
-        message = str(exc).strip() or exc.__class__.__name__
-        raise ValueError(f"无法通过受控 Edge 抓取岗位详情：{message[:180]}。") from exc
-    finally:
-        if page is not None:
-            try:
-                page.close()
-            except Exception:
-                pass
-        if browser is not None:
-            try:
-                browser.close()
-            except Exception:
-                pass
+            return (
+                ensure_public_http_url(page.url),
+                normalize_text(page.title())[:120],
+                page.locator("body").inner_text(timeout=8000),
+            )
+        finally:
+            close_safely(page)
+            close_safely(browser)
 
-    return FetchResult(
-        url=safe_url,
-        final_url=final_url,
-        title=title,
-        text=validate_fetched_text(text),
-        fetch_mode="controlled_edge",
+
+def retry_controlled_edge_read(operation) -> tuple[object, int]:
+    """Retry one transient, read-only CDP operation without touching platform actions."""
+    for attempt in range(2):
+        try:
+            return operation(), attempt
+        except ValueError:
+            raise
+        except Exception as exc:
+            if attempt or not is_transient_controlled_edge_error(exc):
+                raise
+            time.sleep(0.4)
+    raise RuntimeError("受控 Edge 读取重试未能完成。")
+
+
+def is_transient_controlled_edge_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(
+        signal in message
+        for signal in (
+            "event loop is closed",
+            "playwright already stopped",
+            "is playwright already stopped",
+            "connection refused",
+            "econnrefused",
+            "connection reset",
+            "websocket error",
+            "cdp session closed",
+            "target page, context or browser has been closed",
+        )
     )
+
+
+def append_controlled_edge_retry_note(note: str, retry_count: int) -> str:
+    retry_note = f"受控 Edge 连接短暂中断后已自动重试 {retry_count} 次并成功。"
+    return f"{note} {retry_note}".strip()
+
+
+def close_safely(resource) -> None:
+    if resource is None:
+        return
+    try:
+        resource.close()
+    except Exception:
+        pass
 
 
 def browser_profile_dir(name: str) -> Path:

@@ -1663,7 +1663,12 @@ def import_discovery_candidate(
             linked_count = link_candidates_to_job(conn, fetched.final_url, job_id)
             conn.execute(
                 "INSERT INTO application_events (job_id, event_type, content, created_at) VALUES (?, ?, ?, ?)",
-                (job_id, event_type, f"通过受控 Edge 读取岗位详情并完成评分，关联 {linked_count} 条搜索候选。", utc_now()),
+                (
+                    job_id,
+                    event_type,
+                    f"通过受控 Edge 读取岗位详情并完成评分，关联 {linked_count} 条搜索候选。{fetched.note}",
+                    utc_now(),
+                ),
             )
         return {
             "candidate_id": candidate_id,
@@ -1695,6 +1700,7 @@ def run_controlled_job_discovery(filters: dict[str, Any] | None = None) -> dict[
     screened_out_count = 0
     salary_screened_out_count = 0
     candidate_count = 0
+    controlled_edge_retry_count = 0
     seen_urls: set[str] = set()
     for item in plan:
         try:
@@ -1704,6 +1710,7 @@ def run_controlled_job_discovery(filters: dict[str, Any] | None = None) -> dict[
                 item["city"],
                 limit=JOB_DISCOVERY_CANDIDATE_LIMIT,
             )
+            controlled_edge_retry_count += int(getattr(result, "retry_count", 0) or 0)
             run_id = save_search_result(result)
         except Exception as exc:
             note = str(exc)[:500]
@@ -1768,6 +1775,8 @@ def run_controlled_job_discovery(filters: dict[str, Any] | None = None) -> dict[
         note += f" {failed_count} 个导入失败。"
     if search_errors:
         note += f" {len(search_errors)} 个搜索页失败。"
+    if controlled_edge_retry_count:
+        note += f" 受控 Edge 已自动恢复 {controlled_edge_retry_count} 次短暂连接中断。"
 
     with connect() as conn:
         log_agent_action(
@@ -1789,6 +1798,7 @@ def run_controlled_job_discovery(filters: dict[str, Any] | None = None) -> dict[
                 "pending_detail_count": pending_count,
                 "failed_import_count": failed_count,
                 "failed_search_count": len(search_errors),
+                "controlled_edge_retry_count": controlled_edge_retry_count,
                 "auto_apply": False,
                 "auto_message": False,
                 "message_text_saved": False,

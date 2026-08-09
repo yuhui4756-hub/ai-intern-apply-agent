@@ -3606,6 +3606,7 @@ def test_controlled_job_discovery_is_bounded_and_never_creates_outbound_actions(
                 )
                 for candidate_index in range(1, 4)
             ],
+            retry_count=1 if search_index == 1 else 0,
         )
 
     def fake_fetch(url):
@@ -3669,6 +3670,7 @@ def test_controlled_job_discovery_is_bounded_and_never_creates_outbound_actions(
     assert action_log["status"] == "完成"
     assert '"auto_apply": false' in action_log["decision_json"]
     assert '"auto_message": false' in action_log["decision_json"]
+    assert '"controlled_edge_retry_count": 1' in action_log["decision_json"]
 
     client = TestClient(main.app)
     monkeypatch.setattr(

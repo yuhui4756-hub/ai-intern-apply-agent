@@ -23,6 +23,7 @@ class FetchResult:
     text: str
     fetch_mode: str = "http"
     note: str = ""
+    retry_count: int = 0
 
 
 class VisibleTextParser(HTMLParser):

@@ -1,4 +1,7 @@
-from app.services.job_searcher import build_search_url, extract_candidates_from_anchors, pick_search_page
+import pytest
+
+from app.services import job_searcher
+from app.services.job_searcher import build_search_url, capture_current_search_page, extract_candidates_from_anchors, fetch_job_from_controlled_edge, pick_search_page
 
 
 def test_build_search_url_for_boss_city_keyword():
@@ -123,3 +126,66 @@ def test_pick_search_page_prefers_expected_controlled_search_url():
     )
 
     assert selected is intended_search
+
+
+def test_capture_current_search_page_retries_transient_playwright_shutdown(monkeypatch):
+    calls = []
+
+    def fake_read_once(_platform, _expected_url):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("Event loop is closed! Is Playwright already stopped?")
+        return (
+            "https://www.zhipin.com/web/geek/job?query=AI+Agent",
+            [
+                {
+                    "href": "https://www.zhipin.com/job_detail/retry-1.html",
+                    "text": "AI Agent 开发实习生",
+                    "context": "AI Agent 开发实习生\n测试智能科技\n杭州\n200-250元/天",
+                }
+            ],
+        )
+
+    monkeypatch.setattr(job_searcher, "_capture_current_search_page_once", fake_read_once)
+    monkeypatch.setattr(job_searcher.time, "sleep", lambda _seconds: None)
+
+    result = capture_current_search_page("Boss 直聘", "AI Agent", "杭州")
+
+    assert len(calls) == 2
+    assert result.retry_count == 1
+    assert "自动重试 1 次" in result.note
+    assert result.candidates[0].title == "AI Agent 开发实习生"
+
+
+def test_fetch_controlled_edge_retries_only_transient_read_failure(monkeypatch):
+    calls = []
+
+    def fake_read_once(url):
+        calls.append(url)
+        if len(calls) == 1:
+            raise RuntimeError("Event loop is closed! Is Playwright already stopped?")
+        return (url, "AI Agent 开发实习生", "岗位要求 Python、FastAPI、RAG。" * 5)
+
+    monkeypatch.setattr(job_searcher, "_fetch_job_from_controlled_edge_once", fake_read_once)
+    monkeypatch.setattr(job_searcher.time, "sleep", lambda _seconds: None)
+
+    result = fetch_job_from_controlled_edge("https://jobs.example.com/detail/1")
+
+    assert calls == ["https://jobs.example.com/detail/1", "https://jobs.example.com/detail/1"]
+    assert result.retry_count == 1
+    assert "自动重试 1 次" in result.note
+
+
+def test_controlled_edge_does_not_retry_non_transient_error(monkeypatch):
+    calls = []
+
+    def fake_read_once(_platform, _expected_url):
+        calls.append(1)
+        raise RuntimeError("招聘平台要求完成验证码")
+
+    monkeypatch.setattr(job_searcher, "_capture_current_search_page_once", fake_read_once)
+
+    with pytest.raises(ValueError, match="招聘平台要求完成验证码"):
+        capture_current_search_page("Boss 直聘", "AI Agent", "杭州")
+
+    assert len(calls) == 1
