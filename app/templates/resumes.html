@@ -35,6 +35,28 @@
     <label>目标岗位，每行一个
       <textarea name="target_roles" rows="4">{{ (loads(profile.target_roles, []) if profile else []) | join('\n') }}</textarea>
     </label>
+    <label>目标城市，按优先级每行一个
+      <textarea name="cities" rows="4" placeholder="杭州&#10;深圳&#10;广州">{{ preferences.cities | join('\n') }}</textarea>
+    </label>
+    <label>最低日薪（元/天，可留空）
+      <input name="min_salary_per_day" type="number" min="1" step="1" value="{{ preferences.min_salary_per_day or '' }}" placeholder="例如 150">
+    </label>
+    <label>目标日薪（元/天，可留空）
+      <input name="target_salary_per_day" type="number" min="1" step="1" value="{{ preferences.target_salary_per_day or '' }}" placeholder="例如 220">
+    </label>
+    <label>每周到岗偏好
+      <input name="internship_days" value="{{ preferences.internship_days }}" placeholder="例如 5 天左右">
+    </label>
+    <label>实习周期偏好
+      <input name="internship_duration" value="{{ preferences.internship_duration }}" placeholder="例如 3 个月及以上">
+    </label>
+    <label>远程岗位
+      <select name="remote_policy">
+        <option value="接受" {% if preferences.remote_policy == "接受" %}selected{% endif %}>接受远程、线下和混合</option>
+        <option value="仅远程" {% if preferences.remote_policy == "仅远程" %}selected{% endif %}>仅考虑远程</option>
+        <option value="不接受" {% if preferences.remote_policy == "不接受" %}selected{% endif %}>不考虑远程</option>
+      </select>
+    </label>
     <label>技能标签，每行一个
       <textarea name="skills" rows="8">{{ (loads(profile.skills_json, []) if profile else []) | join('\n') }}</textarea>
     </label>

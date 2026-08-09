@@ -17,16 +17,54 @@
   <div class="panel-title">
     <div>
       <h2>岗位发现</h2>
-      <p class="muted">每次搜索 3 个页面，最多读取并评分 6 个岗位详情。搜索条件来自候选人画像的目标岗位和城市。</p>
+      <p class="muted">每次搜索 3 个页面，最多读取并评分 6 个岗位详情。明确低于最低日薪的日薪岗位会归档；月薪和未披露薪资不会仅因薪资自动归档。</p>
       <p class="muted">本轮：{% for item in discovery_plan %}{{ item.platform }} {{ item.keyword }} · {{ item.city }}{% if not loop.last %}；{% endif %}{% endfor %}</p>
     </div>
     <span class="badge">受控 Edge</span>
   </div>
-  <form method="post" action="/job-discovery/start" class="form-actions">
+  <form method="post" action="/job-discovery/start" class="form-stack">
     <input type="hidden" name="return_to" value="/searches">
-    <button class="button primary" type="submit">开始岗位发现</button>
-    <a class="button" href="/resumes">调整候选人画像</a>
+    <div class="form-grid">
+      <label>本次岗位关键词
+        <input name="role" list="discovery-role-options" placeholder="留空按画像轮换（本轮 {{ discovery_plan[0].keyword if discovery_plan else 'AI 应用开发实习' }}）">
+      </label>
+      <label>本次城市
+        <input name="city" list="discovery-city-options" placeholder="留空按画像轮换（本轮 {{ discovery_plan[0].city if discovery_plan else '杭州' }}）">
+      </label>
+      <label>最低日薪（元/天）
+        <input name="min_salary_per_day" type="number" min="1" step="1" value="{{ discovery_filters.min_salary_per_day or '' }}" placeholder="留空不按薪资归档">
+      </label>
+      <label>目标日薪（元/天）
+        <input name="target_salary_per_day" type="number" min="1" step="1" value="{{ discovery_filters.target_salary_per_day or '' }}" placeholder="用于薪资评分">
+      </label>
+      <label>每周到岗偏好
+        <input name="internship_days" value="{{ discovery_filters.internship_days }}">
+      </label>
+      <label>实习周期偏好
+        <input name="internship_duration" value="{{ discovery_filters.internship_duration }}">
+      </label>
+      <label>远程岗位
+        <select name="remote_policy">
+          <option value="接受" {% if discovery_filters.remote_policy == "接受" %}selected{% endif %}>接受远程、线下和混合</option>
+          <option value="仅远程" {% if discovery_filters.remote_policy == "仅远程" %}selected{% endif %}>仅考虑远程</option>
+          <option value="不接受" {% if discovery_filters.remote_policy == "不接受" %}selected{% endif %}>不考虑远程</option>
+        </select>
+      </label>
+      <label class="checkbox-label">
+        <input name="save_as_profile" type="checkbox"> 同步保存为画像偏好
+      </label>
+    </div>
+    <div class="form-actions">
+      <button class="button primary" type="submit">开始岗位发现</button>
+      <a class="button" href="/resumes">调整候选人画像</a>
+    </div>
   </form>
+  <datalist id="discovery-role-options">
+    {% for role in discovery_filters.roles %}<option value="{{ role }}">{% endfor %}
+  </datalist>
+  <datalist id="discovery-city-options">
+    {% for city in discovery_filters.cities %}<option value="{{ city }}">{% endfor %}
+  </datalist>
 </section>
 
 <section class="panel">

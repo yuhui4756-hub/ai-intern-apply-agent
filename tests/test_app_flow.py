@@ -3674,7 +3674,7 @@ def test_controlled_job_discovery_is_bounded_and_never_creates_outbound_actions(
     monkeypatch.setattr(
         main,
         "run_controlled_job_discovery",
-        lambda: {"status": "完成", "note": "模拟岗位发现完成。"},
+        lambda *_args: {"status": "完成", "note": "模拟岗位发现完成。"},
     )
     response = client.post("/job-discovery/start", data={"return_to": "/searches"}, follow_redirects=False)
 
@@ -3782,6 +3782,107 @@ def test_discovery_candidate_screening_accepts_ascii_signals_and_blocks_non_engi
     accepted, reason = main.discovery_candidate_screening({"title": "AI 产品运营实习生", "summary": "内容运营"})
     assert accepted is False
     assert "非研发方向" in reason
+
+
+def test_discovery_filters_persist_override_plan_and_archive_low_daily_salary(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "discovery-filters.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db, loads
+
+    init_db()
+    client = TestClient(main.app)
+    saved = client.post(
+        "/resumes/profile",
+        data={
+            "name": "",
+            "education": "智能科学与技术本科在读",
+            "github_url": "https://github.com/yuhui4756-hub",
+            "demo_url": "https://github.com/yuhui4756-hub/ai-companion",
+            "target_roles": "AI 应用开发实习\nAgent 开发实习",
+            "cities": "杭州\n深圳",
+            "min_salary_per_day": "180",
+            "target_salary_per_day": "240",
+            "internship_days": "5 天左右",
+            "internship_duration": "3 个月及以上",
+            "remote_policy": "接受",
+            "skills": "Python\nFastAPI\nRAG",
+            "projects": "",
+        },
+        follow_redirects=False,
+    )
+    assert saved.status_code == 303
+    with connect() as conn:
+        profile = conn.execute("SELECT * FROM candidate_profile ORDER BY id LIMIT 1").fetchone()
+        plan, _resume_id = main.controlled_job_discovery_plan(
+            conn,
+            filters={"role": "RAG 开发实习", "city": "南京", "min_salary_per_day": 200},
+        )
+    preferences = loads(profile["preferences_json"], {})
+    assert preferences["cities"] == ["杭州", "深圳"]
+    assert preferences["min_salary_per_day"] == 180
+    assert preferences["target_salary_per_day"] == 240
+    assert {item["keyword"] for item in plan} == {"RAG 开发实习"}
+    assert {item["city"] for item in plan} == {"南京"}
+
+    calls = []
+
+    def fake_search(platform, keyword, city, limit):
+        calls.append((platform, keyword, city, limit))
+        return SearchResult(
+            platform=platform,
+            keyword=keyword,
+            city=city,
+            search_url=f"https://jobs.example.com/{platform}",
+            browser_channel="msedge",
+            candidates=[
+                SearchCandidate(
+                    title="RAG 开发实习生",
+                    company=f"测试公司 {platform}",
+                    city=city,
+                    source_url=f"https://jobs.example.com/{platform}/detail",
+                    summary="Python、FastAPI、RAG",
+                )
+            ],
+        )
+
+    monkeypatch.setattr(main, "search_jobs_in_controlled_edge", fake_search)
+    monkeypatch.setattr(main, "search_company", lambda *args, **kwargs: [])
+    monkeypatch.setattr(main, "try_llm_jd_extract", lambda _text: ({}, ""))
+    monkeypatch.setattr(
+        main,
+        "fetch_job_from_controlled_edge",
+        lambda url: FetchResult(
+            url=url,
+            final_url=url,
+            title="RAG 开发实习生",
+            text="RAG 开发实习生，南京，薪资 120-180 元/天，要求 Python、FastAPI、RAG。",
+            fetch_mode="controlled_edge",
+        ),
+    )
+
+    result = main.run_controlled_job_discovery(
+        {"role": "RAG 开发实习", "city": "南京", "min_salary_per_day": 200}
+    )
+    assert result["status"] == "完成"
+    assert all(call[1:3] == ("RAG 开发实习", "南京") for call in calls)
+    with connect() as conn:
+        jobs = conn.execute("SELECT id, recommendation, status, skip_reason FROM job_postings ORDER BY id").fetchall()
+        action = conn.execute("SELECT decision_json FROM agent_action_logs ORDER BY id DESC LIMIT 1").fetchone()
+    assert len(jobs) == 3
+    assert all(job["recommendation"] == "跳过" and job["status"] == "已归档" for job in jobs)
+    assert all("低于设置底线 200 元/天" in job["skip_reason"] for job in jobs)
+    assert loads(action["decision_json"], {})["effective_filters"]["min_salary_per_day"] == 200
+
+    detail = client.get(f"/jobs/{jobs[0]['id']}")
+    assert detail.status_code == 200
+    assert "偏好提醒" in detail.text
+    assert "低于设置底线 200 元/天" in detail.text
+
+    page = client.get("/searches")
+    assert page.status_code == 200
+    assert "最低日薪（元/天）" in page.text
+    assert "同步保存为画像偏好" in page.text
 
 
 def test_manual_edge_search_launch_uses_debug_profile(tmp_path, monkeypatch):

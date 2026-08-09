@@ -1,4 +1,4 @@
-from app.services.analyzer import clean_extracted, extract_salary, looks_like_salary_text, rule_extract_jd, score_job
+from app.services.analyzer import daily_salary_bounds, clean_extracted, extract_salary, looks_like_salary_text, rule_extract_jd, score_job
 
 
 def test_high_match_rag_agent_job_is_recommended():
@@ -75,3 +75,18 @@ def test_extract_salary_handles_common_intern_formats():
 def test_salary_guard_rejects_time_requirements():
     assert not looks_like_salary_text("每周 5 天")
     assert not looks_like_salary_text("3 个月以上")
+
+
+def test_daily_salary_preference_does_not_guess_from_monthly_salary():
+    jd = "AI 应用开发实习生，Python、FastAPI、RAG，薪资 120-180 元/天。"
+    extracted = rule_extract_jd(jd)
+    scoring = score_job(extracted, jd, "Python FastAPI RAG", {"min_salary_per_day": 200})
+
+    assert daily_salary_bounds("120-180元/天") == (120, 180)
+    assert daily_salary_bounds("3-5K/月") is None
+    assert scoring["recommendation"] == "跳过"
+    assert "低于设置底线 200 元/天" in scoring["skip_reason"]
+
+    monthly_jd = "AI 应用开发实习生，Python、FastAPI、RAG，薪资 3-5K/月。"
+    monthly_scoring = score_job(rule_extract_jd(monthly_jd), monthly_jd, "Python FastAPI RAG", {"min_salary_per_day": 200})
+    assert "薪资最低" not in monthly_scoring["skip_reason"]

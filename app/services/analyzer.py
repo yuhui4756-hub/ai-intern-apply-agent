@@ -195,9 +195,35 @@ def clean_extracted(extracted: dict[str, Any]) -> dict[str, Any]:
     return cleaned
 
 
-def salary_score(salary_text: str) -> int:
+def daily_salary_bounds(salary_text: str) -> tuple[int, int] | None:
+    """Return the stated daily salary range without guessing from monthly pay."""
+    text = clean_salary_text(salary_text).lower()
+    if not text or not any(marker in text for marker in ("/天", "/日", "日薪", "元天", "元日")):
+        return None
+    numbers = [float(item) for item in re.findall(SALARY_NUMBER, text)]
+    if not numbers:
+        return None
+    return int(min(numbers)), int(max(numbers))
+
+
+def salary_score(
+    salary_text: str,
+    min_salary_per_day: int | None = None,
+    target_salary_per_day: int | None = None,
+) -> int:
     if not salary_text:
         return 8
+    daily_bounds = daily_salary_bounds(salary_text)
+    if daily_bounds and min_salary_per_day:
+        low, high = daily_bounds
+        if low < min_salary_per_day:
+            return 0
+        if target_salary_per_day:
+            if low >= target_salary_per_day:
+                return 15
+            if high >= target_salary_per_day:
+                return 13
+            return 10
     numbers = [int(item) for item in re.findall(r"\d+", salary_text)]
     if not numbers:
         return 8
@@ -265,16 +291,59 @@ def split_section(text: str, markers: list[str]) -> list[str]:
     return [line[:180] for line in lines[:5]]
 
 
-def score_job(extracted: dict[str, Any], jd_text: str, resume_text: str = "") -> dict[str, Any]:
+def score_job(
+    extracted: dict[str, Any],
+    jd_text: str,
+    resume_text: str = "",
+    preferences: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     text = jd_text or ""
+    preferences = preferences if isinstance(preferences, dict) else {}
     required_skills = extracted.get("required_skills") or find_skills(text)
     resume_lower = (resume_text or "").lower()
     matched_skills = [skill for skill in required_skills if skill.lower() in resume_lower or skill in ["Python", "FastAPI", "SQLite", "RAG"]]
 
     tech_score = min(35, 8 + len(matched_skills) * 4 + ("RAG" in required_skills) * 4 + ("Agent" in required_skills) * 3)
     growth_score = min(25, 8 + sum(3 for keyword in GOOD_GROWTH_KEYWORDS if keyword.lower() in text.lower()))
-    salary_points = salary_score(extracted.get("salary_text") or "")
-    location_score = 10 if (extracted.get("city") in ["北京", "上海", "广州", "深圳", "杭州", "重庆", "成都", ""] or "远程" in text) else 6
+    min_salary_per_day = preferences.get("min_salary_per_day")
+    target_salary_per_day = preferences.get("target_salary_per_day")
+    min_salary_per_day = min_salary_per_day if isinstance(min_salary_per_day, int) and min_salary_per_day > 0 else None
+    target_salary_per_day = target_salary_per_day if isinstance(target_salary_per_day, int) and target_salary_per_day > 0 else None
+    salary_text = extracted.get("salary_text") or ""
+    daily_bounds = daily_salary_bounds(salary_text)
+    salary_points = salary_score(salary_text, min_salary_per_day, target_salary_per_day)
+    preferred_cities = [str(city).strip() for city in preferences.get("cities", []) if str(city).strip()]
+    preferred_cities = preferred_cities or ["北京", "上海", "广州", "深圳", "杭州", "重庆", "成都"]
+    remote_policy = str(preferences.get("remote_policy") or "接受")
+    preference_notes: list[str] = []
+    is_remote = "远程" in text
+    remote_only_mismatch = remote_policy == "仅远程" and bool(extracted.get("city")) and not is_remote
+    if remote_policy == "仅远程":
+        location_score = 10 if is_remote else 0
+        if remote_only_mismatch:
+            preference_notes.append("岗位标注为线下城市，和仅远程偏好不符")
+    elif remote_policy == "不接受" and is_remote and not extracted.get("city"):
+        location_score = 0
+        preference_notes.append("岗位仅标注远程，和远程偏好不符")
+    else:
+        location_score = 10 if (
+            extracted.get("city") in preferred_cities
+            or not extracted.get("city")
+            or is_remote
+        ) else 6
+    salary_below_minimum = bool(
+        daily_bounds and min_salary_per_day and daily_bounds[0] < min_salary_per_day
+    )
+    if salary_below_minimum:
+        preference_notes.append(
+            f"薪资最低 {daily_bounds[0]} 元/天，低于设置底线 {min_salary_per_day} 元/天"
+        )
+    desired_days = re.search(r"([1-7])\s*天", str(preferences.get("internship_days") or ""))
+    stated_days = re.search(r"(?:每周|一周)\s*([1-7])\s*天", text)
+    if desired_days and stated_days and int(stated_days.group(1)) > int(desired_days.group(1)):
+        preference_notes.append(
+            f"每周到岗 {stated_days.group(1)} 天，高于偏好（{preferences.get('internship_days')}）"
+        )
 
     risk_signals = extracted.get("risk_signals") or []
     caution_signals = extracted.get("caution_signals") or []
@@ -290,6 +359,11 @@ def score_job(extracted: dict[str, Any], jd_text: str, resume_text: str = "") ->
         recommendation = "跳过"
         risk_level = "高"
         skip_reason = "命中高风险信号：" + "、".join(risk_signals)
+    elif salary_below_minimum or remote_only_mismatch:
+        level = "低匹配"
+        recommendation = "跳过"
+        risk_level = "谨慎" if caution_signals else "低"
+        skip_reason = preference_notes[0]
     elif score >= 80:
         level = "高匹配"
         recommendation = "必投"
@@ -316,12 +390,14 @@ def score_job(extracted: dict[str, Any], jd_text: str, resume_text: str = "") ->
         "missing_skills": [skill for skill in required_skills if skill not in matched_skills],
         "caution_signals": caution_signals,
         "risk_signals": risk_signals,
+        "preference_notes": preference_notes,
         "score_breakdown": {
             "technical": tech_score,
             "growth": growth_score,
             "salary": salary_points,
             "location_time": location_score,
             "company_risk": risk_score,
+            "salary_daily_range": list(daily_bounds) if daily_bounds else [],
         },
     }
 

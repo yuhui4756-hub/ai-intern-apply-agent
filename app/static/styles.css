@@ -218,6 +218,17 @@ label {
   align-items: center;
 }
 
+.checkbox-label {
+  flex-direction: row;
+  align-items: center;
+  align-self: end;
+  min-height: 42px;
+}
+
+.checkbox-label input {
+  width: auto;
+}
+
 input,
 select,
 textarea {

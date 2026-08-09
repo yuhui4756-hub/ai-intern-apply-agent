@@ -102,6 +102,8 @@ JOB_DISCOVERY_PLATFORMS = ("Boss 直聘", "猎聘", "实习僧")
 JOB_DISCOVERY_SEARCH_PAGE_LIMIT = 3
 JOB_DISCOVERY_CANDIDATE_LIMIT = 18
 JOB_DISCOVERY_IMPORT_LIMIT = 6
+DEFAULT_DISCOVERY_ROLES = ("AI 应用开发实习", "Agent 开发实习", "AI 后端实习")
+DEFAULT_DISCOVERY_CITIES = ("北京", "上海", "广州", "深圳", "杭州", "重庆", "成都")
 JOB_DISCOVERY_ROLE_SIGNALS = (
     "ai",
     "agent",
@@ -827,6 +829,7 @@ def analyze_job_payload(
     salary_text: str = "",
     search_depth: str = "auto",
     generate_messages: bool = True,
+    matching_preferences: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     _resume, resume_text = get_resume_text(resume_id)
     analysis_text = strip_platform_safety_notice(jd_text)
@@ -853,7 +856,12 @@ def analyze_job_payload(
         extracted["salary_text"] = ""
     apply_blacklists(extracted, analysis_text)
 
-    scoring = score_job(extracted, analysis_text, resume_text)
+    if matching_preferences is None:
+        with connect() as conn:
+            profile = conn.execute("SELECT * FROM candidate_profile ORDER BY id LIMIT 1").fetchone()
+        profile_data = {key: profile[key] for key in profile.keys()} if profile else {}
+        matching_preferences = discovery_filters_from_profile(profile_data)
+    scoring = score_job(extracted, analysis_text, resume_text, matching_preferences)
     messages = try_llm_message(extracted, scoring, generate_message(extracted, scoring)) if generate_messages and analysis_text else {"message": "", "email": ""}
     final_depth = auto_search_depth(scoring, extracted) if search_depth == "auto" else search_depth
     source = "llm_plus_rules" if llm_extract else "local_rules"
@@ -965,6 +973,122 @@ def default_search_form() -> dict[str, str]:
     }
 
 
+def text_line_items(value: Any) -> list[str]:
+    if isinstance(value, list):
+        items = value
+    else:
+        items = str(value or "").splitlines()
+    return list(dict.fromkeys(str(item).strip() for item in items if str(item).strip()))
+
+
+def optional_positive_int(value: Any, field_label: str) -> int | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        number = int(text)
+    except ValueError as exc:
+        raise ValueError(f"{field_label}应填写正整数。") from exc
+    if number <= 0:
+        raise ValueError(f"{field_label}应填写正整数。")
+    return number
+
+
+def normalized_profile_preferences(value: Any) -> dict[str, Any]:
+    raw = value if isinstance(value, dict) else {}
+    cities = text_line_items(raw.get("cities")) or list(DEFAULT_DISCOVERY_CITIES)
+    remote_policy = str(raw.get("remote_policy") or "接受").strip()
+    if remote_policy not in {"接受", "仅远程", "不接受"}:
+        remote_policy = "接受"
+    return {
+        "cities": cities,
+        "min_salary_per_day": optional_positive_int(raw.get("min_salary_per_day"), "最低日薪"),
+        "target_salary_per_day": optional_positive_int(raw.get("target_salary_per_day"), "目标日薪"),
+        "internship_days": str(raw.get("internship_days") or "5 天左右").strip(),
+        "internship_duration": str(raw.get("internship_duration") or "3 个月及以上").strip(),
+        "remote_policy": remote_policy,
+    }
+
+
+def discovery_filters_from_profile(
+    profile_data: dict[str, Any], overrides: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    preferences = normalized_profile_preferences(loads(profile_data.get("preferences_json"), {}))
+    roles = text_line_items(loads(profile_data.get("target_roles"), [])) or list(DEFAULT_DISCOVERY_ROLES)
+    filters: dict[str, Any] = {"roles": roles, **preferences}
+    if not overrides:
+        return filters
+
+    role = str(overrides.get("role") or "").strip()
+    city = str(overrides.get("city") or "").strip()
+    if role:
+        filters["roles"] = [role]
+    if city:
+        filters["cities"] = [city]
+    for field in (
+        "min_salary_per_day",
+        "target_salary_per_day",
+        "internship_days",
+        "internship_duration",
+        "remote_policy",
+    ):
+        if field in overrides:
+            filters[field] = overrides[field]
+    return filters
+
+
+def discovery_filters_from_form(form: Any) -> dict[str, Any]:
+    filters: dict[str, Any] = {
+        "role": str(form.get("role") or "").strip(),
+        "city": str(form.get("city") or "").strip(),
+    }
+    for field, label in (("min_salary_per_day", "最低日薪"), ("target_salary_per_day", "目标日薪")):
+        if field in form:
+            filters[field] = optional_positive_int(form.get(field), label)
+    for field in ("internship_days", "internship_duration"):
+        if field in form:
+            filters[field] = str(form.get(field) or "").strip()
+    if "remote_policy" in form:
+        remote_policy = str(form.get("remote_policy") or "接受").strip()
+        if remote_policy not in {"接受", "仅远程", "不接受"}:
+            remote_policy = "接受"
+        filters["remote_policy"] = remote_policy
+    return filters
+
+
+def update_profile_discovery_preferences(
+    conn: Any, profile: Any, filters: dict[str, Any]
+) -> None:
+    profile_data = {key: profile[key] for key in profile.keys()}
+    preferences = loads(profile_data.get("preferences_json"), {})
+    if not isinstance(preferences, dict):
+        preferences = {}
+    if filters.get("city"):
+        old_cities = text_line_items(preferences.get("cities"))
+        preferences["cities"] = [filters["city"], *[city for city in old_cities if city != filters["city"]]]
+    for field in (
+        "min_salary_per_day",
+        "target_salary_per_day",
+        "internship_days",
+        "internship_duration",
+        "remote_policy",
+    ):
+        if field not in filters:
+            continue
+        value = filters.get(field)
+        if value is None or value == "":
+            preferences.pop(field, None)
+        else:
+            preferences[field] = value
+    roles = text_line_items(loads(profile_data.get("target_roles"), []))
+    if filters.get("role"):
+        roles = [filters["role"], *[role for role in roles if role != filters["role"]]]
+    conn.execute(
+        "UPDATE candidate_profile SET target_roles = ?, preferences_json = ?, updated_at = ? WHERE id = ?",
+        (dumps(roles), dumps(preferences), utc_now(), profile["id"]),
+    )
+
+
 def save_last_manual_search(
     platform: str,
     keyword: str,
@@ -1005,6 +1129,7 @@ def create_job_record(
     salary_text: str = "",
     search_depth: str = "auto",
     generate_messages: bool = True,
+    matching_preferences: dict[str, Any] | None = None,
 ) -> tuple[int, dict[str, Any]]:
     analysis = analyze_job_payload(
         jd_text,
@@ -1015,6 +1140,7 @@ def create_job_record(
         salary_text=salary_text,
         search_depth=search_depth,
         generate_messages=generate_messages,
+        matching_preferences=matching_preferences,
     )
     extracted = analysis["extracted"]
     scoring = analysis["scoring"]
@@ -1118,6 +1244,7 @@ def refresh_job_record(
     salary_text: str = "",
     search_depth: str = "auto",
     generate_messages: bool = True,
+    matching_preferences: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     existing = conn.execute("SELECT * FROM job_postings WHERE id = ?", (job_id,)).fetchone()
     if not existing:
@@ -1131,6 +1258,7 @@ def refresh_job_record(
         salary_text=salary_text,
         search_depth=search_depth,
         generate_messages=generate_messages,
+        matching_preferences=matching_preferences,
     )
     extracted = analysis["extracted"]
     scoring = analysis["scoring"]
@@ -1275,16 +1403,16 @@ def save_search_failure(platform: str, keyword: str, city: str, browser_channel:
     return int(cursor.lastrowid)
 
 
-def controlled_job_discovery_plan(conn: Any, page_limit: int = JOB_DISCOVERY_SEARCH_PAGE_LIMIT) -> tuple[list[dict[str, str]], int | None]:
+def controlled_job_discovery_plan(
+    conn: Any,
+    page_limit: int = JOB_DISCOVERY_SEARCH_PAGE_LIMIT,
+    filters: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, str]], int | None]:
     profile = conn.execute("SELECT * FROM candidate_profile ORDER BY id LIMIT 1").fetchone()
     profile_data = {key: profile[key] for key in profile.keys()} if profile else {}
-    roles = [str(item).strip() for item in loads(profile_data.get("target_roles"), []) if str(item).strip()]
-    preferences = loads(profile_data.get("preferences_json"), {})
-    cities = [str(item).strip() for item in preferences.get("cities", []) if str(item).strip()] if isinstance(preferences, dict) else []
-    if not roles:
-        roles = ["AI 应用开发实习", "Agent 开发实习", "AI 后端实习"]
-    if not cities:
-        cities = ["北京", "上海", "广州", "深圳", "杭州", "重庆", "成都"]
+    effective_filters = discovery_filters_from_profile(profile_data, filters)
+    roles = effective_filters["roles"]
+    cities = effective_filters["cities"]
 
     resume = conn.execute("SELECT id FROM resume_versions ORDER BY is_default DESC, id LIMIT 1").fetchone()
     history = conn.execute(
@@ -1299,7 +1427,8 @@ def controlled_job_discovery_plan(conn: Any, page_limit: int = JOB_DISCOVERY_SEA
     ).fetchone()
     role_index = 0
     city_index = 0
-    if history:
+    explicit_role_or_city = bool(filters and (filters.get("role") or filters.get("city")))
+    if history and not explicit_role_or_city:
         decision = loads(history["decision_json"], {})
         previous_plan = decision.get("plan", []) if isinstance(decision, dict) else []
         previous = previous_plan[0] if isinstance(previous_plan, list) and previous_plan else {}
@@ -1334,7 +1463,11 @@ def discovery_candidate_screening(candidate: dict[str, Any]) -> tuple[bool, str]
     return False, "自动初筛未识别到 AI/Agent/大模型方向，未读取 JD；可手动导入复核。"
 
 
-def import_discovery_candidate(candidate_id: int, resume_id: int | None) -> dict[str, Any]:
+def import_discovery_candidate(
+    candidate_id: int,
+    resume_id: int | None,
+    matching_preferences: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     with connect() as conn:
         row = conn.execute("SELECT * FROM job_candidates WHERE id = ?", (candidate_id,)).fetchone()
     if not row:
@@ -1372,6 +1505,7 @@ def import_discovery_candidate(candidate_id: int, resume_id: int | None) -> dict
                     city=str(candidate.get("city") or ""),
                     search_depth="auto",
                     generate_messages=False,
+                    matching_preferences=matching_preferences,
                 )
                 event_type = "岗位发现刷新"
             else:
@@ -1386,6 +1520,7 @@ def import_discovery_candidate(candidate_id: int, resume_id: int | None) -> dict
                     city=str(candidate.get("city") or ""),
                     search_depth="auto",
                     generate_messages=False,
+                    matching_preferences=matching_preferences,
                 )
                 event_type = "岗位发现导入"
             linked_count = link_candidates_to_job(conn, fetched.final_url, job_id)
@@ -1410,9 +1545,12 @@ def import_discovery_candidate(candidate_id: int, resume_id: int | None) -> dict
         return {"candidate_id": candidate_id, "status": "导入失败", "note": note}
 
 
-def run_controlled_job_discovery() -> dict[str, Any]:
+def run_controlled_job_discovery(filters: dict[str, Any] | None = None) -> dict[str, Any]:
     with connect() as conn:
-        plan, resume_id = controlled_job_discovery_plan(conn)
+        profile = conn.execute("SELECT * FROM candidate_profile ORDER BY id LIMIT 1").fetchone()
+        profile_data = {key: profile[key] for key in profile.keys()} if profile else {}
+        effective_filters = discovery_filters_from_profile(profile_data, filters)
+        plan, resume_id = controlled_job_discovery_plan(conn, filters=filters)
 
     run_ids: list[int] = []
     candidate_ids: list[int] = []
@@ -1463,7 +1601,7 @@ def run_controlled_job_discovery() -> dict[str, Any]:
             candidate_ids.append(int(row["id"]))
 
     import_results = [
-        import_discovery_candidate(candidate_id, resume_id)
+        import_discovery_candidate(candidate_id, resume_id, effective_filters)
         for candidate_id in candidate_ids[:JOB_DISCOVERY_IMPORT_LIMIT]
     ]
     imported_count = sum(1 for item in import_results if item["status"] == "已导入")
@@ -1498,6 +1636,7 @@ def run_controlled_job_discovery() -> dict[str, Any]:
                 "search_page_limit": JOB_DISCOVERY_SEARCH_PAGE_LIMIT,
                 "detail_import_limit": JOB_DISCOVERY_IMPORT_LIMIT,
                 "plan": plan,
+                "effective_filters": effective_filters,
                 "run_ids": run_ids,
                 "candidate_count": candidate_count,
                 "auto_import_candidate_count": len(candidate_ids),
@@ -3870,6 +4009,7 @@ def resumes_page(request: Request) -> Any:
         resumes = conn.execute("SELECT * FROM resume_versions ORDER BY id").fetchall()
     profile_dict = {key: profile[key] for key in profile.keys()} if profile else {}
     projects = loads(profile_dict.get("projects_json"), []) if profile_dict else []
+    preferences = normalized_profile_preferences(loads(profile_dict.get("preferences_json"), {}))
     return templates.TemplateResponse(
         request,
         "resumes.html",
@@ -3878,6 +4018,7 @@ def resumes_page(request: Request) -> Any:
             "resumes": [{key: row[key] for key in row.keys()} for row in resumes],
             "projects": projects if isinstance(projects, list) else [],
             "project_lines": format_project_lines(projects if isinstance(projects, list) else []),
+            "preferences": preferences,
             "loads": loads,
             "notice": request.query_params.get("notice", ""),
             "notice_type": request.query_params.get("notice_type", "info"),
@@ -3925,28 +4066,57 @@ def format_project_lines(projects: list[dict[str, Any]]) -> str:
 async def update_profile(request: Request) -> RedirectResponse:
     form = await request.form()
     now = utc_now()
-    with connect() as conn:
-        profile = conn.execute("SELECT id FROM candidate_profile ORDER BY id LIMIT 1").fetchone()
-        values = (
-            str(form.get("name") or ""),
-            str(form.get("education") or ""),
-            str(form.get("github_url") or ""),
-            str(form.get("demo_url") or ""),
-            dumps([item.strip() for item in str(form.get("target_roles") or "").splitlines() if item.strip()]),
-            dumps([item.strip() for item in str(form.get("skills") or "").splitlines() if item.strip()]),
-            dumps(parse_project_lines(str(form.get("projects") or ""))),
-            now,
-        )
-        if profile:
+    try:
+        with connect() as conn:
+            profile = conn.execute("SELECT * FROM candidate_profile ORDER BY id LIMIT 1").fetchone()
+            if not profile:
+                return redirect_with_notice("/resumes", "没有找到候选人画像。", "error")
+            preferences = loads(profile["preferences_json"], {})
+            if not isinstance(preferences, dict):
+                preferences = {}
+            if "cities" in form:
+                preferences["cities"] = text_line_items(form.get("cities"))
+            for field, label in (("min_salary_per_day", "最低日薪"), ("target_salary_per_day", "目标日薪")):
+                if field in form:
+                    value = optional_positive_int(form.get(field), label)
+                    if value is None:
+                        preferences.pop(field, None)
+                    else:
+                        preferences[field] = value
+            for field in ("internship_days", "internship_duration"):
+                if field in form:
+                    value = str(form.get(field) or "").strip()
+                    if value:
+                        preferences[field] = value
+                    else:
+                        preferences.pop(field, None)
+            if "remote_policy" in form:
+                remote_policy = str(form.get("remote_policy") or "接受").strip()
+                if remote_policy not in {"接受", "仅远程", "不接受"}:
+                    raise ValueError("远程偏好无效。")
+                preferences["remote_policy"] = remote_policy
+            values = (
+                str(form.get("name") or ""),
+                str(form.get("education") or ""),
+                str(form.get("github_url") or ""),
+                str(form.get("demo_url") or ""),
+                dumps([item.strip() for item in str(form.get("target_roles") or "").splitlines() if item.strip()]),
+                dumps([item.strip() for item in str(form.get("skills") or "").splitlines() if item.strip()]),
+                dumps(parse_project_lines(str(form.get("projects") or ""))),
+                dumps(preferences),
+                now,
+            )
             conn.execute(
                 """
                 UPDATE candidate_profile
                 SET name = ?, education = ?, github_url = ?, demo_url = ?,
-                    target_roles = ?, skills_json = ?, projects_json = ?, updated_at = ?
+                    target_roles = ?, skills_json = ?, projects_json = ?, preferences_json = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (*values, profile["id"]),
             )
+    except ValueError as exc:
+        return redirect_with_notice("/resumes", str(exc), "error")
     return redirect_with_notice("/resumes", "候选人画像已保存。", "success")
 
 
@@ -4621,6 +4791,9 @@ def searches_page(request: Request) -> Any:
             LIMIT 30
             """
         ).fetchall()
+        profile = conn.execute("SELECT * FROM candidate_profile ORDER BY id LIMIT 1").fetchone()
+        profile_data = {key: profile[key] for key in profile.keys()} if profile else {}
+        discovery_filters = discovery_filters_from_profile(profile_data)
         discovery_plan, _resume_id = controlled_job_discovery_plan(conn)
     return templates.TemplateResponse(
         request,
@@ -4629,6 +4802,7 @@ def searches_page(request: Request) -> Any:
             "runs": [{key: row[key] for key in row.keys()} for row in runs],
             "search_form": search_form,
             "discovery_plan": discovery_plan,
+            "discovery_filters": discovery_filters,
             "notice": request.query_params.get("notice", ""),
             "notice_type": request.query_params.get("notice_type", "info"),
             "browser_channel_label": browser_channel_label,
@@ -4664,7 +4838,16 @@ async def start_controlled_job_discovery(request: Request) -> RedirectResponse:
     if not return_to.startswith("/") or return_to.startswith("//"):
         return_to = "/searches"
     try:
-        result = await run_in_threadpool(run_controlled_job_discovery)
+        filters = discovery_filters_from_form(form)
+        if str(form.get("save_as_profile") or "").lower() in {"1", "true", "on", "yes"}:
+            with connect() as conn:
+                profile = conn.execute("SELECT * FROM candidate_profile ORDER BY id LIMIT 1").fetchone()
+                if not profile:
+                    return redirect_with_notice(return_to, "没有找到候选人画像。", "error")
+                update_profile_discovery_preferences(conn, profile, filters)
+        result = await run_in_threadpool(run_controlled_job_discovery, filters)
+    except ValueError as exc:
+        return redirect_with_notice(return_to, str(exc), "error")
     except Exception as exc:
         return redirect_with_notice(return_to, f"岗位发现失败：{str(exc)[:180]}", "error")
     notice_type = "success" if result["status"] == "完成" else "warning" if result["status"] == "部分完成" else "error"

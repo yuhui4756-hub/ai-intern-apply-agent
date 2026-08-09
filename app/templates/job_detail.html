@@ -35,6 +35,9 @@
     {% set extracted = job.extracted.get("extracted", {}) %}
     <p><strong>已匹配技能：</strong>{{ scoring.get("matched_skills", []) | join("、") or "-" }}</p>
     <p><strong>缺口：</strong>{{ scoring.get("missing_skills", []) | join("、") or "-" }}</p>
+    {% if scoring.get("preference_notes", []) %}
+    <p><strong>偏好提醒：</strong>{{ scoring.get("preference_notes", []) | join("；") }}</p>
+    {% endif %}
     <p><strong>谨慎信号：</strong>{{ scoring.get("caution_signals", []) | join("、") or "-" }}</p>
     <p><strong>高风险信号：</strong>{{ scoring.get("risk_signals", []) | join("、") or "-" }}</p>
     {% if job.skip_reason %}
