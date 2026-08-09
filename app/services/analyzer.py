@@ -81,10 +81,28 @@ CITIES = ["北京", "上海", "广州", "深圳", "杭州", "重庆", "成都", 
 UNKNOWN_VALUES = {"?", "？", "未知", "未填写", "未填", "无", "暂无", "N/A", "n/a", "None", "null"}
 SALARY_NUMBER = r"\d+(?:\.\d+)?"
 SALARY_RANGE = r"(?:-|~|～|至|到|—|–|－)"
+PLATFORM_SAFETY_NOTICE_MARKERS = (
+    "猎聘温馨提示",
+    "BOSS直聘温馨提示",
+    "BOSS直聘安全提示",
+    "实习僧温馨提示",
+    "智联招聘温馨提示",
+    "前程无忧温馨提示",
+    "本平台招聘方不向求职者提供任何收费服务",
+)
 
 
 def normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
+
+
+def strip_platform_safety_notice(text: str) -> str:
+    """Remove generic platform fraud warnings that are not part of the job JD."""
+    value = text or ""
+    matches = [value.find(marker) for marker in PLATFORM_SAFETY_NOTICE_MARKERS if value.find(marker) >= 0]
+    if not matches:
+        return value
+    return value[: min(matches)].rstrip()
 
 
 def find_skills(text: str) -> list[str]:

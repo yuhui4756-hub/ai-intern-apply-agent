@@ -18,6 +18,7 @@
     <div>
       <h2>岗位发现</h2>
       <p class="muted">每次搜索 3 个页面，最多读取并评分 6 个岗位详情。搜索条件来自候选人画像的目标岗位和城市。</p>
+      <p class="muted">本轮：{% for item in discovery_plan %}{{ item.platform }} {{ item.keyword }} · {{ item.city }}{% if not loop.last %}；{% endif %}{% endfor %}</p>
     </div>
     <span class="badge">受控 Edge</span>
   </div>

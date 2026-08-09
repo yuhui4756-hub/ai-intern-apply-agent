@@ -18,6 +18,7 @@
     <div>
       <h2>岗位发现</h2>
       <p class="muted">根据候选人画像中的目标岗位和城市，在受控 Edge 中轮换搜索并完成有限数量的 JD 评分。</p>
+      <p class="muted">本轮：{% for item in discovery_plan %}{{ item.platform }} {{ item.keyword }} · {{ item.city }}{% if not loop.last %}；{% endif %}{% endfor %}</p>
     </div>
     <span class="badge">受控 Edge</span>
   </div>

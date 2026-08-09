@@ -27,6 +27,7 @@ from .services.analyzer import (
     looks_like_salary_text,
     rule_extract_jd,
     score_job,
+    strip_platform_safety_notice,
 )
 from .services.browser_patrol import capture_browser_patrol_observations, open_message_patrol_browser
 from .services.application_browser import build_application_browser_plan, probe_application_browser_plan
@@ -101,6 +102,41 @@ JOB_DISCOVERY_PLATFORMS = ("Boss 直聘", "猎聘", "实习僧")
 JOB_DISCOVERY_SEARCH_PAGE_LIMIT = 3
 JOB_DISCOVERY_CANDIDATE_LIMIT = 18
 JOB_DISCOVERY_IMPORT_LIMIT = 6
+JOB_DISCOVERY_ROLE_SIGNALS = (
+    "ai",
+    "agent",
+    "智能体",
+    "大模型",
+    "llm",
+    "rag",
+    "aigc",
+    "人工智能",
+    "机器学习",
+    "深度学习",
+    "自然语言",
+    "nlp",
+    "模型",
+    "算法",
+)
+JOB_DISCOVERY_NON_ENGINEERING_SIGNALS = (
+    "法务",
+    "供应链",
+    "物流",
+    "采购",
+    "贸易",
+    "并购",
+    "m&a",
+    "财务",
+    "会计",
+    "人事",
+    "行政",
+    "销售",
+    "客服",
+    "市场",
+    "运营",
+    "产品经理",
+    "设计",
+)
 INTERVIEW_PREP_TRIGGER_STATUSES = {"待面试", "面试准备中"}
 INTERVIEW_FEEDBACK_STATUSES = ["待练习", "已补强", "已归档"]
 APPLICATION_PREPARATION_STATUSES = ["待确认", "已确认", "已跳过"]
@@ -793,26 +829,32 @@ def analyze_job_payload(
     generate_messages: bool = True,
 ) -> dict[str, Any]:
     _resume, resume_text = get_resume_text(resume_id)
+    analysis_text = strip_platform_safety_notice(jd_text)
     fallback_extract = rule_extract_jd(
-        jd_text,
+        analysis_text,
         fallback_title=title,
         fallback_company=company,
         fallback_city=city,
         fallback_salary=salary_text,
     )
-    llm_extract, analysis_error = try_llm_jd_extract(jd_text)
+    llm_extract, analysis_error = try_llm_jd_extract(analysis_text)
     extracted = clean_extracted({**fallback_extract, **(llm_extract or {})})
     extracted["required_skills"] = list(dict.fromkeys((llm_extract or {}).get("required_skills") or fallback_extract["required_skills"]))
-    extracted["risk_signals"] = list(dict.fromkeys((llm_extract or {}).get("risk_signals") or fallback_extract["risk_signals"]))
+    grounded_llm_risks = [
+        signal
+        for signal in clean_extracted(llm_extract or {}).get("risk_signals", [])
+        if signal in analysis_text
+    ]
+    extracted["risk_signals"] = list(dict.fromkeys(fallback_extract["risk_signals"] + grounded_llm_risks))
     extracted["caution_signals"] = list(dict.fromkeys((llm_extract or {}).get("caution_signals") or fallback_extract["caution_signals"]))
     if fallback_extract.get("salary_text"):
         extracted["salary_text"] = fallback_extract["salary_text"]
     elif extracted.get("salary_text") and not looks_like_salary_text(extracted["salary_text"]):
         extracted["salary_text"] = ""
-    apply_blacklists(extracted, jd_text)
+    apply_blacklists(extracted, analysis_text)
 
-    scoring = score_job(extracted, jd_text, resume_text)
-    messages = try_llm_message(extracted, scoring, generate_message(extracted, scoring)) if generate_messages and jd_text else {"message": "", "email": ""}
+    scoring = score_job(extracted, analysis_text, resume_text)
+    messages = try_llm_message(extracted, scoring, generate_message(extracted, scoring)) if generate_messages and analysis_text else {"message": "", "email": ""}
     final_depth = auto_search_depth(scoring, extracted) if search_depth == "auto" else search_depth
     source = "llm_plus_rules" if llm_extract else "local_rules"
     if not jd_text:
@@ -1245,20 +1287,51 @@ def controlled_job_discovery_plan(conn: Any, page_limit: int = JOB_DISCOVERY_SEA
         cities = ["北京", "上海", "广州", "深圳", "杭州", "重庆", "成都"]
 
     resume = conn.execute("SELECT id FROM resume_versions ORDER BY is_default DESC, id LIMIT 1").fetchone()
-    completed_count = int(
-        conn.execute("SELECT COUNT(*) AS count FROM job_search_runs WHERE status != '失败'").fetchone()["count"]
-    )
+    history = conn.execute(
+        """
+        SELECT decision_json
+        FROM agent_action_logs
+        WHERE action_type = ? AND status IN ('完成', '部分完成')
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        ("job_discovery",),
+    ).fetchone()
+    role_index = 0
+    city_index = 0
+    if history:
+        decision = loads(history["decision_json"], {})
+        previous_plan = decision.get("plan", []) if isinstance(decision, dict) else []
+        previous = previous_plan[0] if isinstance(previous_plan, list) and previous_plan else {}
+        previous_role = str(previous.get("keyword") or "") if isinstance(previous, dict) else ""
+        previous_city = str(previous.get("city") or "") if isinstance(previous, dict) else ""
+        if previous_role in roles:
+            role_index = (roles.index(previous_role) + 1) % len(roles)
+            if previous_city in cities:
+                city_index = cities.index(previous_city)
+            if role_index == 0:
+                city_index = (city_index + 1) % len(cities)
+    role = roles[role_index]
+    city = cities[city_index]
     plan = []
     for offset in range(max(1, min(int(page_limit), len(JOB_DISCOVERY_PLATFORMS)))):
-        index = completed_count + offset
         plan.append(
             {
-                "platform": JOB_DISCOVERY_PLATFORMS[index % len(JOB_DISCOVERY_PLATFORMS)],
-                "keyword": roles[(index // len(JOB_DISCOVERY_PLATFORMS)) % len(roles)],
-                "city": cities[(index // (len(JOB_DISCOVERY_PLATFORMS) * len(roles))) % len(cities)],
+                "platform": JOB_DISCOVERY_PLATFORMS[offset],
+                "keyword": role,
+                "city": city,
             }
         )
     return plan, int(resume["id"]) if resume else None
+
+
+def discovery_candidate_screening(candidate: dict[str, Any]) -> tuple[bool, str]:
+    text = " ".join([str(candidate.get("title") or ""), str(candidate.get("summary") or "")]).lower()
+    if any(signal.lower() in text for signal in JOB_DISCOVERY_NON_ENGINEERING_SIGNALS):
+        return False, "自动初筛识别为非研发方向，未读取 JD；可手动导入复核。"
+    if any(signal.lower() in text for signal in JOB_DISCOVERY_ROLE_SIGNALS):
+        return True, ""
+    return False, "自动初筛未识别到 AI/Agent/大模型方向，未读取 JD；可手动导入复核。"
 
 
 def import_discovery_candidate(candidate_id: int, resume_id: int | None) -> dict[str, Any]:
@@ -1344,6 +1417,8 @@ def run_controlled_job_discovery() -> dict[str, Any]:
     run_ids: list[int] = []
     candidate_ids: list[int] = []
     search_errors: list[str] = []
+    screened_out_count = 0
+    candidate_count = 0
     seen_urls: set[str] = set()
     for item in plan:
         try:
@@ -1364,16 +1439,27 @@ def run_controlled_job_discovery() -> dict[str, Any]:
         run_ids.append(run_id)
         with connect() as conn:
             rows = conn.execute(
-                "SELECT id, source_url FROM job_candidates WHERE search_run_id = ? ORDER BY id",
+                "SELECT id, title, summary, source_url FROM job_candidates WHERE search_run_id = ? ORDER BY id",
                 (run_id,),
-            ).fetchall()
+        ).fetchall()
         for row in rows:
+            candidate = {key: row[key] for key in row.keys()}
             source_url = str(row["source_url"] or "")
             comparable = comparable_source_url(source_url)
             key = min(comparable) if comparable else source_url
             if not key or key in seen_urls:
                 continue
             seen_urls.add(key)
+            candidate_count += 1
+            should_import, screening_note = discovery_candidate_screening(candidate)
+            if not should_import:
+                with connect() as conn:
+                    conn.execute(
+                        "UPDATE job_candidates SET status = ?, error_message = ?, updated_at = ? WHERE id = ?",
+                        ("初筛待确认", screening_note, utc_now(), int(row["id"])),
+                )
+                screened_out_count += 1
+                continue
             candidate_ids.append(int(row["id"]))
 
     import_results = [
@@ -1390,9 +1476,11 @@ def run_controlled_job_discovery() -> dict[str, Any]:
     else:
         status = "完成"
     note = (
-        f"完成 {len(run_ids)} 个受控搜索页，识别 {len(candidate_ids)} 个去重候选，"
+        f"完成 {len(run_ids)} 个受控搜索页，识别 {candidate_count} 个去重候选，"
         f"自动评分 {imported_count} 个岗位。"
     )
+    if screened_out_count:
+        note += f" {screened_out_count} 个非目标方向候选未读取 JD。"
     if pending_count:
         note += f" {pending_count} 个详情页待补充。"
     if failed_count:
@@ -1411,7 +1499,9 @@ def run_controlled_job_discovery() -> dict[str, Any]:
                 "detail_import_limit": JOB_DISCOVERY_IMPORT_LIMIT,
                 "plan": plan,
                 "run_ids": run_ids,
-                "candidate_count": len(candidate_ids),
+                "candidate_count": candidate_count,
+                "auto_import_candidate_count": len(candidate_ids),
+                "screened_out_count": screened_out_count,
                 "imported_count": imported_count,
                 "pending_detail_count": pending_count,
                 "failed_import_count": failed_count,
@@ -1426,7 +1516,9 @@ def run_controlled_job_discovery() -> dict[str, Any]:
         "status": status,
         "note": note,
         "run_ids": run_ids,
-        "candidate_count": len(candidate_ids),
+        "candidate_count": candidate_count,
+        "auto_import_candidate_count": len(candidate_ids),
+        "screened_out_count": screened_out_count,
         "imported_count": imported_count,
         "pending_detail_count": pending_count,
         "failed_import_count": failed_count,
@@ -3744,6 +3836,7 @@ def dashboard(request: Request) -> Any:
             WHERE status = '待确认' AND communication_mode = 'autonomous' AND draft_type = '自主询问候选'
             """
         ).fetchone()["count"]
+        discovery_plan, _resume_id = controlled_job_discovery_plan(conn)
     communication = communication_policy()
     control = automation_control()
     patrol = message_patrol_policy()
@@ -3763,6 +3856,7 @@ def dashboard(request: Request) -> Any:
             "message_patrol_policy": patrol,
             "workflow_active": workflow_active,
             "autonomous_candidates": autonomous_candidates,
+            "discovery_plan": discovery_plan,
             "notice": request.query_params.get("notice", ""),
             "notice_type": request.query_params.get("notice_type", "info"),
         },
@@ -4527,12 +4621,14 @@ def searches_page(request: Request) -> Any:
             LIMIT 30
             """
         ).fetchall()
+        discovery_plan, _resume_id = controlled_job_discovery_plan(conn)
     return templates.TemplateResponse(
         request,
         "searches.html",
         {
             "runs": [{key: row[key] for key in row.keys()} for row in runs],
             "search_form": search_form,
+            "discovery_plan": discovery_plan,
             "notice": request.query_params.get("notice", ""),
             "notice_type": request.query_params.get("notice_type", "info"),
             "browser_channel_label": browser_channel_label,

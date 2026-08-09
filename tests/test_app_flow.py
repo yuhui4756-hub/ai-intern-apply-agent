@@ -3401,6 +3401,46 @@ def test_analysis_prefers_rule_salary_over_bad_llm_salary(tmp_path, monkeypatch)
     assert result["messages"] == {"message": "", "email": ""}
 
 
+def test_analysis_ignores_platform_safety_notice_and_ungrounded_llm_risks(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "platform-safety-notice.sqlite3"))
+
+    from app import main
+    from app.db import init_db
+
+    llm_inputs = []
+
+    def fake_extract(text):
+        llm_inputs.append(text)
+        return (
+            {
+                "title": "AI Agent 应用开发工程师",
+                "company": "彩讯科技股份有限公司",
+                "risk_signals": ["培训费", "押金"],
+                "required_skills": ["Python", "RAG"],
+            },
+            "",
+        )
+
+    init_db()
+    monkeypatch.setattr(main, "try_llm_jd_extract", fake_extract)
+    result = main.analyze_job_payload(
+        """
+公司名称：彩讯科技股份有限公司
+AI Agent 应用开发工程师
+要求 Python、RAG、LangGraph，有完整 AI 项目经历。
+猎聘温馨提示：如发现招聘方要求缴纳培训费、押金等，请立即举报。
+本平台招聘方不向求职者提供任何收费服务。
+""",
+        None,
+        generate_messages=False,
+    )
+
+    assert "猎聘温馨提示" not in llm_inputs[0]
+    assert result["extracted"]["risk_signals"] == []
+    assert result["scoring"]["risk_level"] != "高"
+    assert "高风险信号" not in result["scoring"]["skip_reason"]
+
+
 def test_search_run_and_candidate_import_flow(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "search.sqlite3"))
 
@@ -3541,6 +3581,7 @@ def test_controlled_job_discovery_is_bounded_and_never_creates_outbound_actions(
     from app.db import connect, init_db
 
     calls = []
+    fetch_calls = []
 
     def fake_search(platform, keyword, city, limit):
         calls.append((platform, keyword, city, limit))
@@ -3553,17 +3594,22 @@ def test_controlled_job_discovery_is_bounded_and_never_creates_outbound_actions(
             browser_channel="msedge",
             candidates=[
                 SearchCandidate(
-                    title=f"AI 应用开发实习生 {search_index}-{candidate_index}",
+                    title=(
+                        f"AI 应用开发实习生 {search_index}-{candidate_index}"
+                        if candidate_index < 3
+                        else "供应链物流实习生"
+                    ),
                     company=f"测试智能科技 {search_index}-{candidate_index}",
                     city=city,
                     source_url=f"https://jobs.example.com/detail/{search_index}-{candidate_index}",
-                    summary="Python FastAPI RAG，每周 5 天，3 个月。",
+                    summary=("Python FastAPI RAG，每周 5 天，3 个月。" if candidate_index < 3 else "采购与物流协同。"),
                 )
                 for candidate_index in range(1, 4)
             ],
         )
 
     def fake_fetch(url):
+        fetch_calls.append(url)
         suffix = url.rsplit("/", 1)[-1]
         return FetchResult(
             url=url,
@@ -3590,7 +3636,9 @@ def test_controlled_job_discovery_is_bounded_and_never_creates_outbound_actions(
     assert [call[0] for call in calls] == ["Boss 直聘", "猎聘", "实习僧"]
     assert all(call[3] == main.JOB_DISCOVERY_CANDIDATE_LIMIT for call in calls)
     assert result["candidate_count"] == 9
+    assert result["screened_out_count"] == 3
     assert result["imported_count"] == main.JOB_DISCOVERY_IMPORT_LIMIT
+    assert all(not url.endswith("-3") for url in fetch_calls)
 
     with connect() as conn:
         jobs = conn.execute(
@@ -3598,6 +3646,9 @@ def test_controlled_job_discovery_is_bounded_and_never_creates_outbound_actions(
         ).fetchall()
         imported_candidates = conn.execute(
             "SELECT COUNT(*) AS count FROM job_candidates WHERE status = '已导入'"
+        ).fetchone()["count"]
+        screened_candidates = conn.execute(
+            "SELECT COUNT(*) AS count FROM job_candidates WHERE status = '初筛待确认'"
         ).fetchone()["count"]
         draft_count = conn.execute("SELECT COUNT(*) AS count FROM message_drafts").fetchone()["count"]
         preparation_count = conn.execute("SELECT COUNT(*) AS count FROM application_preparations").fetchone()["count"]
@@ -3608,6 +3659,7 @@ def test_controlled_job_discovery_is_bounded_and_never_creates_outbound_actions(
 
     assert len(jobs) == main.JOB_DISCOVERY_IMPORT_LIMIT
     assert imported_candidates == main.JOB_DISCOVERY_IMPORT_LIMIT
+    assert screened_candidates == 3
     assert all(job["generated_message"] == "" and job["generated_email"] == "" for job in jobs)
     assert all(job["match_score"] > 0 for job in jobs)
     assert draft_count == 0
@@ -3673,6 +3725,63 @@ def test_controlled_job_discovery_marks_detail_fetch_failure_for_manual_followup
     assert "需要登录" in candidate["error_message"]
     assert candidate["job_id"] is None
     assert job_count == 0
+
+
+def test_controlled_discovery_plan_ignores_generic_search_history(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "controlled-discovery-plan.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db
+
+    init_db()
+    main.save_search_result(
+        SearchResult(
+            platform="Boss 直聘",
+            keyword="旧关键词",
+            city="深圳",
+            search_url="https://jobs.example.com/old-search",
+            browser_channel="extension",
+            candidates=[],
+        )
+    )
+    with connect() as conn:
+        plan, _resume_id = main.controlled_job_discovery_plan(conn)
+
+    assert [item["platform"] for item in plan] == ["Boss 直聘", "猎聘", "实习僧"]
+    assert {item["keyword"] for item in plan} == {"AI 应用开发实习"}
+    assert {item["city"] for item in plan} == {"北京"}
+
+    client = TestClient(main.app)
+    page = client.get("/searches")
+    assert page.status_code == 200
+    assert "本轮：" in page.text
+    assert "AI 应用开发实习" in page.text
+
+    with connect() as conn:
+        main.log_agent_action(
+            conn,
+            action_type="job_discovery",
+            status="完成",
+            summary="历史岗位发现。",
+            decision={
+                "plan": [
+                    {"platform": "Boss 直聘", "keyword": "Agent 开发实习", "city": "北京"}
+                ]
+            },
+        )
+        next_plan, _resume_id = main.controlled_job_discovery_plan(conn)
+
+    assert {item["keyword"] for item in next_plan} == {"AI 后端实习"}
+    assert {item["city"] for item in next_plan} == {"北京"}
+
+
+def test_discovery_candidate_screening_accepts_ascii_signals_and_blocks_non_engineering_roles():
+    from app import main
+
+    assert main.discovery_candidate_screening({"title": "LLM backend intern", "summary": "Python service"})[0] is True
+    accepted, reason = main.discovery_candidate_screening({"title": "AI 产品运营实习生", "summary": "内容运营"})
+    assert accepted is False
+    assert "非研发方向" in reason
 
 
 def test_manual_edge_search_launch_uses_debug_profile(tmp_path, monkeypatch):
