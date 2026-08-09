@@ -141,6 +141,8 @@ JOB_DISCOVERY_NON_ENGINEERING_SIGNALS = (
 )
 INTERVIEW_PREP_TRIGGER_STATUSES = {"待面试", "面试准备中"}
 INTERVIEW_FEEDBACK_STATUSES = ["待练习", "已补强", "已归档"]
+CANDIDATE_FEEDBACK_STATUSES = ["", "正确", "误判", "待观察"]
+CANDIDATE_EXPECTED_SCREENINGS = ["", "自动读取 JD", "人工复核", "跳过"]
 APPLICATION_PREPARATION_STATUSES = ["待确认", "已确认", "已跳过"]
 APPLICATION_ELIGIBLE_RECOMMENDATIONS = {"必投", "可投递"}
 APPLICATION_LOW_RISK_LEVELS = {"低", "低风险"}
@@ -196,6 +198,7 @@ def action_type_label(value: str) -> str:
         "communication_autonomous_executor": "自主沟通执行",
         "workflow_control": "求职流程控制",
         "job_discovery": "岗位发现",
+        "job_candidate_feedback": "候选校准",
         "demo_draft_created": "演练草稿",
         "interview_prep_auto_create": "面试准备",
         "interview_feedback_update": "面试反馈",
@@ -4950,6 +4953,15 @@ def search_detail(run_id: int, request: Request) -> Any:
             "SELECT * FROM job_candidates WHERE search_run_id = ? ORDER BY id",
             (run_id,),
         ).fetchall()
+        feedback_rows = conn.execute(
+            """
+            SELECT feedback_status, COUNT(*) AS count
+            FROM job_candidates
+            WHERE search_run_id = ? AND feedback_status != ''
+            GROUP BY feedback_status
+            """,
+            (run_id,),
+        ).fetchall()
         resumes = conn.execute("SELECT * FROM resume_versions ORDER BY is_default DESC, id").fetchall()
     if not run:
         return redirect("/searches")
@@ -4960,11 +4972,56 @@ def search_detail(run_id: int, request: Request) -> Any:
             "run": {key: run[key] for key in run.keys()},
             "candidates": [{key: row[key] for key in row.keys()} for row in candidates],
             "resumes": [{key: row[key] for key in row.keys()} for row in resumes],
+            "candidate_feedback_statuses": CANDIDATE_FEEDBACK_STATUSES,
+            "candidate_expected_screenings": CANDIDATE_EXPECTED_SCREENINGS,
+            "candidate_feedback_counts": {row["feedback_status"]: row["count"] for row in feedback_rows},
             "browser_channel_label": browser_channel_label,
             "notice": request.query_params.get("notice", ""),
             "notice_type": request.query_params.get("notice_type", "info"),
         },
     )
+
+
+@app.post("/candidates/{candidate_id}/feedback")
+async def update_candidate_feedback(candidate_id: int, request: Request) -> RedirectResponse:
+    form = await request.form()
+    feedback_status = str(form.get("feedback_status") or "").strip()
+    expected_screening = str(form.get("expected_screening") or "").strip()
+    feedback_note = str(form.get("feedback_note") or "").strip()[:1000]
+    if feedback_status not in CANDIDATE_FEEDBACK_STATUSES:
+        return redirect_with_notice("/searches", "候选反馈状态无效。", "error")
+    if expected_screening not in CANDIDATE_EXPECTED_SCREENINGS:
+        return redirect_with_notice("/searches", "期望分流无效。", "error")
+
+    now = utc_now()
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM job_candidates WHERE id = ?", (candidate_id,)).fetchone()
+        if not row:
+            return redirect_with_notice("/searches", "没有找到该候选岗位。", "error")
+        run_id = int(row["search_run_id"])
+        conn.execute(
+            """
+            UPDATE job_candidates
+            SET feedback_status = ?, expected_screening = ?, feedback_note = ?, feedback_updated_at = ?
+            WHERE id = ?
+            """,
+            (feedback_status, expected_screening, feedback_note, now, candidate_id),
+        )
+        log_agent_action(
+            conn,
+            action_type="job_candidate_feedback",
+            status=feedback_status or "已清除",
+            summary=f"候选校准：{row['title'] or '候选岗位'}",
+            platform=str(row["platform"] or ""),
+            job_id=int(row["job_id"]) if row["job_id"] else None,
+            decision={
+                "candidate_id": candidate_id,
+                "candidate_status": row["status"],
+                "expected_screening": expected_screening,
+                "feedback_note_length": len(feedback_note),
+            },
+        )
+    return redirect_with_notice(f"/searches/{run_id}", "候选校准反馈已保存。", "success")
 
 
 @app.post("/candidates/{candidate_id}/import")

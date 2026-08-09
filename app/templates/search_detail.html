@@ -17,6 +17,10 @@
 <section class="notice">{{ run.note }}</section>
 {% endif %}
 
+{% if candidate_feedback_counts %}
+<section class="notice">候选校准：正确 {{ candidate_feedback_counts.get("正确", 0) }} · 误判 {{ candidate_feedback_counts.get("误判", 0) }} · 待观察 {{ candidate_feedback_counts.get("待观察", 0) }}</section>
+{% endif %}
+
 <section class="panel">
   <div class="panel-title">
     <h2>候选岗位</h2>
@@ -71,6 +75,19 @@
               <button class="button compact primary" type="submit">导入分析</button>
             </form>
             {% endif %}
+            <details class="debug-details">
+              <summary>校准候选</summary>
+              <form method="post" action="/candidates/{{ candidate.id }}/feedback" class="form-stack compact-form">
+                <label>反馈
+                  <select name="feedback_status">{% for status in candidate_feedback_statuses %}<option value="{{ status }}" {% if candidate.feedback_status == status %}selected{% endif %}>{{ status or "未标记" }}</option>{% endfor %}</select>
+                </label>
+                <label>期望分流
+                  <select name="expected_screening">{% for screening in candidate_expected_screenings %}<option value="{{ screening }}" {% if candidate.expected_screening == screening %}selected{% endif %}>{{ screening or "不指定" }}</option>{% endfor %}</select>
+                </label>
+                <label>备注<textarea name="feedback_note" rows="3">{{ candidate.feedback_note }}</textarea></label>
+                <button class="button compact" type="submit">保存反馈</button>
+              </form>
+            </details>
           </td>
         </tr>
         {% endfor %}

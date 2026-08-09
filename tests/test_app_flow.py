@@ -3727,6 +3727,70 @@ def test_controlled_job_discovery_marks_detail_fetch_failure_for_manual_followup
     assert job_count == 0
 
 
+def test_search_candidate_feedback_persists_calibration_and_audit_log(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "candidate-feedback.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db, loads
+
+    init_db()
+    run_id = main.save_search_result(
+        SearchResult(
+            platform="猎聘",
+            keyword="Agent 开发实习",
+            city="北京",
+            search_url="https://jobs.example.com/search",
+            browser_channel="msedge",
+            candidates=[
+                SearchCandidate(
+                    title="其他法务职位招聘",
+                    company="",
+                    city="北京",
+                    source_url="https://jobs.example.com/career/legal",
+                    summary="Agent 开发实习搜索页中的导航链接。",
+                )
+            ],
+        )
+    )
+    with connect() as conn:
+        candidate_id = conn.execute(
+            "SELECT id FROM job_candidates WHERE search_run_id = ?", (run_id,)
+        ).fetchone()["id"]
+
+    client = TestClient(main.app)
+    response = client.post(
+        f"/candidates/{candidate_id}/feedback",
+        data={
+            "feedback_status": "误判",
+            "expected_screening": "跳过",
+            "feedback_note": "猎聘职位专场导航不是具体岗位。",
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"].startswith(f"/searches/{run_id}?notice=")
+    with connect() as conn:
+        candidate = conn.execute(
+            "SELECT feedback_status, expected_screening, feedback_note FROM job_candidates WHERE id = ?",
+            (candidate_id,),
+        ).fetchone()
+        action = conn.execute(
+            "SELECT action_type, status, decision_json FROM agent_action_logs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert candidate["feedback_status"] == "误判"
+    assert candidate["expected_screening"] == "跳过"
+    assert "职位专场导航" in candidate["feedback_note"]
+    assert action["action_type"] == "job_candidate_feedback"
+    assert action["status"] == "误判"
+    assert loads(action["decision_json"], {})["expected_screening"] == "跳过"
+
+    detail = client.get(f"/searches/{run_id}")
+    assert detail.status_code == 200
+    assert "候选校准" in detail.text
+    assert "误判 1" in detail.text
+
+
 def test_controlled_discovery_plan_ignores_generic_search_history(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "controlled-discovery-plan.sqlite3"))
 

@@ -168,6 +168,10 @@ def init_db() -> None:
                 summary TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT '候选',
                 error_message TEXT NOT NULL DEFAULT '',
+                feedback_status TEXT NOT NULL DEFAULT '',
+                expected_screening TEXT NOT NULL DEFAULT '',
+                feedback_note TEXT NOT NULL DEFAULT '',
+                feedback_updated_at TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY(search_run_id) REFERENCES job_search_runs(id) ON DELETE CASCADE,
@@ -375,6 +379,17 @@ def ensure_columns(conn: sqlite3.Connection) -> None:
     job_columns = table_column_names(conn, "job_postings")
     if "analysis_source" not in job_columns:
         conn.execute("ALTER TABLE job_postings ADD COLUMN analysis_source TEXT NOT NULL DEFAULT 'local_rules'")
+
+    candidate_columns = table_column_names(conn, "job_candidates")
+    candidate_defaults = {
+        "feedback_status": "TEXT NOT NULL DEFAULT ''",
+        "expected_screening": "TEXT NOT NULL DEFAULT ''",
+        "feedback_note": "TEXT NOT NULL DEFAULT ''",
+        "feedback_updated_at": "TEXT NOT NULL DEFAULT ''",
+    }
+    for column, definition in candidate_defaults.items():
+        if column not in candidate_columns:
+            conn.execute(f"ALTER TABLE job_candidates ADD COLUMN {column} {definition}")
 
     conversation_columns = table_column_names(conn, "conversation_captures")
     conversation_defaults = {
