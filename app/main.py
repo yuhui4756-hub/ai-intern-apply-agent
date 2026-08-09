@@ -53,7 +53,9 @@ from .services.job_searcher import (
     SearchResult,
     capture_current_search_page,
     extract_candidates_from_anchors,
+    fetch_job_from_controlled_edge,
     open_manual_search_in_edge,
+    search_jobs_in_controlled_edge,
     search_jobs_with_browser,
 )
 from .services.llm import OpenAICompatibleClient, client_for_task
@@ -95,6 +97,10 @@ COMMUNICATION_EXECUTOR_PLAN_LIMIT = 20
 AUTONOMOUS_DAILY_SEND_LIMIT = 5
 AUTONOMOUS_PLATFORM_DAILY_SEND_LIMIT = 3
 AUTONOMOUS_MESSAGE_BLOCKING_TEXT = ("简历", "附件", "电话", "微信", "邮箱", "身份证", "银行卡", "押金", "培训费", "贷款", "报价")
+JOB_DISCOVERY_PLATFORMS = ("Boss 直聘", "猎聘", "实习僧")
+JOB_DISCOVERY_SEARCH_PAGE_LIMIT = 3
+JOB_DISCOVERY_CANDIDATE_LIMIT = 18
+JOB_DISCOVERY_IMPORT_LIMIT = 6
 INTERVIEW_PREP_TRIGGER_STATUSES = {"待面试", "面试准备中"}
 INTERVIEW_FEEDBACK_STATUSES = ["待练习", "已补强", "已归档"]
 APPLICATION_PREPARATION_STATUSES = ["待确认", "已确认", "已跳过"]
@@ -151,6 +157,7 @@ def action_type_label(value: str) -> str:
         "communication_autonomous_send": "自主沟通发送",
         "communication_autonomous_executor": "自主沟通执行",
         "workflow_control": "求职流程控制",
+        "job_discovery": "岗位发现",
         "demo_draft_created": "演练草稿",
         "interview_prep_auto_create": "面试准备",
         "interview_feedback_update": "面试反馈",
@@ -885,6 +892,7 @@ def fetch_mode_label(value: str) -> str:
         "auto": "自动",
         "http": "普通网页",
         "browser": "浏览器渲染",
+        "controlled_edge": "受控 Edge",
     }.get(value or "", value or "自动")
 
 
@@ -1223,6 +1231,208 @@ def save_search_failure(platform: str, keyword: str, city: str, browser_channel:
             ),
         )
     return int(cursor.lastrowid)
+
+
+def controlled_job_discovery_plan(conn: Any, page_limit: int = JOB_DISCOVERY_SEARCH_PAGE_LIMIT) -> tuple[list[dict[str, str]], int | None]:
+    profile = conn.execute("SELECT * FROM candidate_profile ORDER BY id LIMIT 1").fetchone()
+    profile_data = {key: profile[key] for key in profile.keys()} if profile else {}
+    roles = [str(item).strip() for item in loads(profile_data.get("target_roles"), []) if str(item).strip()]
+    preferences = loads(profile_data.get("preferences_json"), {})
+    cities = [str(item).strip() for item in preferences.get("cities", []) if str(item).strip()] if isinstance(preferences, dict) else []
+    if not roles:
+        roles = ["AI 应用开发实习", "Agent 开发实习", "AI 后端实习"]
+    if not cities:
+        cities = ["北京", "上海", "广州", "深圳", "杭州", "重庆", "成都"]
+
+    resume = conn.execute("SELECT id FROM resume_versions ORDER BY is_default DESC, id LIMIT 1").fetchone()
+    completed_count = int(
+        conn.execute("SELECT COUNT(*) AS count FROM job_search_runs WHERE status != '失败'").fetchone()["count"]
+    )
+    plan = []
+    for offset in range(max(1, min(int(page_limit), len(JOB_DISCOVERY_PLATFORMS)))):
+        index = completed_count + offset
+        plan.append(
+            {
+                "platform": JOB_DISCOVERY_PLATFORMS[index % len(JOB_DISCOVERY_PLATFORMS)],
+                "keyword": roles[(index // len(JOB_DISCOVERY_PLATFORMS)) % len(roles)],
+                "city": cities[(index // (len(JOB_DISCOVERY_PLATFORMS) * len(roles))) % len(cities)],
+            }
+        )
+    return plan, int(resume["id"]) if resume else None
+
+
+def import_discovery_candidate(candidate_id: int, resume_id: int | None) -> dict[str, Any]:
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM job_candidates WHERE id = ?", (candidate_id,)).fetchone()
+    if not row:
+        return {"candidate_id": candidate_id, "status": "缺失", "note": "候选岗位已不存在。"}
+
+    candidate = {key: row[key] for key in row.keys()}
+    if candidate.get("job_id"):
+        return {"candidate_id": candidate_id, "status": "已存在", "job_id": int(candidate["job_id"]), "note": "候选岗位已有关联分析。"}
+
+    try:
+        fetched = fetch_job_from_controlled_edge(str(candidate.get("source_url") or ""))
+    except Exception as exc:
+        note = str(exc)[:500]
+        with connect() as conn:
+            conn.execute(
+                "UPDATE job_candidates SET status = ?, error_message = ?, updated_at = ? WHERE id = ?",
+                ("详情待补充", note, utc_now(), candidate_id),
+            )
+        return {"candidate_id": candidate_id, "status": "详情待补充", "note": note}
+
+    try:
+        with connect() as conn:
+            existing_job = find_existing_job_by_source_url(conn, fetched.final_url)
+            if existing_job:
+                job_id = int(existing_job["id"])
+                refresh_job_record(
+                    conn,
+                    job_id,
+                    jd_text=fetched.text,
+                    resume_id=resume_id,
+                    platform=str(candidate.get("platform") or infer_platform_from_url(fetched.final_url)),
+                    source_url=fetched.final_url,
+                    title=fetched.title or str(candidate.get("title") or ""),
+                    company=str(candidate.get("company") or ""),
+                    city=str(candidate.get("city") or ""),
+                    search_depth="auto",
+                    generate_messages=False,
+                )
+                event_type = "岗位发现刷新"
+            else:
+                job_id, _analysis = create_job_record(
+                    conn,
+                    jd_text=fetched.text,
+                    resume_id=resume_id,
+                    platform=str(candidate.get("platform") or infer_platform_from_url(fetched.final_url)),
+                    source_url=fetched.final_url,
+                    title=fetched.title or str(candidate.get("title") or ""),
+                    company=str(candidate.get("company") or ""),
+                    city=str(candidate.get("city") or ""),
+                    search_depth="auto",
+                    generate_messages=False,
+                )
+                event_type = "岗位发现导入"
+            linked_count = link_candidates_to_job(conn, fetched.final_url, job_id)
+            conn.execute(
+                "INSERT INTO application_events (job_id, event_type, content, created_at) VALUES (?, ?, ?, ?)",
+                (job_id, event_type, f"通过受控 Edge 读取岗位详情并完成评分，关联 {linked_count} 条搜索候选。", utc_now()),
+            )
+        return {
+            "candidate_id": candidate_id,
+            "status": "已导入",
+            "job_id": job_id,
+            "fetch_mode": fetched.fetch_mode,
+            "note": "岗位详情已读取并完成评分。",
+        }
+    except Exception as exc:
+        note = str(exc)[:500]
+        with connect() as conn:
+            conn.execute(
+                "UPDATE job_candidates SET status = ?, error_message = ?, updated_at = ? WHERE id = ?",
+                ("导入失败", note, utc_now(), candidate_id),
+            )
+        return {"candidate_id": candidate_id, "status": "导入失败", "note": note}
+
+
+def run_controlled_job_discovery() -> dict[str, Any]:
+    with connect() as conn:
+        plan, resume_id = controlled_job_discovery_plan(conn)
+
+    run_ids: list[int] = []
+    candidate_ids: list[int] = []
+    search_errors: list[str] = []
+    seen_urls: set[str] = set()
+    for item in plan:
+        try:
+            result = search_jobs_in_controlled_edge(
+                item["platform"],
+                item["keyword"],
+                item["city"],
+                limit=JOB_DISCOVERY_CANDIDATE_LIMIT,
+            )
+            run_id = save_search_result(result)
+        except Exception as exc:
+            note = str(exc)[:500]
+            run_id = save_search_failure(item["platform"], item["keyword"], item["city"], "msedge", note)
+            search_errors.append(note)
+            run_ids.append(run_id)
+            continue
+
+        run_ids.append(run_id)
+        with connect() as conn:
+            rows = conn.execute(
+                "SELECT id, source_url FROM job_candidates WHERE search_run_id = ? ORDER BY id",
+                (run_id,),
+            ).fetchall()
+        for row in rows:
+            source_url = str(row["source_url"] or "")
+            comparable = comparable_source_url(source_url)
+            key = min(comparable) if comparable else source_url
+            if not key or key in seen_urls:
+                continue
+            seen_urls.add(key)
+            candidate_ids.append(int(row["id"]))
+
+    import_results = [
+        import_discovery_candidate(candidate_id, resume_id)
+        for candidate_id in candidate_ids[:JOB_DISCOVERY_IMPORT_LIMIT]
+    ]
+    imported_count = sum(1 for item in import_results if item["status"] == "已导入")
+    pending_count = sum(1 for item in import_results if item["status"] == "详情待补充")
+    failed_count = sum(1 for item in import_results if item["status"] == "导入失败")
+    if search_errors and len(search_errors) == len(plan):
+        status = "失败"
+    elif search_errors or failed_count:
+        status = "部分完成"
+    else:
+        status = "完成"
+    note = (
+        f"完成 {len(run_ids)} 个受控搜索页，识别 {len(candidate_ids)} 个去重候选，"
+        f"自动评分 {imported_count} 个岗位。"
+    )
+    if pending_count:
+        note += f" {pending_count} 个详情页待补充。"
+    if failed_count:
+        note += f" {failed_count} 个导入失败。"
+    if search_errors:
+        note += f" {len(search_errors)} 个搜索页失败。"
+
+    with connect() as conn:
+        log_agent_action(
+            conn,
+            action_type="job_discovery",
+            status=status,
+            summary=note,
+            decision={
+                "search_page_limit": JOB_DISCOVERY_SEARCH_PAGE_LIMIT,
+                "detail_import_limit": JOB_DISCOVERY_IMPORT_LIMIT,
+                "plan": plan,
+                "run_ids": run_ids,
+                "candidate_count": len(candidate_ids),
+                "imported_count": imported_count,
+                "pending_detail_count": pending_count,
+                "failed_import_count": failed_count,
+                "failed_search_count": len(search_errors),
+                "auto_apply": False,
+                "auto_message": False,
+                "message_text_saved": False,
+            },
+            error_message="；".join(search_errors)[:500],
+        )
+    return {
+        "status": status,
+        "note": note,
+        "run_ids": run_ids,
+        "candidate_count": len(candidate_ids),
+        "imported_count": imported_count,
+        "pending_detail_count": pending_count,
+        "failed_import_count": failed_count,
+        "failed_search_count": len(search_errors),
+        "import_results": import_results,
+    }
 
 
 def api_error(message: str, status_code: int = 400) -> JSONResponse:
@@ -4349,6 +4559,20 @@ async def create_search_run(request: Request) -> RedirectResponse:
 
     run_id = save_search_result(result)
     return redirect_with_notice(f"/searches/{run_id}", f"已采集 {len(result.candidates)} 个候选岗位。", "success")
+
+
+@app.post("/job-discovery/start")
+async def start_controlled_job_discovery(request: Request) -> RedirectResponse:
+    form = await request.form()
+    return_to = str(form.get("return_to") or "/searches")
+    if not return_to.startswith("/") or return_to.startswith("//"):
+        return_to = "/searches"
+    try:
+        result = await run_in_threadpool(run_controlled_job_discovery)
+    except Exception as exc:
+        return redirect_with_notice(return_to, f"岗位发现失败：{str(exc)[:180]}", "error")
+    notice_type = "success" if result["status"] == "完成" else "warning" if result["status"] == "部分完成" else "error"
+    return redirect_with_notice(return_to, f"岗位发现：{result['note']}", notice_type)
 
 
 @app.post("/searches/open-manual")

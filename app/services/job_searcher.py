@@ -12,7 +12,14 @@ from urllib.parse import quote_plus, urljoin, urlparse
 
 from ..config import data_dir
 from .analyzer import extract_salary
-from .job_fetcher import ensure_public_http_url, normalize_browser_channel, normalize_text, normalize_visible_text
+from .job_fetcher import (
+    FetchResult,
+    ensure_public_http_url,
+    normalize_browser_channel,
+    normalize_text,
+    normalize_visible_text,
+    validate_fetched_text,
+)
 
 
 JOB_KEYWORDS = ["AI", "Agent", "大模型", "RAG", "Python", "开发", "后端", "实习", "算法", "LLM"]
@@ -166,6 +173,7 @@ def capture_current_search_page(
     city: str = "",
     browser_channel: str = "msedge",
     limit: int = 30,
+    expected_url: str = "",
 ) -> SearchResult:
     channel = normalize_browser_channel(browser_channel)
     if channel != "msedge":
@@ -184,11 +192,12 @@ def capture_current_search_page(
             pages = [page for context in browser.contexts for page in context.pages if page.url and page.url != "about:blank"]
             if not pages:
                 raise ValueError("没有找到可采集的 Edge 页面，请先从应用打开搜索页。")
-            page = pick_search_page(pages, platform)
+            page = pick_search_page(pages, platform, expected_url=expected_url)
             try:
                 page.wait_for_load_state("domcontentloaded", timeout=3000)
             except Exception:
                 pass
+            page.wait_for_timeout(1500)
             final_url = ensure_public_http_url(page.url)
             anchors = extract_anchor_dicts_from_page(page)
             browser.close()
@@ -205,6 +214,82 @@ def capture_current_search_page(
     candidates = extract_candidates_from_anchors(anchors, platform, city, final_url, limit=limit)
     note = "" if candidates else "没有从当前页面识别到岗位候选，可尝试打开搜索结果页或岗位列表页后再采集。"
     return SearchResult(platform=platform, keyword=keyword, city=city, search_url=final_url, browser_channel=channel, candidates=candidates, note=note)
+
+
+def search_jobs_in_controlled_edge(
+    platform: str,
+    keyword: str,
+    city: str = "",
+    limit: int = 30,
+) -> SearchResult:
+    """Open a search in the shared controlled Edge profile and capture its current results."""
+    search_url = open_manual_search_in_edge(platform, keyword, city)
+    return capture_current_search_page(
+        platform,
+        keyword,
+        city,
+        browser_channel="msedge",
+        limit=limit,
+        expected_url=search_url,
+    )
+
+
+def fetch_job_from_controlled_edge(url: str) -> FetchResult:
+    """Read one job-detail page through the controlled Edge login session without submitting anything."""
+    safe_url = ensure_public_http_url(url)
+    try:
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise ValueError("受控 Edge 抓取需要安装 Playwright：pip install playwright。") from exc
+
+    browser = None
+    page = None
+    try:
+        with sync_playwright() as playwright:
+            if not wait_for_debug_endpoint(timeout_seconds=3):
+                raise ValueError("没有检测到受控 Edge，请先启动岗位发现或自主沟通。")
+            browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{EDGE_DEBUG_PORT}", timeout=8000)
+            if not browser.contexts:
+                raise ValueError("受控 Edge 没有可用浏览器上下文。")
+            page = browser.contexts[0].new_page()
+            page.goto(safe_url, wait_until="domcontentloaded", timeout=30000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=6000)
+            except PlaywrightTimeoutError:
+                pass
+            page.wait_for_timeout(1000)
+            final_url = ensure_public_http_url(page.url)
+            title = normalize_text(page.title())[:120]
+            text = page.locator("body").inner_text(timeout=8000)
+            page.close()
+            page = None
+            browser.close()
+            browser = None
+    except ValueError:
+        raise
+    except Exception as exc:
+        message = str(exc).strip() or exc.__class__.__name__
+        raise ValueError(f"无法通过受控 Edge 抓取岗位详情：{message[:180]}。") from exc
+    finally:
+        if page is not None:
+            try:
+                page.close()
+            except Exception:
+                pass
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                pass
+
+    return FetchResult(
+        url=safe_url,
+        final_url=final_url,
+        title=title,
+        text=validate_fetched_text(text),
+        fetch_mode="controlled_edge",
+    )
 
 
 def browser_profile_dir(name: str) -> Path:
@@ -243,7 +328,17 @@ def open_url_in_debug_browser(url: str) -> None:
         pass
 
 
-def pick_search_page(pages: list, platform: str):
+def pick_search_page(pages: list, platform: str, expected_url: str = ""):
+    expected = urlparse(expected_url)
+    expected_host = (expected.hostname or "").lower()
+    expected_path = (expected.path or "").rstrip("/")
+    if expected_host:
+        for page in reversed(pages):
+            parsed = urlparse(page.url or "")
+            host = (parsed.hostname or "").lower()
+            path = (parsed.path or "").rstrip("/")
+            if host == expected_host and path == expected_path:
+                return page
     signals = platform_url_signals(platform)
     for page in reversed(pages):
         lowered = (page.url or "").lower()

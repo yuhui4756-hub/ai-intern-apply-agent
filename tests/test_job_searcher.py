@@ -1,4 +1,4 @@
-from app.services.job_searcher import build_search_url, extract_candidates_from_anchors
+from app.services.job_searcher import build_search_url, extract_candidates_from_anchors, pick_search_page
 
 
 def test_build_search_url_for_boss_city_keyword():
@@ -69,3 +69,21 @@ def test_extract_candidates_filters_mixed_card_fields():
     assert "薪资数字未能从页面文本读取" in candidates[0].summary
     assert "群核科技" in candidates[1].summary
     assert "北京字节跳动" not in candidates[1].summary
+
+
+def test_pick_search_page_prefers_expected_controlled_search_url():
+    class DummyPage:
+        def __init__(self, url: str):
+            self.url = url
+
+    older_chat = DummyPage("https://www.zhipin.com/web/geek/chat")
+    intended_search = DummyPage("https://www.zhipin.com/web/geek/job?query=AI+Agent&city=101210100")
+    later_unrelated_page = DummyPage("https://example.com/dashboard")
+
+    selected = pick_search_page(
+        [older_chat, intended_search, later_unrelated_page],
+        "Boss 直聘",
+        expected_url="https://www.zhipin.com/web/geek/job?query=AI+Agent&city=101210100",
+    )
+
+    assert selected is intended_search

@@ -3534,6 +3534,147 @@ def test_manual_edge_search_capture_flow(tmp_path, monkeypatch):
     assert run["city"] == "杭州"
 
 
+def test_controlled_job_discovery_is_bounded_and_never_creates_outbound_actions(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "controlled-discovery.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db
+
+    calls = []
+
+    def fake_search(platform, keyword, city, limit):
+        calls.append((platform, keyword, city, limit))
+        search_index = len(calls)
+        return SearchResult(
+            platform=platform,
+            keyword=keyword,
+            city=city,
+            search_url=f"https://jobs.example.com/search/{search_index}",
+            browser_channel="msedge",
+            candidates=[
+                SearchCandidate(
+                    title=f"AI 应用开发实习生 {search_index}-{candidate_index}",
+                    company=f"测试智能科技 {search_index}-{candidate_index}",
+                    city=city,
+                    source_url=f"https://jobs.example.com/detail/{search_index}-{candidate_index}",
+                    summary="Python FastAPI RAG，每周 5 天，3 个月。",
+                )
+                for candidate_index in range(1, 4)
+            ],
+        )
+
+    def fake_fetch(url):
+        suffix = url.rsplit("/", 1)[-1]
+        return FetchResult(
+            url=url,
+            final_url=url,
+            title="AI 应用开发实习生",
+            text=(
+                f"公司名称：测试智能科技 {suffix}\n"
+                "AI 应用开发实习生\n"
+                "杭州，薪资：200-250 元/天，每周 5 天，实习 3 个月。要求 Python、FastAPI、RAG。"
+            ),
+            fetch_mode="controlled_edge",
+        )
+
+    monkeypatch.setattr(main, "search_jobs_in_controlled_edge", fake_search)
+    monkeypatch.setattr(main, "fetch_job_from_controlled_edge", fake_fetch)
+    monkeypatch.setattr(main, "search_company", lambda *args, **kwargs: [])
+    monkeypatch.setattr(main, "try_llm_jd_extract", lambda _text: ({}, ""))
+    init_db()
+
+    result = main.run_controlled_job_discovery()
+
+    assert result["status"] == "完成"
+    assert len(calls) == main.JOB_DISCOVERY_SEARCH_PAGE_LIMIT
+    assert [call[0] for call in calls] == ["Boss 直聘", "猎聘", "实习僧"]
+    assert all(call[3] == main.JOB_DISCOVERY_CANDIDATE_LIMIT for call in calls)
+    assert result["candidate_count"] == 9
+    assert result["imported_count"] == main.JOB_DISCOVERY_IMPORT_LIMIT
+
+    with connect() as conn:
+        jobs = conn.execute(
+            "SELECT generated_message, generated_email, match_score FROM job_postings ORDER BY id"
+        ).fetchall()
+        imported_candidates = conn.execute(
+            "SELECT COUNT(*) AS count FROM job_candidates WHERE status = '已导入'"
+        ).fetchone()["count"]
+        draft_count = conn.execute("SELECT COUNT(*) AS count FROM message_drafts").fetchone()["count"]
+        preparation_count = conn.execute("SELECT COUNT(*) AS count FROM application_preparations").fetchone()["count"]
+        interview_count = conn.execute("SELECT COUNT(*) AS count FROM interview_preparations").fetchone()["count"]
+        action_log = conn.execute(
+            "SELECT action_type, status, decision_json FROM agent_action_logs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+
+    assert len(jobs) == main.JOB_DISCOVERY_IMPORT_LIMIT
+    assert imported_candidates == main.JOB_DISCOVERY_IMPORT_LIMIT
+    assert all(job["generated_message"] == "" and job["generated_email"] == "" for job in jobs)
+    assert all(job["match_score"] > 0 for job in jobs)
+    assert draft_count == 0
+    assert preparation_count == 0
+    assert interview_count == 0
+    assert action_log["action_type"] == "job_discovery"
+    assert action_log["status"] == "完成"
+    assert '"auto_apply": false' in action_log["decision_json"]
+    assert '"auto_message": false' in action_log["decision_json"]
+
+    client = TestClient(main.app)
+    monkeypatch.setattr(
+        main,
+        "run_controlled_job_discovery",
+        lambda: {"status": "完成", "note": "模拟岗位发现完成。"},
+    )
+    response = client.post("/job-discovery/start", data={"return_to": "/searches"}, follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"].startswith("/searches?notice=")
+
+
+def test_controlled_job_discovery_marks_detail_fetch_failure_for_manual_followup(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "controlled-discovery-failure.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db
+
+    init_db()
+    run_id = main.save_search_result(
+        SearchResult(
+            platform="Boss 直聘",
+            keyword="AI 应用开发实习",
+            city="杭州",
+            search_url="https://jobs.example.com/search",
+            browser_channel="msedge",
+            candidates=[
+                SearchCandidate(
+                    title="AI 应用开发实习生",
+                    company="详情待补充科技",
+                    city="杭州",
+                    source_url="https://jobs.example.com/detail/failure",
+                    summary="Python RAG",
+                )
+            ],
+        )
+    )
+    with connect() as conn:
+        candidate_id = conn.execute(
+            "SELECT id FROM job_candidates WHERE search_run_id = ?", (run_id,)
+        ).fetchone()["id"]
+
+    monkeypatch.setattr(main, "fetch_job_from_controlled_edge", lambda _url: (_ for _ in ()).throw(ValueError("需要登录")))
+    result = main.import_discovery_candidate(candidate_id, resume_id=1)
+
+    assert result["status"] == "详情待补充"
+    with connect() as conn:
+        candidate = conn.execute(
+            "SELECT status, error_message, job_id FROM job_candidates WHERE id = ?", (candidate_id,)
+        ).fetchone()
+        job_count = conn.execute("SELECT COUNT(*) AS count FROM job_postings").fetchone()["count"]
+    assert candidate["status"] == "详情待补充"
+    assert "需要登录" in candidate["error_message"]
+    assert candidate["job_id"] is None
+    assert job_count == 0
+
+
 def test_manual_edge_search_launch_uses_debug_profile(tmp_path, monkeypatch):
     from app.services import job_searcher
 

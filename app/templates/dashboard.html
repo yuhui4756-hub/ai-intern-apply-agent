@@ -16,6 +16,21 @@
 <section class="panel">
   <div class="panel-title">
     <div>
+      <h2>岗位发现</h2>
+      <p class="muted">根据候选人画像中的目标岗位和城市，在受控 Edge 中轮换搜索并完成有限数量的 JD 评分。</p>
+    </div>
+    <span class="badge">受控 Edge</span>
+  </div>
+  <form method="post" action="/job-discovery/start" class="form-actions">
+    <input type="hidden" name="return_to" value="/">
+    <button class="button primary" type="submit">开始岗位发现</button>
+    <a class="button" href="/searches">查看搜索记录</a>
+  </form>
+</section>
+
+<section class="panel">
+  <div class="panel-title">
+    <div>
       <h2>受控沟通</h2>
       {% if workflow_active %}
       <p class="muted">正在巡检受控 Edge 中的招聘平台聊天页。</p>
