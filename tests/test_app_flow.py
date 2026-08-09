@@ -3792,6 +3792,80 @@ def test_discovery_candidate_screening_accepts_ascii_signals_and_blocks_non_engi
         {"title": "AI 应用开发实习生", "summary": "薪资 3-5K/月，Python FastAPI RAG"},
         {"min_salary_per_day": 200},
     )[0] is True
+    accepted, reason = main.discovery_candidate_screening(
+        {"title": "AI\ue797开发实习", "summary": "北京 | 5天/周"}
+    )
+    assert accepted is False
+    assert "无法识别的字体字符" in reason
+
+
+def test_controlled_discovery_prioritizes_clear_ai_candidates_and_keeps_corrupted_text_for_review(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "discovery-quality-gate.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db
+
+    init_db()
+    fetch_calls = []
+
+    def fake_search(platform, keyword, city, limit):
+        return SearchResult(
+            platform=platform,
+            keyword=keyword,
+            city=city,
+            search_url=f"https://jobs.example.com/{platform}",
+            browser_channel="msedge",
+            candidates=[
+                SearchCandidate(
+                    title="算法开发实习生",
+                    company="次优候选",
+                    city=city,
+                    source_url=f"https://jobs.example.com/{platform}/algorithm",
+                    summary="模型训练与算法开发",
+                ),
+                SearchCandidate(
+                    title="AI Agent 开发实习生",
+                    company="优先候选",
+                    city=city,
+                    source_url=f"https://jobs.example.com/{platform}/agent",
+                    summary="Python、FastAPI、RAG",
+                ),
+                SearchCandidate(
+                    title="AI\ue797开发（实习）",
+                    company="",
+                    city=city,
+                    source_url=f"https://jobs.example.com/{platform}/masked",
+                    summary="AI\ue797开发（实习） \ue67e\ue338\ue338-\ue1b4\ue338\ue338/天",
+                ),
+            ],
+        )
+
+    def fake_fetch(url):
+        fetch_calls.append(url)
+        return FetchResult(
+            url=url,
+            final_url=url,
+            title="AI Agent 开发实习生",
+            text="AI Agent 开发实习生，要求 Python、FastAPI、RAG。",
+            fetch_mode="controlled_edge",
+        )
+
+    monkeypatch.setattr(main, "search_jobs_in_controlled_edge", fake_search)
+    monkeypatch.setattr(main, "fetch_job_from_controlled_edge", fake_fetch)
+    monkeypatch.setattr(main, "search_company", lambda *args, **kwargs: [])
+    monkeypatch.setattr(main, "try_llm_jd_extract", lambda _text: ({}, ""))
+
+    result = main.run_controlled_job_discovery()
+
+    assert result["imported_count"] == 6
+    assert all(url.endswith("/agent") or url.endswith("/algorithm") for url in fetch_calls)
+    assert all(url.endswith("/agent") for url in fetch_calls[:3])
+    with connect() as conn:
+        masked = conn.execute(
+            "SELECT status, error_message FROM job_candidates WHERE source_url LIKE '%/masked' LIMIT 1"
+        ).fetchone()
+    assert masked["status"] == "初筛待确认"
+    assert "无法识别的字体字符" in masked["error_message"]
 
 
 def test_controlled_discovery_skips_explicit_low_daily_salary_before_jd_read(tmp_path, monkeypatch):

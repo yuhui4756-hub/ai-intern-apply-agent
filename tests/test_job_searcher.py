@@ -71,6 +71,42 @@ def test_extract_candidates_filters_mixed_card_fields():
     assert "北京字节跳动" not in candidates[1].summary
 
 
+def test_extract_candidates_rejects_liepin_career_navigation_with_global_search_context():
+    anchors = [
+        {
+            "href": "https://www.liepin.com/career/qtfawuzw/",
+            "text": "其他法务职位招聘",
+            "context": "Agent 开发实习\n其他法务职位招聘\n本期新增 2800 个职位",
+        },
+        {
+            "href": "https://www.liepin.com/lptjob/80798955",
+            "text": "AI Agent 应用开发工程师【实习+应届】",
+            "context": "AI Agent 应用开发工程师【实习+应届】\n彩讯科技股份有限公司\n北京-朝阳区\n20-35k",
+        },
+    ]
+
+    candidates = extract_candidates_from_anchors(anchors, "猎聘", "北京")
+
+    assert len(candidates) == 1
+    assert candidates[0].title == "AI Agent 应用开发工程师【实习+应届】"
+    assert candidates[0].company == "彩讯科技股份有限公司"
+
+
+def test_extract_candidates_keeps_detail_anchor_title_when_context_contains_search_keyword():
+    anchors = [
+        {
+            "href": "https://www.liepin.com/lptjob/12345678",
+            "text": "海外专利诉讼专家",
+            "context": "Agent 开发实习\n海外专利诉讼专家\n某新能源公司\n上海",
+        }
+    ]
+
+    candidates = extract_candidates_from_anchors(anchors, "猎聘", "北京")
+
+    assert len(candidates) == 1
+    assert candidates[0].title == "海外专利诉讼专家"
+
+
 def test_pick_search_page_prefers_expected_controlled_search_url():
     class DummyPage:
         def __init__(self, url: str):

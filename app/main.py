@@ -105,7 +105,7 @@ JOB_DISCOVERY_CANDIDATE_LIMIT = 18
 JOB_DISCOVERY_IMPORT_LIMIT = 6
 DEFAULT_DISCOVERY_ROLES = ("AI 应用开发实习", "Agent 开发实习", "AI 后端实习")
 DEFAULT_DISCOVERY_CITIES = ("北京", "上海", "广州", "深圳", "杭州", "重庆", "成都")
-JOB_DISCOVERY_ROLE_SIGNALS = (
+JOB_DISCOVERY_STRONG_ROLE_SIGNALS = (
     "ai",
     "agent",
     "智能体",
@@ -118,9 +118,8 @@ JOB_DISCOVERY_ROLE_SIGNALS = (
     "深度学习",
     "自然语言",
     "nlp",
-    "模型",
-    "算法",
 )
+JOB_DISCOVERY_SECONDARY_ROLE_SIGNALS = ("模型", "算法")
 JOB_DISCOVERY_NON_ENGINEERING_SIGNALS = (
     "法务",
     "供应链",
@@ -1458,10 +1457,18 @@ def controlled_job_discovery_plan(
 def discovery_candidate_screening(
     candidate: dict[str, Any], matching_preferences: dict[str, Any] | None = None
 ) -> tuple[bool, str]:
-    text = " ".join([str(candidate.get("title") or ""), str(candidate.get("summary") or "")]).lower()
+    title = str(candidate.get("title") or "").strip()
+    summary = str(candidate.get("summary") or "").strip()
+    text = f"{title} {summary}".lower()
+    if not title or title == "候选岗位":
+        return False, "搜索结果缺少可识别的岗位名称，未自动读取 JD；可手动导入复核。"
+    if any("\ue000" <= char <= "\uf8ff" for char in f"{title}\n{summary}"):
+        return False, "搜索结果包含无法识别的字体字符，未自动读取 JD；可手动导入复核。"
     if any(signal.lower() in text for signal in JOB_DISCOVERY_NON_ENGINEERING_SIGNALS):
         return False, "自动初筛识别为非研发方向，未读取 JD；可手动导入复核。"
-    if any(signal.lower() in text for signal in JOB_DISCOVERY_ROLE_SIGNALS):
+    strong_match = any(signal.lower() in text for signal in JOB_DISCOVERY_STRONG_ROLE_SIGNALS)
+    secondary_match = any(signal.lower() in text for signal in JOB_DISCOVERY_SECONDARY_ROLE_SIGNALS)
+    if strong_match or (secondary_match and any(word in text for word in ("开发", "工程", "研发", "实习", "后端"))):
         preferences = matching_preferences if isinstance(matching_preferences, dict) else {}
         minimum_daily_salary = preferences.get("min_salary_per_day")
         minimum_daily_salary = minimum_daily_salary if isinstance(minimum_daily_salary, int) and minimum_daily_salary > 0 else None
@@ -1474,6 +1481,28 @@ def discovery_candidate_screening(
             )
         return True, ""
     return False, "自动初筛未识别到 AI/Agent/大模型方向，未读取 JD；可手动导入复核。"
+
+
+def discovery_candidate_priority(candidate: dict[str, Any]) -> int:
+    """Rank clear AI-development candidates before consuming the bounded JD quota."""
+    title = str(candidate.get("title") or "").lower()
+    summary = str(candidate.get("summary") or "").lower()
+    score = 0
+    for signal in JOB_DISCOVERY_STRONG_ROLE_SIGNALS:
+        if signal.lower() in title:
+            score += 30
+        elif signal.lower() in summary:
+            score += 8
+    for signal in JOB_DISCOVERY_SECONDARY_ROLE_SIGNALS:
+        if signal.lower() in title:
+            score += 8
+        elif signal.lower() in summary:
+            score += 3
+    if any(word in title for word in ("开发", "工程师", "后端", "研发", "实习")):
+        score += 6
+    if str(candidate.get("company") or "").strip():
+        score += 2
+    return score
 
 
 def import_discovery_candidate(
@@ -1566,7 +1595,7 @@ def run_controlled_job_discovery(filters: dict[str, Any] | None = None) -> dict[
         plan, resume_id = controlled_job_discovery_plan(conn, filters=filters)
 
     run_ids: list[int] = []
-    candidate_ids: list[int] = []
+    import_candidates: list[tuple[int, int]] = []
     search_errors: list[str] = []
     screened_out_count = 0
     salary_screened_out_count = 0
@@ -1614,11 +1643,12 @@ def run_controlled_job_discovery(filters: dict[str, Any] | None = None) -> dict[
                 screened_out_count += 1
                 salary_screened_out_count += int(is_salary_filter)
                 continue
-            candidate_ids.append(int(row["id"]))
+            import_candidates.append((discovery_candidate_priority(candidate), int(row["id"])))
 
+    import_candidates.sort(key=lambda item: (-item[0], item[1]))
     import_results = [
         import_discovery_candidate(candidate_id, resume_id, effective_filters)
-        for candidate_id in candidate_ids[:JOB_DISCOVERY_IMPORT_LIMIT]
+        for _priority, candidate_id in import_candidates[:JOB_DISCOVERY_IMPORT_LIMIT]
     ]
     imported_count = sum(1 for item in import_results if item["status"] == "已导入")
     pending_count = sum(1 for item in import_results if item["status"] == "详情待补充")
@@ -1657,7 +1687,7 @@ def run_controlled_job_discovery(filters: dict[str, Any] | None = None) -> dict[
                 "effective_filters": effective_filters,
                 "run_ids": run_ids,
                 "candidate_count": candidate_count,
-                "auto_import_candidate_count": len(candidate_ids),
+                "auto_import_candidate_count": len(import_candidates),
                 "screened_out_count": screened_out_count,
                 "salary_screened_out_count": salary_screened_out_count,
                 "imported_count": imported_count,
@@ -1675,7 +1705,7 @@ def run_controlled_job_discovery(filters: dict[str, Any] | None = None) -> dict[
         "note": note,
         "run_ids": run_ids,
         "candidate_count": candidate_count,
-        "auto_import_candidate_count": len(candidate_ids),
+        "auto_import_candidate_count": len(import_candidates),
         "screened_out_count": screened_out_count,
         "salary_screened_out_count": salary_screened_out_count,
         "imported_count": imported_count,

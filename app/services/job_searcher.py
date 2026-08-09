@@ -400,14 +400,21 @@ def extract_candidates_from_anchors(
     seen_urls: set[str] = set()
     for anchor in anchors:
         href = normalize_href(str(anchor.get("href") or ""), base_url)
-        if not href or href in seen_urls or looks_like_search_page_url(href) or not looks_like_job_link(href):
+        if (
+            not href
+            or href in seen_urls
+            or looks_like_search_page_url(href)
+            or not looks_like_job_link(href, platform)
+        ):
             continue
         text = normalize_visible_text(str(anchor.get("text") or anchor.get("title") or ""))
         context = normalize_visible_text(str(anchor.get("context") or ""))
-        combined = "\n".join(item for item in [text, context] if item)
-        if not has_job_signal(combined, href):
+        # Search pages often put global navigation text in a broad ancestor.  The
+        # direct link must therefore look like a job before its card context is used.
+        if not has_job_signal(text, href, platform):
             continue
-        title = infer_title(combined) or "候选岗位"
+        combined = "\n".join(item for item in [text, context] if item)
+        title = infer_direct_title(text) or infer_title(context) or "候选岗位"
         company = infer_company(combined)
         summary = build_candidate_summary(combined, title, company)
         candidates.append(
@@ -437,8 +444,17 @@ def normalize_href(href: str, base_url: str = "") -> str:
         return ""
 
 
-def looks_like_job_link(href: str) -> bool:
+def looks_like_job_link(href: str, platform: str = "") -> bool:
     lowered = href.lower()
+    parsed = urlparse(href)
+    path = (parsed.path or "").lower()
+    platform_key = (platform or "").strip().lower()
+    if platform_key in {"liepin", "猎聘"}:
+        return "/lptjob/" in path
+    if platform_key in {"shixiseng", "实习僧"}:
+        return bool(re.search(r"/intern/inn_[a-z0-9]+", path))
+    if platform_key in {"boss", "boss直聘", "zhipin", "boss 直聘"}:
+        return "/job_detail/" in path
     return any(token in lowered for token in ["job", "jobs", "job_detail", "intern", "zhaopin", "zhiwei", "zw", "position"])
 
 
@@ -459,17 +475,24 @@ def looks_like_search_page_url(href: str) -> bool:
     return False
 
 
-def has_job_signal(text: str, href: str) -> bool:
+def has_job_signal(text: str, href: str, platform: str = "") -> bool:
     if any(keyword.lower() in text.lower() for keyword in JOB_KEYWORDS):
         return True
-    parsed = urlparse(href)
-    return any(keyword in parsed.path.lower() for keyword in ["job", "intern", "position"])
+    return looks_like_job_link(href, platform) and bool(normalize_text(text))
 
 
 def infer_title(text: str) -> str:
     for line in candidate_lines(text):
         clean = normalize_text(line)
         if 4 <= len(clean) <= 80 and any(keyword.lower() in clean.lower() for keyword in JOB_KEYWORDS):
+            return clean
+    return ""
+
+
+def infer_direct_title(text: str) -> str:
+    for line in candidate_lines(text):
+        clean = normalize_text(line)
+        if 2 <= len(clean) <= 80 and not extract_salary(clean) and not any(word in clean for word in TIME_WORDS):
             return clean
     return ""
 
