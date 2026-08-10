@@ -41,7 +41,8 @@ def open_message_patrol_browser(start_url: str = "") -> str:
         raise ValueError("未找到 Microsoft Edge。")
 
     if is_debug_endpoint_ready():
-        open_url_in_debug_browser(target_url)
+        if target_url != "about:blank" and not open_url_in_debug_browser(target_url):
+            raise ValueError("无法在受控 Edge 中打开起始页面，请确认 9222 调试端口仍可用。")
         return target_url
 
     user_data_dir = browser_profile_dir("manual-msedge")
@@ -53,7 +54,7 @@ def open_message_patrol_browser(start_url: str = "") -> str:
         f"--user-data-dir={user_data_dir}",
         "--no-first-run",
         "--new-window",
-        target_url,
+        "about:blank",
     ]
     subprocess.Popen(
         launch_args,
@@ -63,6 +64,8 @@ def open_message_patrol_browser(start_url: str = "") -> str:
     )
     if not wait_for_debug_endpoint():
         raise ValueError("Edge 已尝试打开，但 9222 调试端口没有响应。请关闭刚打开的专用 Edge 窗口后再试。")
+    if target_url != "about:blank" and not open_url_in_debug_browser(target_url):
+        raise ValueError("受控 Edge 已启动，但无法打开起始页面。请稍后重试。")
     return target_url
 
 

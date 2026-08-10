@@ -144,7 +144,8 @@ def open_manual_search_in_edge(platform: str, keyword: str, city: str = "") -> s
         raise ValueError("未找到 Microsoft Edge。")
 
     if is_debug_endpoint_ready():
-        open_url_in_debug_browser(search_url)
+        if not open_url_in_debug_browser(search_url):
+            raise ValueError("无法在受控 Edge 中打开搜索页，请确认 9222 调试端口仍可用。")
         return search_url
 
     user_data_dir = browser_profile_dir("manual-msedge")
@@ -156,7 +157,7 @@ def open_manual_search_in_edge(platform: str, keyword: str, city: str = "") -> s
         f"--user-data-dir={user_data_dir}",
         "--no-first-run",
         "--new-window",
-        search_url,
+        "about:blank",
     ]
     subprocess.Popen(
         launch_args,
@@ -166,6 +167,8 @@ def open_manual_search_in_edge(platform: str, keyword: str, city: str = "") -> s
     )
     if not wait_for_debug_endpoint():
         raise ValueError("Edge 已尝试打开，但 9222 调试端口没有响应。请关闭刚打开的专用 Edge 窗口后再试。")
+    if not open_url_in_debug_browser(search_url):
+        raise ValueError("受控 Edge 已启动，但无法打开搜索页。请稍后重试。")
     return search_url
 
 
@@ -207,29 +210,18 @@ def capture_current_search_page(
 
 
 def _capture_current_search_page_once(platform: str, expected_url: str) -> tuple[str, list[dict]]:
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError as exc:
-        raise ValueError("当前页面采集需要安装 Playwright：pip install playwright。") from exc
-
-    browser = None
-    with sync_playwright() as playwright:
-        try:
-            if not wait_for_debug_endpoint(timeout_seconds=3):
-                raise ValueError("没有检测到应用打开的 Edge 调试窗口，请先点击“打开 Edge 搜索页”。")
-            browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{EDGE_DEBUG_PORT}", timeout=8000)
-            pages = [page for context in browser.contexts for page in context.pages if page.url and page.url != "about:blank"]
-            if not pages:
-                raise ValueError("没有找到可采集的 Edge 页面，请先从应用打开搜索页。")
-            page = pick_search_page(pages, platform, expected_url=expected_url)
-            try:
-                page.wait_for_load_state("domcontentloaded", timeout=3000)
-            except Exception:
-                pass
-            page.wait_for_timeout(1500)
-            return ensure_public_http_url(page.url), extract_anchor_dicts_from_page(page)
-        finally:
-            close_safely(browser)
+    if not wait_for_debug_endpoint(timeout_seconds=3):
+        raise ValueError("没有检测到应用打开的 Edge 调试窗口，请先点击“打开 Edge 搜索页”。")
+    target = wait_for_controlled_search_page(platform, expected_url=expected_url)
+    time.sleep(1.0)
+    snapshot = evaluate_cdp_expression(target, controlled_search_snapshot_expression())
+    if not isinstance(snapshot, dict):
+        raise ValueError("受控 Edge 搜索页没有返回可读取的页面内容。")
+    final_url = ensure_public_http_url(str(snapshot.get("url") or target_url(target)))
+    anchors = snapshot.get("anchors")
+    if not isinstance(anchors, list):
+        raise ValueError("受控 Edge 搜索页没有返回岗位链接。")
+    return final_url, [anchor for anchor in anchors if isinstance(anchor, dict)]
 
 
 def search_jobs_in_controlled_edge(
@@ -275,36 +267,22 @@ def fetch_job_from_controlled_edge(url: str) -> FetchResult:
 
 
 def _fetch_job_from_controlled_edge_once(safe_url: str) -> tuple[str, str, str]:
+    if not wait_for_debug_endpoint(timeout_seconds=3):
+        raise ValueError("没有检测到受控 Edge，请先启动岗位发现或自主沟通。")
+    target = create_controlled_edge_target(safe_url)
     try:
-        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-        from playwright.sync_api import sync_playwright
-    except ImportError as exc:
-        raise ValueError("受控 Edge 抓取需要安装 Playwright：pip install playwright。") from exc
-
-    browser = None
-    page = None
-    with sync_playwright() as playwright:
-        try:
-            if not wait_for_debug_endpoint(timeout_seconds=3):
-                raise ValueError("没有检测到受控 Edge，请先启动岗位发现或自主沟通。")
-            browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{EDGE_DEBUG_PORT}", timeout=8000)
-            if not browser.contexts:
-                raise ValueError("受控 Edge 没有可用浏览器上下文。")
-            page = browser.contexts[0].new_page()
-            page.goto(safe_url, wait_until="domcontentloaded", timeout=30000)
-            try:
-                page.wait_for_load_state("networkidle", timeout=6000)
-            except PlaywrightTimeoutError:
-                pass
-            page.wait_for_timeout(1000)
-            return (
-                ensure_public_http_url(page.url),
-                normalize_text(page.title())[:120],
-                page.locator("body").inner_text(timeout=8000),
-            )
-        finally:
-            close_safely(page)
-            close_safely(browser)
+        wait_for_cdp_document_ready(target)
+        time.sleep(0.8)
+        snapshot = evaluate_cdp_expression(target, controlled_job_snapshot_expression())
+        if not isinstance(snapshot, dict):
+            raise ValueError("受控 Edge 岗位详情页没有返回可读取的页面内容。")
+        return (
+            ensure_public_http_url(str(snapshot.get("url") or safe_url)),
+            normalize_text(str(snapshot.get("title") or ""))[:120],
+            str(snapshot.get("text") or ""),
+        )
+    finally:
+        close_controlled_edge_target(target)
 
 
 def retry_controlled_edge_read(operation) -> tuple[object, int]:
@@ -342,15 +320,6 @@ def is_transient_controlled_edge_error(exc: Exception) -> bool:
 def append_controlled_edge_retry_note(note: str, retry_count: int) -> str:
     retry_note = f"受控 Edge 连接短暂中断后已自动重试 {retry_count} 次并成功。"
     return f"{note} {retry_note}".strip()
-
-
-def close_safely(resource) -> None:
-    if resource is None:
-        return
-    try:
-        resource.close()
-    except Exception:
-        pass
 
 
 def browser_profile_dir(name: str) -> Path:
@@ -442,31 +411,161 @@ def wait_for_debug_endpoint(timeout_seconds: float = 8) -> bool:
     return False
 
 
-def open_url_in_debug_browser(url: str) -> None:
-    request = urllib.request.Request(debug_endpoint_url(f"/json/new?{quote_plus(url)}"), method="PUT")
+def open_url_in_debug_browser(url: str) -> bool:
+    try:
+        create_controlled_edge_target(url)
+        return True
+    except (OSError, ValueError, urllib.error.URLError, TimeoutError):
+        return False
+
+
+def read_controlled_edge_targets(timeout_seconds: float = 1) -> list[dict]:
+    try:
+        with urllib.request.urlopen(debug_endpoint_url("/json/list"), timeout=timeout_seconds) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("无法读取受控 Edge 页面列表。") from exc
+    if not isinstance(payload, list):
+        raise ValueError("受控 Edge 页面列表格式无效。")
+    return [target for target in payload if isinstance(target, dict) and target.get("type") == "page"]
+
+
+def create_controlled_edge_target(url: str) -> dict:
+    safe_url = ensure_public_http_url(url)
+    request = urllib.request.Request(debug_endpoint_url(f"/json/new?{quote_plus(safe_url)}"), method="PUT")
+    try:
+        with urllib.request.urlopen(request, timeout=3) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("无法在受控 Edge 中打开页面。") from exc
+    if not isinstance(payload, dict) or not payload.get("id") or not payload.get("webSocketDebuggerUrl"):
+        raise ValueError("受控 Edge 没有返回新页面的调试地址。")
+    return payload
+
+
+def close_controlled_edge_target(target: dict) -> bool:
+    target_id = str(target.get("id") or "")
+    if not target_id:
+        return False
+    request = urllib.request.Request(debug_endpoint_url(f"/json/close/{quote_plus(target_id)}"), method="PUT")
     try:
         urllib.request.urlopen(request, timeout=2).close()
+        return True
     except (OSError, urllib.error.URLError, TimeoutError):
-        pass
+        return False
+
+
+def evaluate_cdp_expression(target: dict, expression: str, timeout_seconds: float = 8):
+    websocket_url = str(target.get("webSocketDebuggerUrl") or "")
+    if not websocket_url:
+        raise ValueError("受控 Edge 页面缺少调试地址。")
+    try:
+        from websockets.sync.client import connect
+    except ImportError as exc:
+        raise ValueError("受控 Edge 读取需要安装 websockets：pip install websockets。") from exc
+
+    request_id = 1
+    request = {
+        "id": request_id,
+        "method": "Runtime.evaluate",
+        "params": {
+            "expression": expression,
+            "returnByValue": True,
+            "awaitPromise": True,
+        },
+    }
+    try:
+        with connect(websocket_url, open_timeout=timeout_seconds, close_timeout=1) as websocket:
+            websocket.send(json.dumps(request))
+            deadline = time.monotonic() + timeout_seconds
+            while time.monotonic() < deadline:
+                message = websocket.recv(timeout=max(0.1, deadline - time.monotonic()))
+                response = json.loads(message)
+                if response.get("id") != request_id:
+                    continue
+                if response.get("error"):
+                    raise RuntimeError(str(response["error"].get("message") or "CDP 请求失败"))
+                result = response.get("result") if isinstance(response.get("result"), dict) else {}
+                if result.get("exceptionDetails"):
+                    details = result["exceptionDetails"]
+                    raise RuntimeError(str(details.get("text") or "页面脚本执行失败"))
+                remote = result.get("result") if isinstance(result.get("result"), dict) else {}
+                return remote.get("value")
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"受控 Edge CDP 读取失败：{exc}") from exc
+    raise RuntimeError("受控 Edge CDP 读取超时。")
+
+
+def wait_for_cdp_document_ready(target: dict, timeout_seconds: float = 20) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        ready_state = evaluate_cdp_expression(target, "document.readyState", timeout_seconds=4)
+        if ready_state in {"interactive", "complete"}:
+            return
+        time.sleep(0.25)
+    raise ValueError("等待岗位详情页加载超时。")
+
+
+def target_url(page: object) -> str:
+    if isinstance(page, dict):
+        return str(page.get("url") or "")
+    return str(getattr(page, "url", "") or "")
+
+
+def wait_for_controlled_search_page(platform: str, expected_url: str = "", timeout_seconds: float = 8) -> dict:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        target = find_controlled_search_page(read_controlled_edge_targets(), platform, expected_url=expected_url)
+        if isinstance(target, dict):
+            return target
+        time.sleep(0.25)
+    platform_label = (platform or "招聘平台").strip()
+    raise ValueError(f"等待 {platform_label} 搜索结果页超时。请确认受控 Edge 已打开对应搜索页后重试。")
 
 
 def pick_search_page(pages: list, platform: str, expected_url: str = ""):
+    return find_controlled_search_page(pages, platform, expected_url=expected_url)
+
+
+def find_controlled_search_page(pages: list, platform: str, expected_url: str = ""):
     expected = urlparse(expected_url)
     expected_host = (expected.hostname or "").lower()
     expected_path = (expected.path or "").rstrip("/")
     if expected_host:
         for page in reversed(pages):
-            parsed = urlparse(page.url or "")
+            current_url = target_url(page)
+            parsed = urlparse(current_url)
             host = (parsed.hostname or "").lower()
             path = (parsed.path or "").rstrip("/")
-            if host == expected_host and path == expected_path:
+            if host == expected_host and (path == expected_path or is_platform_search_page_url(current_url, platform)):
                 return page
     signals = platform_url_signals(platform)
     for page in reversed(pages):
-        lowered = (page.url or "").lower()
-        if any(signal in lowered for signal in signals):
+        current_url = target_url(page)
+        lowered = current_url.lower()
+        if any(signal in lowered for signal in signals) and is_platform_search_page_url(current_url, platform):
             return page
-    return pages[-1]
+    return None
+
+
+def is_platform_search_page_url(url: str, platform: str) -> bool:
+    parsed = urlparse(url or "")
+    host = (parsed.hostname or "").lower()
+    path = (parsed.path or "").lower().rstrip("/")
+    platform_key = (platform or "").strip().lower()
+    if platform_key in {"boss", "boss直聘", "zhipin", "boss 直聘"}:
+        return "zhipin.com" in host and path in {"/web/geek/job", "/web/geek/jobs"}
+    if platform_key in {"liepin", "猎聘"}:
+        return "liepin.com" in host and path.startswith("/zhaopin")
+    if platform_key in {"shixiseng", "实习僧"}:
+        return "shixiseng.com" in host and path.startswith("/interns")
+    if platform_key in {"zhaopin", "智联招聘"}:
+        return "zhaopin.com" in host and (host.startswith("sou.") or "search" in path)
+    if platform_key in {"51job", "前程无忧"}:
+        return "51job.com" in host and path.startswith("/pc/search")
+    return bool(url and not url.startswith(("about:", "edge:")))
 
 
 def platform_url_signals(platform: str) -> list[str]:
@@ -482,6 +581,29 @@ def platform_url_signals(platform: str) -> list[str]:
     if platform_key in {"前程无忧", "51job"}:
         return ["51job.com"]
     return []
+
+
+def controlled_search_snapshot_expression() -> str:
+    return """(() => ({
+        url: location.href,
+        anchors: Array.from(document.querySelectorAll('a')).slice(0, 400).map(a => {
+            const container = a.closest('[class*="job-card"], [class*="jobCard"], [class*="job-item"], [class*="jobItem"], li, article, section') || a.parentElement;
+            return {
+                href: a.href || '',
+                text: a.innerText || a.textContent || '',
+                title: a.title || '',
+                context: container ? (container.innerText || '') : ''
+            };
+        })
+    }))()"""
+
+
+def controlled_job_snapshot_expression() -> str:
+    return """(() => ({
+        url: location.href,
+        title: document.title || '',
+        text: document.body ? document.body.innerText || '' : ''
+    }))()"""
 
 
 def extract_anchor_dicts_from_page(page) -> list[dict]:
