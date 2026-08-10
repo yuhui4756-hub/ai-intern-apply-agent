@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 from urllib.parse import urlparse
 
 from .job_fetcher import normalize_browser_channel
-from .job_searcher import evaluate_cdp_expression, read_controlled_edge_targets, target_url, wait_for_debug_endpoint
+from .job_searcher import (
+    controlled_edge_dom_snapshot_expression,
+    evaluate_cdp_expression,
+    read_controlled_edge_targets,
+    target_url,
+    wait_for_debug_endpoint,
+)
 
 
 APPLICATION_PLATFORM_STRATEGIES: dict[str, dict[str, object]] = {
@@ -212,7 +217,7 @@ def capture_application_browser_snapshots(plan: dict[str, object], *, browser_ch
 
 
 def capture_application_target_snapshot(target: dict, plan: dict[str, object]) -> dict[str, object]:
-    snapshot = evaluate_cdp_expression(target, application_snapshot_expression(application_selector_list(plan)))
+    snapshot = evaluate_cdp_expression(target, controlled_edge_dom_snapshot_expression(application_selector_list(plan)))
     if not isinstance(snapshot, dict):
         raise ValueError("受控 Edge 投递页面没有返回可读取的内容。")
     selector_counts = snapshot.get("selectors") if isinstance(snapshot.get("selectors"), dict) else {}
@@ -235,37 +240,6 @@ def application_selector_list(plan: dict[str, object]) -> list[str]:
             if str(selector).strip()
         }
     )
-
-
-def application_snapshot_expression(selectors: list[str]) -> str:
-    selector_payload = json.dumps(selectors, ensure_ascii=False)
-    return f"""(() => {{
-        const selectors = {selector_payload};
-        const textSelector = /^(.*):has-text\\((['\"])(.*?)\\2\\)$/;
-        const visible = element => {{
-            const style = window.getComputedStyle(element);
-            const rect = element.getBoundingClientRect();
-            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
-        }};
-        const countSelector = selector => {{
-            const match = selector.match(textSelector);
-            const baseSelector = match ? match[1] : selector;
-            const text = match ? match[3] : '';
-            try {{
-                return Array.from(document.querySelectorAll(baseSelector))
-                    .filter(element => visible(element) && (!text || (element.innerText || element.textContent || '').includes(text)))
-                    .slice(0, 20).length;
-            }} catch (_error) {{
-                return 0;
-            }}
-        }};
-        return {{
-            url: location.href,
-            title: document.title || '',
-            text: document.body ? (document.body.innerText || '').slice(0, 20000) : '',
-            selectors: Object.fromEntries(selectors.map(selector => [selector, countSelector(selector)]))
-        }};
-    }})()"""
 
 
 def snapshot_application_page(page, plan: dict[str, object]) -> dict[str, object]:

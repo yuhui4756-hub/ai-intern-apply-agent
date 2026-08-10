@@ -498,6 +498,38 @@ def evaluate_cdp_expression(target: dict, expression: str, timeout_seconds: floa
     raise RuntimeError("受控 Edge CDP 读取超时。")
 
 
+def controlled_edge_dom_snapshot_expression(selectors: list[str], text_limit: int = 20000) -> str:
+    selector_payload = json.dumps(selectors, ensure_ascii=False)
+    limit = max(0, min(int(text_limit), 50000))
+    return f"""(() => {{
+        const selectors = {selector_payload};
+        const textSelector = /^(.*):has-text\\((['\"])(.*?)\\2\\)$/;
+        const visible = element => {{
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+        }};
+        const countSelector = selector => {{
+            const match = selector.match(textSelector);
+            const baseSelector = match ? match[1] : selector;
+            const text = match ? match[3] : '';
+            try {{
+                return Array.from(document.querySelectorAll(baseSelector))
+                    .filter(element => visible(element) && (!text || (element.innerText || element.textContent || '').includes(text)))
+                    .slice(0, 20).length;
+            }} catch (_error) {{
+                return 0;
+            }}
+        }};
+        return {{
+            url: location.href,
+            title: document.title || '',
+            text: document.body ? (document.body.innerText || '').slice(0, {limit}) : '',
+            selectors: Object.fromEntries(selectors.map(selector => [selector, countSelector(selector)]))
+        }};
+    }})()"""
+
+
 def wait_for_cdp_document_ready(target: dict, timeout_seconds: float = 20) -> None:
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:

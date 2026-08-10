@@ -4,7 +4,14 @@ import hashlib
 from urllib.parse import urlparse
 
 from .job_fetcher import normalize_browser_channel
-from .job_searcher import EDGE_DEBUG_PORT, wait_for_debug_endpoint
+from .job_searcher import (
+    EDGE_DEBUG_PORT,
+    controlled_edge_dom_snapshot_expression,
+    evaluate_cdp_expression,
+    read_controlled_edge_targets,
+    target_url,
+    wait_for_debug_endpoint,
+)
 
 
 PLATFORM_STRATEGIES: dict[str, dict[str, object]] = {
@@ -223,31 +230,38 @@ def capture_browser_probe_snapshots(
     if channel != "msedge":
         raise ValueError("当前浏览器发送探测先支持 Microsoft Edge。")
     try:
-        from playwright.sync_api import sync_playwright
-    except ImportError as exc:
-        raise ValueError("浏览器发送探测需要安装 Playwright：pip install playwright。") from exc
-
-    browser = None
-    try:
-        with sync_playwright() as playwright:
-            if not wait_for_debug_endpoint(timeout_seconds=3):
-                raise ValueError("没有检测到应用打开的 Edge 调试窗口，请先点击“打开 Edge 巡检窗口”。")
-            browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{EDGE_DEBUG_PORT}", timeout=8000)
-            pages = [page for context in browser.contexts for page in context.pages if page.url and page.url != "about:blank"]
-            snapshots: list[dict[str, object]] = []
-            for page in pages:
-                snapshots.append(snapshot_page_for_browser_probe(page, browser_plan))
-            browser.close()
-            browser = None
-            return snapshots
+        if not wait_for_debug_endpoint(timeout_seconds=3):
+            raise ValueError("没有检测到应用打开的 Edge 调试窗口，请先点击“打开 Edge 巡检窗口”。")
+        snapshots: list[dict[str, object]] = []
+        for target in read_controlled_edge_targets():
+            if not target_url(target).startswith(("http://", "https://")):
+                continue
+            try:
+                snapshots.append(capture_browser_probe_target_snapshot(target, browser_plan))
+            except Exception:
+                continue
+        return snapshots
     except ValueError:
         raise
     except Exception as exc:
         message = str(exc).strip() or exc.__class__.__name__
         raise ValueError(f"无法连接当前 Edge 页面做发送探测：{message[:160]}。请先打开 Edge 巡检窗口并停留在 HR 对话页。") from exc
-    finally:
-        if browser is not None:
-            browser.close()
+
+
+def capture_browser_probe_target_snapshot(target: dict, browser_plan: dict[str, object]) -> dict[str, object]:
+    snapshot = evaluate_cdp_expression(
+        target,
+        controlled_edge_dom_snapshot_expression(collect_selector_candidates(browser_plan)),
+    )
+    if not isinstance(snapshot, dict):
+        raise ValueError("受控 Edge 聊天页没有返回可读取的内容。")
+    selector_counts = snapshot.get("selectors") if isinstance(snapshot.get("selectors"), dict) else {}
+    return browser_probe_snapshot_from_values(
+        str(snapshot.get("url") or target_url(target)),
+        str(snapshot.get("title") or ""),
+        str(snapshot.get("text") or ""),
+        {str(selector): int(count or 0) for selector, count in selector_counts.items()},
+    )
 
 
 def snapshot_page_for_browser_probe(page, browser_plan: dict[str, object]) -> dict[str, object]:
@@ -255,17 +269,28 @@ def snapshot_page_for_browser_probe(page, browser_plan: dict[str, object]) -> di
     title = safe_page_title(page)
     url = str(getattr(page, "url", "") or "")
     selector_candidates = collect_selector_candidates(browser_plan)
+    return browser_probe_snapshot_from_values(
+        url,
+        title,
+        text,
+        {selector: safe_locator_count(page, selector) for selector in selector_candidates},
+    )
+
+
+def browser_probe_snapshot_from_values(
+    url: str,
+    title: str,
+    text: str,
+    selector_counts: dict[str, int],
+) -> dict[str, object]:
     return {
         "url": url,
-        "title": title,
+        "title": title[:300],
         "host": url_host(url),
         "text_length": len(text),
         "text_digest": text_digest(text),
         "normalized_text": normalize_probe_text(f"{title}\n{text}"),
-        "selectors": {
-            selector: safe_locator_count(page, selector)
-            for selector in selector_candidates
-        },
+        "selectors": selector_counts,
     }
 
 
