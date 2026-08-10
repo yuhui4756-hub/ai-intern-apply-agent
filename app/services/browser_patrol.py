@@ -8,8 +8,11 @@ from .job_searcher import (
     EDGE_DEBUG_PORT,
     browser_profile_dir,
     find_edge_executable,
+    evaluate_cdp_expression,
     is_debug_endpoint_ready,
     open_url_in_debug_browser,
+    read_controlled_edge_targets,
+    target_url,
     wait_for_debug_endpoint,
 )
 
@@ -84,39 +87,61 @@ def capture_browser_patrol_observations(
     if channel != "msedge":
         raise ValueError("当前巡检执行器先支持 Microsoft Edge。")
     try:
-        from playwright.sync_api import sync_playwright
-    except ImportError as exc:
-        raise ValueError("浏览器巡检需要安装 Playwright：pip install playwright。") from exc
-
-    browser = None
-    try:
-        with sync_playwright() as playwright:
-            if not wait_for_debug_endpoint(timeout_seconds=3):
-                raise ValueError("没有检测到应用打开的 Edge 调试窗口，请先点击“打开 Edge 巡检窗口”。")
-            browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{EDGE_DEBUG_PORT}", timeout=8000)
-            pages = [page for context in browser.contexts for page in context.pages if page.url and page.url != "about:blank"]
-            observations: list[dict[str, str]] = []
-            for page in pages:
-                observation = capture_page_observation(page)
-                if observation:
-                    observations.append(observation)
-                if len(observations) >= limit:
-                    break
-            browser.close()
-            browser = None
-            return observations
+        if not wait_for_debug_endpoint(timeout_seconds=3):
+            raise ValueError("没有检测到应用打开的 Edge 调试窗口，请先点击“打开 Edge 巡检窗口”。")
+        observations: list[dict[str, str]] = []
+        for target in read_controlled_edge_targets():
+            if not target_url(target).startswith(("http://", "https://")):
+                continue
+            try:
+                snapshot = evaluate_cdp_expression(target, browser_patrol_snapshot_expression())
+            except Exception:
+                continue
+            observation = capture_snapshot_observation(snapshot)
+            if observation:
+                observations.append(observation)
+            if len(observations) >= limit:
+                break
+        return observations
     except ValueError:
         raise
     except Exception as exc:
         message = str(exc).strip() or exc.__class__.__name__
         raise ValueError(f"无法连接当前 Edge 巡检页面：{message[:160]}。请先点击“打开 Edge 巡检窗口”，完成登录并打开 HR 对话页。") from exc
-    finally:
-        if browser is not None:
-            browser.close()
 
 
 def capture_page_observation(page) -> dict[str, str] | None:
     raw_url = str(page.url or "")
+    title = safe_page_title(page)
+    panel_text = safe_conversation_panel_text(page)
+    body_text = ""
+    try:
+        url = ensure_public_http_url(raw_url)
+    except ValueError:
+        return None
+    url_or_title_matches = looks_like_conversation_url(url) or looks_like_conversation_title(title)
+    if not panel_text and (url_or_title_matches or needs_text_probe(url)):
+        body_text = safe_body_text(page)
+    return capture_observation_from_content(raw_url, title, panel_text, body_text)
+
+
+def capture_snapshot_observation(snapshot: object) -> dict[str, str] | None:
+    if not isinstance(snapshot, dict):
+        return None
+    return capture_observation_from_content(
+        str(snapshot.get("url") or ""),
+        str(snapshot.get("title") or ""),
+        str(snapshot.get("conversation_text") or ""),
+        str(snapshot.get("body_text") or ""),
+    )
+
+
+def capture_observation_from_content(
+    raw_url: str,
+    title: str,
+    conversation_text: str = "",
+    body_text: str = "",
+) -> dict[str, str] | None:
     try:
         url = ensure_public_http_url(raw_url)
     except ValueError:
@@ -125,12 +150,11 @@ def capture_page_observation(page) -> dict[str, str] | None:
     if not platform:
         return None
 
-    title = safe_page_title(page)
+    title = title.strip()[:300]
     url_or_title_matches = looks_like_conversation_url(url) or looks_like_conversation_title(title)
-    text = safe_conversation_panel_text(page)
+    text = conversation_text
     text_scope = "conversation_panel" if text else ""
     if not text and (url_or_title_matches or needs_text_probe(url)):
-        body_text = safe_body_text(page)
         if body_text and not is_broad_recruitment_page(url, title):
             text = body_text
             text_scope = "page_body"
@@ -145,6 +169,18 @@ def capture_page_observation(page) -> dict[str, str] | None:
         "text": text[:20000],
         "text_scope": text_scope,
     }
+
+
+def browser_patrol_snapshot_expression() -> str:
+    return f"""(() => {{
+        const conversationText = ({CONVERSATION_PANEL_SCRIPT.strip()})();
+        return {{
+            url: location.href,
+            title: document.title || '',
+            conversation_text: conversationText || '',
+            body_text: document.body ? document.body.innerText || '' : ''
+        }};
+    }})()"""
 
 
 def safe_page_title(page) -> str:
