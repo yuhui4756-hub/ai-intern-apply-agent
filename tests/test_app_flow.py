@@ -3447,6 +3447,17 @@ def test_search_run_and_candidate_import_flow(tmp_path, monkeypatch):
     from app import main
     from app.db import connect, init_db
 
+    monkeypatch.setattr(
+        main,
+        "controlled_edge_status",
+        lambda: {
+            "status": "未连接",
+            "connected": False,
+            "page_count": 0,
+            "platforms": [],
+            "note": "未检测到应用启动的受控 Edge。普通 Edge 不会被读取；开始岗位发现时会打开专用窗口。",
+        },
+    )
     monkeypatch.setattr(main, "search_company", lambda *args, **kwargs: [])
     monkeypatch.setattr(
         main,
@@ -3485,6 +3496,8 @@ def test_search_run_and_candidate_import_flow(tmp_path, monkeypatch):
     page = client.get("/searches")
     assert page.status_code == 200
     assert "岗位搜索" in page.text
+    assert "受控 Edge：未连接" in page.text
+    assert "普通 Edge 不会被读取" in page.text
 
     search_response = client.post(
         "/searches",

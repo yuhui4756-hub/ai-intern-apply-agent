@@ -1,7 +1,7 @@
 import pytest
 
 from app.services import job_searcher
-from app.services.job_searcher import build_search_url, capture_current_search_page, extract_candidates_from_anchors, fetch_job_from_controlled_edge, pick_search_page
+from app.services.job_searcher import build_search_url, capture_current_search_page, controlled_edge_status, extract_candidates_from_anchors, fetch_job_from_controlled_edge, pick_search_page
 
 
 def test_build_search_url_for_boss_city_keyword():
@@ -189,3 +189,37 @@ def test_controlled_edge_does_not_retry_non_transient_error(monkeypatch):
         capture_current_search_page("Boss 直聘", "AI Agent", "杭州")
 
     assert len(calls) == 1
+
+
+def test_controlled_edge_status_reports_platforms_without_page_content(monkeypatch):
+    class DummyResponse:
+        def read(self):
+            return b'[{"type":"page","url":"https://www.zhipin.com/web/geek/job"},{"type":"page","url":"https://www.liepin.com/zhaopin/"},{"type":"service_worker","url":"https://www.zhipin.com/worker.js"}]'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(job_searcher, "find_edge_executable", lambda: object())
+    monkeypatch.setattr(job_searcher.urllib.request, "urlopen", lambda *_args, **_kwargs: DummyResponse())
+
+    status = controlled_edge_status()
+
+    assert status["status"] == "已连接"
+    assert status["page_count"] == 2
+    assert status["platforms"] == ["Boss 直聘", "猎聘"]
+    assert "zhipin.com" not in status["note"]
+    assert "liepin.com" not in status["note"]
+
+
+def test_controlled_edge_status_distinguishes_missing_controlled_window(monkeypatch):
+    monkeypatch.setattr(job_searcher, "find_edge_executable", lambda: object())
+    monkeypatch.setattr(job_searcher.urllib.request, "urlopen", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("refused")))
+
+    status = controlled_edge_status()
+
+    assert status["status"] == "未连接"
+    assert status["connected"] is False
+    assert "普通 Edge 不会被读取" in status["note"]

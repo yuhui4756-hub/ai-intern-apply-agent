@@ -22,6 +22,10 @@
     </div>
     <span class="badge">受控 Edge</span>
   </div>
+  <div class="controlled-edge-status">
+    <span class="badge {% if not controlled_edge_status.connected %}warning{% endif %}">受控 Edge：{{ controlled_edge_status.status }}</span>
+    <p class="muted">{{ controlled_edge_status.note }}</p>
+  </div>
   <form method="post" action="/job-discovery/start" class="form-stack">
     <input type="hidden" name="return_to" value="/searches">
     <div class="form-grid">

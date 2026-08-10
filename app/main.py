@@ -54,6 +54,7 @@ from .services.job_fetcher import ensure_public_http_url, fetch_job_from_url, no
 from .services.job_searcher import (
     SearchResult,
     capture_current_search_page,
+    controlled_edge_status,
     extract_candidates_from_anchors,
     fetch_job_from_controlled_edge,
     open_manual_search_in_edge,
@@ -4933,6 +4934,7 @@ def new_job_page(request: Request) -> Any:
 @app.get("/searches")
 def searches_page(request: Request) -> Any:
     search_form = default_search_form()
+    edge_status = controlled_edge_status()
     with connect() as conn:
         runs = conn.execute(
             """
@@ -4958,6 +4960,7 @@ def searches_page(request: Request) -> Any:
             "search_form": search_form,
             "discovery_plan": discovery_plan,
             "discovery_filters": discovery_filters,
+            "controlled_edge_status": edge_status,
             "notice": request.query_params.get("notice", ""),
             "notice_type": request.query_params.get("notice_type", "info"),
             "browser_channel_label": browser_channel_label,

@@ -363,6 +363,23 @@ th {
   white-space: nowrap;
 }
 
+.badge.warning {
+  border-color: #e3c28f;
+  color: #875211;
+  background: #fff7e8;
+}
+
+.controlled-edge-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: -2px 0 16px;
+}
+
+.controlled-edge-status p {
+  margin: 0;
+}
+
 .empty {
   color: var(--muted);
 }
@@ -484,5 +501,10 @@ code {
 
   .practice-metrics {
     grid-template-columns: 1fr;
+  }
+
+  .controlled-edge-status {
+    align-items: flex-start;
+    flex-direction: column;
   }
 }

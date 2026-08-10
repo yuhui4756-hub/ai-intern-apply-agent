@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -361,6 +362,67 @@ def browser_profile_dir(name: str) -> Path:
 
 def debug_endpoint_url(path: str = "/json/version") -> str:
     return f"http://127.0.0.1:{EDGE_DEBUG_PORT}{path}"
+
+
+def controlled_edge_status() -> dict[str, object]:
+    """Inspect only local CDP metadata; never read page text or browser session data."""
+    if not find_edge_executable():
+        return {
+            "status": "未检测到 Edge",
+            "edge_available": False,
+            "connected": False,
+            "page_count": 0,
+            "platforms": [],
+            "note": "未检测到 Microsoft Edge，无法启动受控岗位发现。",
+        }
+
+    try:
+        with urllib.request.urlopen(debug_endpoint_url("/json/list"), timeout=0.8) as response:
+            targets = json.loads(response.read().decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return {
+            "status": "未连接",
+            "edge_available": True,
+            "connected": False,
+            "page_count": 0,
+            "platforms": [],
+            "note": "未检测到应用启动的受控 Edge。普通 Edge 不会被读取；开始岗位发现时会打开专用窗口。",
+        }
+
+    pages = [target for target in targets if isinstance(target, dict) and target.get("type") == "page"]
+    platforms: list[str] = []
+    for target in pages:
+        platform = platform_name_from_url(str(target.get("url") or ""))
+        if platform and platform not in platforms:
+            platforms.append(platform)
+    note = f"受控 Edge 已连接，检测到 {len(pages)} 个页面。"
+    if platforms:
+        note += f" 当前招聘平台：{'、'.join(platforms)}。"
+    else:
+        note += " 尚未检测到招聘平台页面。"
+    return {
+        "status": "已连接",
+        "edge_available": True,
+        "connected": True,
+        "page_count": len(pages),
+        "platforms": platforms,
+        "note": note,
+    }
+
+
+def platform_name_from_url(url: str) -> str:
+    host = (urlparse(url).hostname or "").lower()
+    if "zhipin.com" in host:
+        return "Boss 直聘"
+    if "liepin.com" in host:
+        return "猎聘"
+    if "shixiseng.com" in host:
+        return "实习僧"
+    if "zhaopin.com" in host:
+        return "智联招聘"
+    if "51job.com" in host:
+        return "前程无忧"
+    return ""
 
 
 def is_debug_endpoint_ready(timeout_seconds: float = 1) -> bool:
