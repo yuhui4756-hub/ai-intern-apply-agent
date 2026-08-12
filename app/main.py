@@ -977,11 +977,24 @@ def rescore_saved_job(conn: Any, job_id: int) -> dict[str, Any]:
     return scoring
 
 
-def insert_company_research(conn: Any, job_id: int, company: str, title: str, city: str, search_depth: str) -> None:
+def insert_company_research(
+    conn: Any,
+    job_id: int,
+    company: str,
+    title: str,
+    city: str,
+    search_depth: str,
+    *,
+    replace_existing: bool = False,
+) -> int:
+    """Fetch and persist user-requested public company search evidence."""
     if not company:
-        return
+        return 0
+    results = search_company(company, title, city, search_depth)
+    if results and replace_existing:
+        conn.execute("DELETE FROM company_research WHERE job_id = ?", (job_id,))
     now = utc_now()
-    for result in search_company(company, title, city, search_depth):
+    for result in results:
         conn.execute(
             """
             INSERT INTO company_research (
@@ -1000,6 +1013,20 @@ def insert_company_research(conn: Any, job_id: int, company: str, title: str, ci
                 now,
             ),
         )
+    return len(results)
+
+
+def normalized_company_name(value: str) -> str:
+    return re.sub(r"\s+", "", value or "").lower()
+
+
+def company_research_depth(job: dict[str, Any], requested_depth: str) -> str:
+    if requested_depth in {"quick", "standard", "deep"}:
+        return requested_depth
+    stored = loads(str(job.get("extracted_json") or ""), {})
+    extracted = stored.get("extracted", {}) if isinstance(stored, dict) else {}
+    scoring = stored.get("scoring", {}) if isinstance(stored, dict) else {}
+    return auto_search_depth(scoring if isinstance(scoring, dict) else {}, extracted if isinstance(extracted, dict) else {})
 
 
 def split_batch_jds(raw_text: str) -> list[str]:
@@ -1283,11 +1310,7 @@ def create_job_record(
             now,
         ),
     )
-    job_id = cursor.lastrowid
-    company_name = extracted.get("company") or company
-    if jd_text and company_name:
-        insert_company_research(conn, job_id, company_name, extracted.get("title") or "", extracted.get("city") or "", final_depth)
-    return job_id, analysis
+    return cursor.lastrowid, analysis
 
 
 def comparable_source_url(url: str) -> set[str]:
@@ -1366,7 +1389,10 @@ def refresh_job_record(
         status = initial_job_status(jd_text, scoring)
 
     now = utc_now()
-    conn.execute("DELETE FROM company_research WHERE job_id = ?", (job_id,))
+    previous_company = normalized_company_name(str(existing["company"] or ""))
+    updated_company = normalized_company_name(str(extracted.get("company") or company))
+    if previous_company != updated_company:
+        conn.execute("DELETE FROM company_research WHERE job_id = ?", (job_id,))
     conn.execute(
         """
         UPDATE job_postings
@@ -1404,9 +1430,6 @@ def refresh_job_record(
             job_id,
         ),
     )
-    company_name = extracted.get("company") or company
-    if jd_text and company_name:
-        insert_company_research(conn, job_id, company_name, extracted.get("title") or "", extracted.get("city") or "", analysis["search_depth"])
     return analysis
 
 
@@ -5917,7 +5940,10 @@ async def reanalyze_job(job_id: int, request: Request) -> RedirectResponse:
 
     now = utc_now()
     with connect() as conn:
-        conn.execute("DELETE FROM company_research WHERE job_id = ?", (job_id,))
+        previous_company = normalized_company_name(str(job.get("company") or ""))
+        updated_company = normalized_company_name(str(extracted.get("company") or ""))
+        if previous_company != updated_company:
+            conn.execute("DELETE FROM company_research WHERE job_id = ?", (job_id,))
         conn.execute(
             """
             UPDATE job_postings
@@ -5955,15 +5981,53 @@ async def reanalyze_job(job_id: int, request: Request) -> RedirectResponse:
             "INSERT INTO application_events (job_id, event_type, content, created_at) VALUES (?, ?, ?, ?)",
             (job_id, "重新分析", f"使用{analysis_source_label(analysis['analysis_source'])}刷新岗位分析。", now),
         )
-        insert_company_research(
+    return redirect_with_notice(f"/jobs/{job_id}", "已重新分析岗位。", "success")
+
+
+@app.post("/jobs/{job_id}/company-research")
+async def research_company_for_job(job_id: int, request: Request) -> RedirectResponse:
+    form = await request.form()
+    requested_depth = str(form.get("search_depth") or "auto").strip()
+    if requested_depth not in {"auto", "quick", "standard", "deep"}:
+        return redirect_with_notice(f"/jobs/{job_id}", "检索深度无效，未查询公司风险。", "error")
+
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM job_postings WHERE id = ?", (job_id,)).fetchone()
+        if not row:
+            return redirect_with_notice("/jobs", "没有找到这个岗位。", "error")
+        job = {key: row[key] for key in row.keys()}
+        company = str(job.get("company") or "").strip()
+        if not company:
+            return redirect_with_notice(f"/jobs/{job_id}", "公司名称为空，请在重新分析中补充后再查询。", "error")
+
+        search_depth = company_research_depth(job, requested_depth)
+        result_count = insert_company_research(
             conn,
             job_id,
-            extracted.get("company") or "",
-            extracted.get("title") or "",
-            extracted.get("city") or "",
-            analysis["search_depth"],
+            company,
+            str(job.get("title") or ""),
+            str(job.get("city") or ""),
+            search_depth,
+            replace_existing=True,
         )
-    return redirect_with_notice(f"/jobs/{job_id}", "已重新分析岗位。", "success")
+        log_agent_action(
+            conn,
+            action_type="company_risk_research",
+            status="完成" if result_count else "无结果",
+            summary=f"公司公开风险查询：{company}，保存 {result_count} 条来源。",
+            platform=str(job.get("platform") or ""),
+            job_id=job_id,
+            decision={
+                "company": company,
+                "search_depth": search_depth,
+                "source_count": result_count,
+                "model_called": False,
+                "user_triggered": True,
+            },
+        )
+    if result_count:
+        return redirect_with_notice(f"/jobs/{job_id}", f"已查询公司公开风险信息，保存 {result_count} 条来源。", "success")
+    return redirect_with_notice(f"/jobs/{job_id}", "未找到可保存的公司公开资料，已保留原有查询结果。", "warning")
 
 
 @app.post("/jobs/{job_id}/rescore")

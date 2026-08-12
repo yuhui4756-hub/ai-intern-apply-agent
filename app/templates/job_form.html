@@ -50,14 +50,6 @@
         {% endfor %}
       </select>
     </label>
-    <label>搜索深度
-      <select name="search_depth">
-        <option value="auto">自动分档</option>
-        <option value="quick">快速</option>
-        <option value="standard">标准</option>
-        <option value="deep">深度</option>
-      </select>
-    </label>
   </div>
   <div class="form-actions">
     <button class="button primary" type="submit">抓取链接并分析</button>
@@ -94,14 +86,6 @@
         {% endfor %}
       </select>
     </label>
-    <label>搜索深度
-      <select name="search_depth">
-        <option value="auto">自动分档</option>
-        <option value="quick">快速</option>
-        <option value="standard">标准</option>
-        <option value="deep">深度</option>
-      </select>
-    </label>
   </div>
   <label>JD 文本
     <textarea name="jd_text" rows="16" required placeholder="把岗位描述粘贴到这里"></textarea>
@@ -125,14 +109,6 @@
         {% for resume in resumes %}
         <option value="{{ resume.id }}">{{ resume.name }} - {{ resume.target_role }}</option>
         {% endfor %}
-      </select>
-    </label>
-    <label>搜索深度
-      <select name="search_depth">
-        <option value="auto">自动分档</option>
-        <option value="quick">快速</option>
-        <option value="standard">标准</option>
-        <option value="deep">深度</option>
       </select>
     </label>
   </div>

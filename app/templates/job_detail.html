@@ -59,6 +59,24 @@
   </div>
 </section>
 
+<section class="panel form-stack">
+  <div class="panel-title">
+    <h2>公司公开风险查询</h2>
+    {% if research %}<span class="badge">已保存 {{ research | length }} 条来源</span>{% endif %}
+  </div>
+  <p class="muted">JD 内的风险词和黑名单会在分析时即时判断；公开公司资料仅在你有投递意向时查询，不调用岗位分析模型。</p>
+  <form method="post" action="/jobs/{{ job.id }}/company-research" class="form-actions">
+    <label>检索深度
+      <select name="search_depth">
+        {% for value, label in [("auto","自动分档"),("quick","快速：最多 3 条"),("standard","标准：最多 5 条"),("deep","深度：最多 8 条")] %}
+        <option value="{{ value }}" {% if value == "auto" %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <button class="button" type="submit">{% if research %}重新查询公司风险{% else %}查询公司风险{% endif %}</button>
+  </form>
+</section>
+
 <section class="panel">
   <div class="panel-title">
     <h2>投递准备</h2>
@@ -135,13 +153,6 @@
       </label>
       <label>薪资
         <input name="salary_text" value="{{ job.salary_text }}">
-      </label>
-      <label>搜索深度
-        <select name="search_depth">
-          {% for value, label in [("auto","自动分档"),("quick","快速"),("standard","标准"),("deep","深度")] %}
-          <option value="{{ value }}" {% if job.search_depth == value %}selected{% endif %}>{{ label }}</option>
-          {% endfor %}
-        </select>
       </label>
     </div>
     <div class="form-actions">
@@ -234,7 +245,7 @@
       {% endfor %}
     </div>
   {% else %}
-    <p class="empty">暂无搜索结果。可能是公司名为空、搜索失败，或该岗位被快速跳过。</p>
+    <p class="empty">尚未查询。确认对这个岗位有投递意向后，可使用上方按钮查询公开公司资料。</p>
   {% endif %}
 </section>
 
