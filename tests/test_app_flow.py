@@ -1707,6 +1707,42 @@ def test_communication_browser_strategy_service_handles_unsupported_platform():
     assert plan["browser_plans"][0]["message_text_included"] is False
 
 
+def test_communication_browser_strategy_excludes_zhaopin_from_pc_message_automation():
+    from app.services.communication_browser import build_browser_send_adapter_plan
+
+    plan = build_browser_send_adapter_plan(
+        {
+            "ok": True,
+            "dry_run": True,
+            "trigger_type": "test",
+            "status": "演练完成",
+            "note": "",
+            "policy_mode": "draft",
+            "candidate_count": 1,
+            "allowed_count": 1,
+            "blocked_count": 0,
+            "plans": [
+                {
+                    "draft_id": 1,
+                    "job_id": 2,
+                    "platform": "智联招聘",
+                    "company": "测试公司",
+                    "job_title": "AI 应用开发实习生",
+                    "source_url": "https://www.zhaopin.com/job_detail/example",
+                    "message_length": 20,
+                    "gate_allowed": True,
+                    "gate_reasons": [],
+                }
+            ],
+        }
+    )
+
+    item = plan["browser_plans"][0]
+    assert item["browser_action"] == "manual_locate"
+    assert "PC 消息界面" in item["reason"]
+    assert item["message_text_included"] is False
+
+
 def test_communication_browser_probe_matches_page_snapshot():
     from app.services.communication_browser import (
         build_browser_send_adapter_plan,
@@ -2152,14 +2188,14 @@ def test_autonomous_communication_executor_blocks_noneligible_job(tmp_path, monk
     assert draft["status"] == "待确认"
 
 
-def test_communication_browser_fill_blocks_sensitive_page_signals():
+def test_communication_browser_fill_blocks_hard_sensitive_page_signals_only():
     from app.services.communication_browser import find_fill_blocking_signals, normalize_probe_text
 
     signals = find_fill_blocking_signals(
         {"normalized_text": normalize_probe_text("HR：请先上传简历，不需要缴纳培训费或押金。")}
     )
 
-    assert signals == ["培训费", "押金", "上传简历"]
+    assert signals == ["培训费", "押金", "请先上传简历"]
 
 
 def test_controlled_browser_refuses_tied_chat_page_matches():

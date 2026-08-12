@@ -210,6 +210,7 @@
       <button class="button" type="submit" formaction="/communication-executor/browser-probe-dry-run">探测聊天页</button>
       <button class="button" type="submit" formaction="/communication-executor/browser-calibration-dry-run">校准聊天页结构</button>
     </form>
+    <p class="muted">PC 消息自动化目前只支持 Boss 直聘、猎聘、实习僧。智联招聘和前程无忧仍可用于岗位发现、JD 分析和投递准备。</p>
     <p class="muted">结构校准只记录平台、聊天页线索和控件数量，不保存页面正文、标题或链接，也不会填入或发送消息。</p>
     <p class="muted">{{ executor_status.preview.note }}</p>
     {% if executor_status.preview.plans %}

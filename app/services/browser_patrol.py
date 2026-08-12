@@ -35,6 +35,7 @@ RECRUITMENT_DOMAINS = {
     "zhaopin.com": "智联招聘",
     "51job.com": "前程无忧",
 }
+PC_MESSAGE_AUTOMATION_PLATFORMS = {"Boss 直聘", "猎聘", "实习僧"}
 
 
 def open_message_patrol_browser(start_url: str = "") -> str:
@@ -91,7 +92,10 @@ def capture_browser_patrol_observations(
             raise ValueError("没有检测到应用打开的 Edge 调试窗口，请先点击“打开 Edge 巡检窗口”。")
         observations: list[dict[str, str]] = []
         for target in read_controlled_edge_targets():
-            if not target_url(target).startswith(("http://", "https://")):
+            url = target_url(target)
+            if not url.startswith(("http://", "https://")):
+                continue
+            if infer_recruitment_platform(url) not in PC_MESSAGE_AUTOMATION_PLATFORMS:
                 continue
             try:
                 snapshot = evaluate_cdp_expression(target, browser_patrol_snapshot_expression())
@@ -147,7 +151,7 @@ def capture_observation_from_content(
     except ValueError:
         return None
     platform = infer_recruitment_platform(url)
-    if not platform:
+    if not platform or platform not in PC_MESSAGE_AUTOMATION_PLATFORMS:
         return None
 
     title = title.strip()[:300]

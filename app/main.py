@@ -2536,6 +2536,7 @@ def run_controlled_edge_chat_page_calibration(trigger_type: str = "manual_browse
                 "structure_ready_count": int(result.get("structure_ready_count") or 0),
                 "review_count": int(result.get("review_count") or 0),
                 "sensitive_count": int(result.get("sensitive_count") or 0),
+                "unsupported_count": int(result.get("unsupported_count") or 0),
                 "results": result.get("results", []),
                 "page_text_saved": False,
                 "page_url_saved": False,

@@ -36,8 +36,14 @@ PLATFORM_STRATEGIES: dict[str, dict[str, object]] = {
         "send_button_selectors": [
             "button:has-text('发送')",
             "[role='button']:has-text('发送')",
+            "button[aria-label*='发送']",
+            "[role='button'][aria-label*='发送']",
+            "button[title*='发送']",
+            "[role='button'][title*='发送']",
+            "button[type='submit']",
             ".btn-send",
             "[class*='send']",
+            "[class*='submit']",
         ],
     },
     "猎聘": {
@@ -60,7 +66,13 @@ PLATFORM_STRATEGIES: dict[str, dict[str, object]] = {
         "send_button_selectors": [
             "button:has-text('发送')",
             "[role='button']:has-text('发送')",
+            "button[aria-label*='发送']",
+            "[role='button'][aria-label*='发送']",
+            "button[title*='发送']",
+            "[role='button'][title*='发送']",
+            "button[type='submit']",
             "[class*='send']",
+            "[class*='submit']",
         ],
     },
     "实习僧": {
@@ -81,54 +93,30 @@ PLATFORM_STRATEGIES: dict[str, dict[str, object]] = {
         "send_button_selectors": [
             "button:has-text('发送')",
             "[role='button']:has-text('发送')",
+            "button[aria-label*='发送']",
+            "[role='button'][aria-label*='发送']",
+            "button[title*='发送']",
+            "[role='button'][title*='发送']",
+            "button[type='submit']",
             "[class*='send']",
-        ],
-    },
-    "智联招聘": {
-        "domains": ["zhaopin.com"],
-        "chat_url_tokens": ["chat", "message", "im"],
-        "chat_text_hints": ["请输入", "发送", "沟通", "消息"],
-        "conversation_panel_selectors": [
-            "[class*='chat']",
-            "[class*='message']",
-            "[class*='im']",
-        ],
-        "message_input_selectors": [
-            "textarea",
-            "[contenteditable='true']",
-            "[placeholder*='请输入']",
-            "[class*='input'] textarea",
-        ],
-        "send_button_selectors": [
-            "button:has-text('发送')",
-            "[role='button']:has-text('发送')",
-            "[class*='send']",
-        ],
-    },
-    "前程无忧": {
-        "domains": ["51job.com"],
-        "chat_url_tokens": ["chat", "message", "im"],
-        "chat_text_hints": ["请输入", "发送", "沟通", "消息"],
-        "conversation_panel_selectors": [
-            "[class*='chat']",
-            "[class*='message']",
-            "[class*='im']",
-        ],
-        "message_input_selectors": [
-            "textarea",
-            "[contenteditable='true']",
-            "[placeholder*='请输入']",
-            "[class*='input'] textarea",
-        ],
-        "send_button_selectors": [
-            "button:has-text('发送')",
-            "[role='button']:has-text('发送')",
-            "[class*='send']",
+            "[class*='submit']",
         ],
     },
 }
 
-FILL_BLOCKING_TEXT = (
+RECRUITMENT_PLATFORM_DOMAINS = {
+    "Boss 直聘": ("zhipin.com",),
+    "猎聘": ("liepin.com",),
+    "实习僧": ("shixiseng.com",),
+    "智联招聘": ("zhaopin.com",),
+    "前程无忧": ("51job.com",),
+}
+
+PC_MESSAGE_AUTOMATION_PLATFORMS = frozenset(PLATFORM_STRATEGIES)
+
+# Static resume controls are common in legitimate chat UIs. Conversation content
+# asking for a resume is still routed to a human by the separate send gate.
+HARD_PAGE_BLOCKING_TEXT = (
     "身份证",
     "银行卡",
     "培训费",
@@ -136,8 +124,7 @@ FILL_BLOCKING_TEXT = (
     "贷款",
     "付费",
     "扫码",
-    "上传简历",
-    "附件简历",
+    "请先上传简历",
 )
 
 
@@ -157,8 +144,12 @@ def calibrate_controlled_edge_chat_pages(
         url = target_url(target)
         if not url.startswith(("http://", "https://")):
             continue
-        platform, strategy = platform_strategy_for_url(url)
+        platform = recruitment_platform_for_url(url)
         if not platform:
+            continue
+        strategy = PLATFORM_STRATEGIES.get(platform)
+        if not strategy:
+            results.append(unsupported_platform_calibration_result(platform))
             continue
         try:
             snapshot = evaluate_cdp_expression(target, chat_page_calibration_expression(strategy))
@@ -171,6 +162,7 @@ def calibrate_controlled_edge_chat_pages(
     structure_ready_count = sum(1 for item in results if item.get("status") == "结构可校准")
     review_count = sum(1 for item in results if item.get("status") == "需人工校准")
     sensitive_count = sum(1 for item in results if item.get("status") == "含敏感提示")
+    unsupported_count = sum(1 for item in results if item.get("status") == "PC 消息自动化未启用")
     if not results:
         status = "未发现招聘平台页面"
         note = "已连接受控 Edge，但没有发现已打开的招聘平台页面。"
@@ -178,7 +170,8 @@ def calibrate_controlled_edge_chat_pages(
         status = "校准完成"
         note = (
             f"已只读校准 {len(results)} 个招聘平台页面：聊天页候选 {candidate_chat_count} 个，"
-            f"结构可校准 {structure_ready_count} 个，需人工校准 {review_count} 个。"
+            f"结构可校准 {structure_ready_count} 个，需人工校准 {review_count} 个，"
+            f"PC 消息自动化未启用 {unsupported_count} 个。"
         )
     return {
         "status": status,
@@ -189,6 +182,7 @@ def calibrate_controlled_edge_chat_pages(
         "structure_ready_count": structure_ready_count,
         "review_count": review_count,
         "sensitive_count": sensitive_count,
+        "unsupported_count": unsupported_count,
         "results": results,
         "page_text_saved": False,
         "page_url_saved": False,
@@ -199,12 +193,35 @@ def calibrate_controlled_edge_chat_pages(
 
 
 def platform_strategy_for_url(url: str) -> tuple[str, dict[str, object]]:
+    platform = recruitment_platform_for_url(url)
+    return platform, PLATFORM_STRATEGIES.get(platform, {})
+
+
+def recruitment_platform_for_url(url: str) -> str:
     host = url_host(url)
-    for platform, strategy in PLATFORM_STRATEGIES.items():
-        domains = [str(domain).lower() for domain in list(strategy.get("domains") or [])]
+    for platform, domains in RECRUITMENT_PLATFORM_DOMAINS.items():
         if any(host == domain or host.endswith("." + domain) for domain in domains):
-            return platform, strategy
-    return "", {}
+            return platform
+    return ""
+
+
+def is_pc_message_automation_platform(platform: str) -> bool:
+    return str(platform or "") in PC_MESSAGE_AUTOMATION_PLATFORMS
+
+
+def unsupported_platform_calibration_result(platform: str) -> dict[str, object]:
+    return {
+        "platform": platform,
+        "status": "PC 消息自动化未启用",
+        "chat_page_candidate": False,
+        "chat_url_match": False,
+        "chat_text_hint_match": False,
+        "conversation_panel_count": 0,
+        "message_input_count": 0,
+        "send_button_count": 0,
+        "generic_send_control_count": 0,
+        "sensitive_signal_count": 0,
+    }
 
 
 def chat_page_calibration_expression(strategy: dict[str, object]) -> str:
@@ -216,7 +233,7 @@ def chat_page_calibration_expression(strategy: dict[str, object]) -> str:
         [normalize_probe_text(str(hint)) for hint in list(strategy.get("chat_text_hints") or [])],
         ensure_ascii=False,
     )
-    blocking_text = json.dumps([normalize_probe_text(signal) for signal in FILL_BLOCKING_TEXT], ensure_ascii=False)
+    blocking_text = json.dumps([normalize_probe_text(signal) for signal in HARD_PAGE_BLOCKING_TEXT], ensure_ascii=False)
     return f"""(() => {{
         const panelSelectors = {panel_selectors};
         const inputSelectors = {input_selectors};
@@ -230,6 +247,8 @@ def chat_page_calibration_expression(strategy: dict[str, object]) -> str:
             const rect = element.getBoundingClientRect();
             return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
         }};
+        const controlLabel = element => (element.getAttribute('aria-label') || element.getAttribute('title') || element.innerText || element.textContent || '').trim().replace(/\\s+/g, '');
+        const isSendLabel = label => label === '发送' || label === '发送消息';
         const matches = (selectors, predicate = () => true) => {{
             const found = new Set();
             for (const selector of selectors) {{
@@ -238,7 +257,7 @@ def chat_page_calibration_expression(strategy: dict[str, object]) -> str:
                 const expectedText = match ? match[3] : '';
                 try {{
                     for (const element of document.querySelectorAll(baseSelector)) {{
-                        const label = (element.innerText || element.textContent || '').trim().replace(/\\s+/g, '');
+                        const label = controlLabel(element);
                         if (visible(element) && (!expectedText || label.includes(expectedText)) && predicate(element, label)) found.add(element);
                     }}
                 }} catch (_error) {{}}
@@ -257,7 +276,9 @@ def chat_page_calibration_expression(strategy: dict[str, object]) -> str:
             chat_text_hint_match: chatTextHints.some(hint => normalizedText.includes(hint)),
             conversation_panel_count: matches(panelSelectors),
             message_input_count: matches(inputSelectors, editable),
-            send_button_count: matches(sendSelectors, (element, label) => !element.disabled && (label === '发送' || label === '发送消息')),
+            send_button_count: matches(sendSelectors, (_element, label) => isSendLabel(label)),
+            generic_send_control_count: Array.from(document.querySelectorAll('button, [role="button"], [aria-label], [title]'))
+                .filter(element => visible(element) && isSendLabel(controlLabel(element))).slice(0, 20).length,
             sensitive_signal_count: blockingText.filter(token => normalizedText.includes(token)).length
         }};
     }})()"""
@@ -270,13 +291,14 @@ def chat_page_calibration_result(platform: str, snapshot: object) -> dict[str, o
     panel_count = bounded_count(values.get("conversation_panel_count"))
     input_count = bounded_count(values.get("message_input_count"))
     send_count = bounded_count(values.get("send_button_count"))
+    generic_send_count = bounded_count(values.get("generic_send_control_count"))
     sensitive_signal_count = bounded_count(values.get("sensitive_signal_count"))
     chat_page_candidate = bool(chat_url_match or chat_text_hint_match or panel_count)
     if not chat_page_candidate:
         status = "非聊天页"
     elif sensitive_signal_count:
         status = "含敏感提示"
-    elif input_count == 1 and send_count == 1:
+    elif input_count == 1 and (send_count == 1 or generic_send_count == 1):
         status = "结构可校准"
     else:
         status = "需人工校准"
@@ -289,6 +311,7 @@ def chat_page_calibration_result(platform: str, snapshot: object) -> dict[str, o
         "conversation_panel_count": panel_count,
         "message_input_count": input_count,
         "send_button_count": send_count,
+        "generic_send_control_count": generic_send_count,
         "sensitive_signal_count": sensitive_signal_count,
     }
 
@@ -607,6 +630,14 @@ def browser_plan_for_item(item: dict[str, object]) -> dict[str, object]:
         }
 
     platform = str(item.get("platform") or "")
+    if platform in RECRUITMENT_PLATFORM_DOMAINS and not is_pc_message_automation_platform(platform):
+        return {
+            **base,
+            "browser_action": "manual_locate",
+            "supported": False,
+            "reason": f"{platform} 当前没有可用的 PC 消息界面，暂不进入消息自动化；岗位发现、JD 分析和投递准备仍可使用。",
+            "gate_reasons": [],
+        }
     strategy = PLATFORM_STRATEGIES.get(platform)
     if not strategy:
         return {
@@ -643,7 +674,8 @@ def browser_plan_for_item(item: dict[str, object]) -> dict[str, object]:
         "safety_checks": [
             "发送前重新执行发送闸门。",
             "页面岗位或公司不匹配时停止。",
-            "页面出现面试、联系方式、简历附件、押金、培训费等敏感内容时停止。",
+            "页面出现身份证、银行卡、付费、押金、培训费等高风险提示时停止。",
+            "对话中出现简历附件、联系方式或面试安排时仍由发送闸门转人工。",
             "真实发送必须由用户显式启动自主沟通工作流，并保留审计日志。",
         ],
     }
@@ -725,7 +757,7 @@ def send_message_in_controlled_edge(
         raise ValueError(f"无法发送当前 Edge 聊天草稿：{message_text[:180]}。") from exc
 def find_fill_blocking_signals(snapshot: dict[str, object]) -> list[str]:
     text = str(snapshot.get("normalized_text") or "")
-    return [signal for signal in FILL_BLOCKING_TEXT if normalize_probe_text(signal) in text]
+    return [signal for signal in HARD_PAGE_BLOCKING_TEXT if normalize_probe_text(signal) in text]
 
 
 def find_unique_verified_cdp_chat_target(
@@ -836,6 +868,7 @@ def send_button_location_expression(browser_plan_item: dict[str, object]) -> str
             const rect = element.getBoundingClientRect();
             return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
         }};
+        const controlLabel = element => (element.getAttribute('aria-label') || element.getAttribute('title') || element.innerText || element.textContent || '').trim().replace(/\\s+/g, '');
         const buttons = new Map();
         for (const selector of selectors) {{
             const textSelector = /^(.*):has-text\\((['\"])(.*?)\\2\\)$/;
@@ -844,7 +877,7 @@ def send_button_location_expression(browser_plan_item: dict[str, object]) -> str
             const text = match ? match[3] : '';
             try {{
                 for (const element of document.querySelectorAll(baseSelector)) {{
-                    const label = (element.innerText || element.textContent || '').trim().replace(/\\s+/g, '');
+                    const label = controlLabel(element);
                     if (visible(element) && !element.disabled && (!text || label.includes(text)) && (label === '发送' || label === '发送消息')) {{
                         if (!buttons.has(element)) buttons.set(element, selector);
                     }}
@@ -860,7 +893,7 @@ def send_button_location_expression(browser_plan_item: dict[str, object]) -> str
 
 def select_unique_verified_page(candidates: list[tuple[int, object, dict[str, object]]], *, action: str):
     if not candidates:
-        raise ValueError(f"未找到可安全{action}的对应聊天页，请先确认页面没有简历、联系方式或付费等敏感提示。")
+        raise ValueError(f"未找到可安全{action}的对应聊天页，请先确认页面身份唯一且没有高风险或敏感提示。")
     best_score = max(item[0] for item in candidates)
     best_matches = [item for item in candidates if item[0] == best_score]
     if len(best_matches) != 1:

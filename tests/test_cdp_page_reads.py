@@ -32,6 +32,23 @@ def test_browser_patrol_reads_cdp_snapshot_without_browser_takeover(monkeypatch)
     assert "conversationText" in expressions[0]
 
 
+def test_browser_patrol_excludes_zhaopin_without_pc_message_automation(monkeypatch):
+    target = {
+        "id": "zhaopin-page",
+        "type": "page",
+        "url": "https://www.zhaopin.com/job_detail/example",
+        "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/zhaopin-page",
+    }
+    called = []
+
+    monkeypatch.setattr(browser_patrol, "wait_for_debug_endpoint", lambda **_kwargs: True)
+    monkeypatch.setattr(browser_patrol, "read_controlled_edge_targets", lambda: [target])
+    monkeypatch.setattr(browser_patrol, "evaluate_cdp_expression", lambda *_args: called.append(True))
+
+    assert browser_patrol.capture_browser_patrol_observations() == []
+    assert not called
+
+
 def test_application_probe_reads_cdp_snapshot_and_selector_counts(monkeypatch):
     target = {
         "id": "job-page",
@@ -207,6 +224,58 @@ def test_chat_page_calibration_marks_sensitive_candidate_for_manual_review(monke
     assert result["sensitive_count"] == 1
     assert result["structure_ready_count"] == 0
     assert result["results"][0]["status"] == "含敏感提示"
+
+
+def test_chat_page_calibration_does_not_treat_static_resume_controls_as_sensitive(monkeypatch):
+    target = {
+        "id": "liepin-chat",
+        "type": "page",
+        "url": "https://c.liepin.com/im/chat",
+        "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/liepin-chat",
+    }
+
+    monkeypatch.setattr(communication_browser, "wait_for_debug_endpoint", lambda **_kwargs: True)
+    monkeypatch.setattr(communication_browser, "read_controlled_edge_targets", lambda: [target])
+    monkeypatch.setattr(
+        communication_browser,
+        "evaluate_cdp_expression",
+        lambda *_args: {
+            "chat_url_match": True,
+            "chat_text_hint_match": True,
+            "conversation_panel_count": 1,
+            "message_input_count": 1,
+            "send_button_count": 0,
+            "generic_send_control_count": 1,
+            "sensitive_signal_count": 0,
+        },
+    )
+
+    result = communication_browser.calibrate_controlled_edge_chat_pages()
+
+    assert result["sensitive_count"] == 0
+    assert result["structure_ready_count"] == 1
+    assert result["results"][0]["status"] == "结构可校准"
+
+
+def test_chat_page_calibration_marks_zhaopin_as_pc_message_automation_unavailable(monkeypatch):
+    target = {
+        "id": "zhaopin-page",
+        "type": "page",
+        "url": "https://www.zhaopin.com/job_detail/example",
+        "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/zhaopin-page",
+    }
+    called = []
+
+    monkeypatch.setattr(communication_browser, "wait_for_debug_endpoint", lambda **_kwargs: True)
+    monkeypatch.setattr(communication_browser, "read_controlled_edge_targets", lambda: [target])
+    monkeypatch.setattr(communication_browser, "evaluate_cdp_expression", lambda *_args: called.append(True))
+
+    result = communication_browser.calibrate_controlled_edge_chat_pages()
+
+    assert result["unsupported_count"] == 1
+    assert result["results"][0]["platform"] == "智联招聘"
+    assert result["results"][0]["status"] == "PC 消息自动化未启用"
+    assert not called
 
 
 def test_cdp_fill_requires_one_verified_safe_target(monkeypatch):
