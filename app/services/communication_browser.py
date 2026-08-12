@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from urllib.parse import urlparse
 
 from .job_fetcher import normalize_browser_channel
 from .job_searcher import (
-    EDGE_DEBUG_PORT,
     controlled_edge_dom_snapshot_expression,
+    send_cdp_command,
     evaluate_cdp_expression,
     read_controlled_edge_targets,
     target_url,
@@ -503,48 +504,23 @@ def fill_message_in_controlled_edge(
     if normalize_browser_channel(browser_channel) != "msedge":
         raise ValueError("当前浏览器填入先支持 Microsoft Edge。")
     try:
-        from playwright.sync_api import sync_playwright
-    except ImportError as exc:
-        raise ValueError("浏览器填入需要安装 Playwright：pip install playwright。") from exc
-
-    browser = None
-    try:
-        with sync_playwright() as playwright:
-            if not wait_for_debug_endpoint(timeout_seconds=3):
-                raise ValueError("没有检测到应用打开的 Edge 调试窗口，请先打开 Edge 巡检窗口并停留在对应 HR 对话页。")
-            browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{EDGE_DEBUG_PORT}", timeout=8000)
-            pages = [page for context in browser.contexts for page in context.pages if page.url and page.url != "about:blank"]
-            candidates = []
-            for page in pages:
-                snapshot = snapshot_page_for_browser_probe(page, {"browser_plans": [browser_plan_item]})
-                blocked_signals = find_fill_blocking_signals(snapshot)
-                probe = probe_browser_plan_against_snapshots(browser_plan_item, [snapshot])
-                if probe.get("probe_status") == "probe_ready" and not blocked_signals:
-                    candidates.append((int((probe.get("matched_page") or {}).get("page_match_score") or 0), page, probe))
-            _, page, probe = select_unique_verified_page(candidates, action="填入草稿")
-            selector = fill_first_visible_message_input(page, browser_plan_item, message)
-            result = {
-                "status": "已填入",
-                "note": "已填入当前 Edge 聊天输入框，未点击发送。",
-                "filled_selector": selector,
-                "matched_page": probe.get("matched_page") or {},
-                "message_filled": True,
-                "browser_clicked": False,
-                "message_text_saved": False,
-            }
-            browser.close()
-            browser = None
-            return result
+        target, probe = find_unique_verified_cdp_chat_target(browser_plan_item, action="填入草稿")
+        action_result = evaluate_cdp_expression(target, fill_message_expression(browser_plan_item, message))
+        selector = require_cdp_action_selector(action_result, action="填入草稿")
+        return {
+            "status": "已填入",
+            "note": "已填入当前 Edge 聊天输入框，未点击发送。",
+            "filled_selector": selector,
+            "matched_page": probe.get("matched_page") or {},
+            "message_filled": True,
+            "browser_clicked": False,
+            "message_text_saved": False,
+        }
     except ValueError:
         raise
     except Exception as exc:
         message_text = str(exc).strip() or exc.__class__.__name__
         raise ValueError(f"无法填入当前 Edge 聊天输入框：{message_text[:180]}。") from exc
-    finally:
-        if browser is not None:
-            browser.close()
-
-
 def send_message_in_controlled_edge(
     browser_plan_item: dict[str, object],
     message: str,
@@ -559,61 +535,168 @@ def send_message_in_controlled_edge(
     if normalize_browser_channel(browser_channel) != "msedge":
         raise ValueError("当前浏览器发送先支持 Microsoft Edge。")
     try:
-        from playwright.sync_api import sync_playwright
-    except ImportError as exc:
-        raise ValueError("浏览器发送需要安装 Playwright：pip install playwright。") from exc
+        target, probe = find_unique_verified_cdp_chat_target(browser_plan_item, action="发送草稿")
+        filled_selector = require_cdp_action_selector(
+            evaluate_cdp_expression(target, fill_message_expression(browser_plan_item, message)),
+            action="填入草稿",
+        )
 
-    browser = None
-    try:
-        with sync_playwright() as playwright:
-            if not wait_for_debug_endpoint(timeout_seconds=3):
-                raise ValueError("没有检测到应用打开的 Edge 调试窗口，请先打开 Edge 巡检窗口并停留在对应 HR 对话页。")
-            browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{EDGE_DEBUG_PORT}", timeout=8000)
-            pages = [page for context in browser.contexts for page in context.pages if page.url and page.url != "about:blank"]
-            candidates = []
-            for page in pages:
-                snapshot = snapshot_page_for_browser_probe(page, {"browser_plans": [browser_plan_item]})
-                blocked_signals = find_fill_blocking_signals(snapshot)
-                probe = probe_browser_plan_against_snapshots(browser_plan_item, [snapshot])
-                if probe.get("probe_status") == "probe_ready" and not blocked_signals:
-                    candidates.append((int((probe.get("matched_page") or {}).get("page_match_score") or 0), page, probe))
-            _, page, probe = select_unique_verified_page(candidates, action="发送草稿")
-            filled_selector = fill_first_visible_message_input(page, browser_plan_item, message)
+        # Re-check after filling. The page can change while the action is in progress.
+        post_fill_snapshot = capture_browser_probe_target_snapshot(target, {"browser_plans": [browser_plan_item]})
+        post_fill_probe = probe_browser_plan_against_snapshots(browser_plan_item, [post_fill_snapshot])
+        blocked_signals = find_fill_blocking_signals(post_fill_snapshot)
+        if post_fill_probe.get("probe_status") != "probe_ready" or blocked_signals:
+            raise ValueError("填写后页面状态发生变化，已停止点击发送按钮。")
 
-            # Re-check after filling. The page can change while the action is in progress.
-            post_fill_snapshot = snapshot_page_for_browser_probe(page, {"browser_plans": [browser_plan_item]})
-            post_fill_probe = probe_browser_plan_against_snapshots(browser_plan_item, [post_fill_snapshot])
-            blocked_signals = find_fill_blocking_signals(post_fill_snapshot)
-            if post_fill_probe.get("probe_status") != "probe_ready" or blocked_signals:
-                raise ValueError("填写后页面状态发生变化，已停止点击发送按钮。")
-
-            send_selector = click_first_visible_send_button(page, browser_plan_item)
-            result = {
-                "status": "已发送",
-                "note": "已点击当前 Edge 聊天页的发送按钮。",
-                "filled_selector": filled_selector,
-                "send_selector": send_selector,
-                "matched_page": probe.get("matched_page") or {},
-                "message_filled": True,
-                "browser_clicked": True,
-                "message_text_saved": False,
-            }
-            browser.close()
-            browser = None
-            return result
+        send_selector = click_send_button_in_cdp(target, browser_plan_item)
+        return {
+            "status": "已发送",
+            "note": "已点击当前 Edge 聊天页的发送按钮。",
+            "filled_selector": filled_selector,
+            "send_selector": send_selector,
+            "matched_page": probe.get("matched_page") or {},
+            "message_filled": True,
+            "browser_clicked": True,
+            "message_text_saved": False,
+        }
     except ValueError:
         raise
     except Exception as exc:
         message_text = str(exc).strip() or exc.__class__.__name__
         raise ValueError(f"无法发送当前 Edge 聊天草稿：{message_text[:180]}。") from exc
-    finally:
-        if browser is not None:
-            browser.close()
-
-
 def find_fill_blocking_signals(snapshot: dict[str, object]) -> list[str]:
     text = str(snapshot.get("normalized_text") or "")
     return [signal for signal in FILL_BLOCKING_TEXT if normalize_probe_text(signal) in text]
+
+
+def find_unique_verified_cdp_chat_target(
+    browser_plan_item: dict[str, object],
+    *,
+    action: str,
+) -> tuple[dict, dict[str, object]]:
+    if not wait_for_debug_endpoint(timeout_seconds=3):
+        raise ValueError("没有检测到应用打开的 Edge 调试窗口，请先打开 Edge 巡检窗口并停留在对应 HR 对话页。")
+    candidates: list[tuple[int, dict, dict[str, object]]] = []
+    for target in read_controlled_edge_targets():
+        if not target_url(target).startswith(("http://", "https://")):
+            continue
+        try:
+            snapshot = capture_browser_probe_target_snapshot(target, {"browser_plans": [browser_plan_item]})
+        except Exception:
+            continue
+        blocked_signals = find_fill_blocking_signals(snapshot)
+        probe = probe_browser_plan_against_snapshots(browser_plan_item, [snapshot])
+        if probe.get("probe_status") == "probe_ready" and not blocked_signals:
+            score = int((probe.get("matched_page") or {}).get("page_match_score") or 0)
+            candidates.append((score, target, probe))
+    _, target, probe = select_unique_verified_page(candidates, action=action)
+    return target, probe
+
+
+def require_cdp_action_selector(result: object, *, action: str) -> str:
+    if not isinstance(result, dict) or not result.get("ok"):
+        reason = str(result.get("reason") or "页面未找到唯一可用控件。") if isinstance(result, dict) else "页面没有返回动作结果。"
+        raise ValueError(f"{action}失败：{reason}")
+    selector = str(result.get("selector") or "")
+    if not selector:
+        raise ValueError(f"{action}失败：页面没有返回实际控件。")
+    return selector
+
+
+def action_selector_list(browser_plan_item: dict[str, object], name: str) -> list[str]:
+    candidates = browser_plan_item.get("selector_candidates")
+    values = candidates.get(name) if isinstance(candidates, dict) else []
+    return [str(selector) for selector in values if str(selector).strip()] if isinstance(values, list) else []
+
+
+def fill_message_expression(browser_plan_item: dict[str, object], message: str) -> str:
+    selector_payload = json.dumps(action_selector_list(browser_plan_item, "message_input"), ensure_ascii=False)
+    message_payload = json.dumps(str(message), ensure_ascii=False)
+    return f"""(() => {{
+        const selectors = {selector_payload};
+        const message = {message_payload};
+        const visible = element => {{
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+        }};
+        const editable = element => {{
+            if (element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement) return !element.disabled && !element.readOnly;
+            return element.isContentEditable;
+        }};
+        const fields = new Map();
+        for (const selector of selectors) {{
+            try {{
+                for (const element of document.querySelectorAll(selector)) {{
+                    if (visible(element) && editable(element) && !fields.has(element)) fields.set(element, selector);
+                }}
+            }} catch (_error) {{}}
+        }}
+        if (fields.size !== 1) return {{ok: false, reason: fields.size ? '找到多个可填写输入框，已停止填入。' : '未找到唯一可填写输入框。'}};
+        const [[field, selector]] = fields.entries();
+        field.focus();
+        if (field instanceof HTMLTextAreaElement || field instanceof HTMLInputElement) {{
+            const prototype = field instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+            const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
+            if (setter) setter.call(field, message);
+            else field.value = message;
+        }} else {{
+            field.textContent = message;
+        }}
+        field.dispatchEvent(new InputEvent('input', {{bubbles: true, inputType: 'insertText', data: message}}));
+        field.dispatchEvent(new Event('change', {{bubbles: true}}));
+        return {{ok: true, selector}};
+    }})()"""
+
+
+def click_send_button_in_cdp(target: dict, browser_plan_item: dict[str, object]) -> str:
+    result = evaluate_cdp_expression(target, send_button_location_expression(browser_plan_item))
+    selector = require_cdp_action_selector(result, action="发送草稿")
+    if not isinstance(result, dict):
+        raise ValueError("发送草稿失败：页面没有返回发送按钮位置。")
+    try:
+        x = float(result["x"])
+        y = float(result["y"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("发送草稿失败：页面没有返回有效发送按钮位置。") from exc
+    for event_type, button_count in (("mousePressed", 1), ("mouseReleased", 1)):
+        send_cdp_command(
+            target,
+            "Input.dispatchMouseEvent",
+            {"type": event_type, "x": x, "y": y, "button": "left", "clickCount": button_count},
+        )
+    return selector
+
+
+def send_button_location_expression(browser_plan_item: dict[str, object]) -> str:
+    selector_payload = json.dumps(action_selector_list(browser_plan_item, "send_button"), ensure_ascii=False)
+    return f"""(() => {{
+        const selectors = {selector_payload};
+        const visible = element => {{
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+        }};
+        const buttons = new Map();
+        for (const selector of selectors) {{
+            const textSelector = /^(.*):has-text\\((['\"])(.*?)\\2\\)$/;
+            const match = selector.match(textSelector);
+            const baseSelector = match ? match[1] : selector;
+            const text = match ? match[3] : '';
+            try {{
+                for (const element of document.querySelectorAll(baseSelector)) {{
+                    const label = (element.innerText || element.textContent || '').trim().replace(/\\s+/g, '');
+                    if (visible(element) && !element.disabled && (!text || label.includes(text)) && (label === '发送' || label === '发送消息')) {{
+                        if (!buttons.has(element)) buttons.set(element, selector);
+                    }}
+                }}
+            }} catch (_error) {{}}
+        }}
+        if (buttons.size !== 1) return {{ok: false, reason: buttons.size ? '找到多个可用发送按钮，已停止发送。' : '未找到唯一可用发送按钮。'}};
+        const [[button, selector]] = buttons.entries();
+        const rect = button.getBoundingClientRect();
+        return {{ok: true, selector, x: rect.left + rect.width / 2, y: rect.top + rect.height / 2}};
+    }})()"""
 
 
 def select_unique_verified_page(candidates: list[tuple[int, object, dict[str, object]]], *, action: str):
@@ -624,50 +707,6 @@ def select_unique_verified_page(candidates: list[tuple[int, object, dict[str, ob
     if len(best_matches) != 1:
         raise ValueError(f"找到多个同等匹配的聊天页，已停止{action}。")
     return best_matches[0]
-
-
-def fill_first_visible_message_input(page, browser_plan_item: dict[str, object], message: str) -> str:
-    candidates = browser_plan_item.get("selector_candidates")
-    selectors = candidates.get("message_input") if isinstance(candidates, dict) else []
-    for selector in selectors if isinstance(selectors, list) else []:
-        locator = page.locator(str(selector))
-        count = min(int(locator.count()), 20)
-        for index in range(count):
-            field = locator.nth(index)
-            try:
-                if not field.is_visible(timeout=500) or not field.is_enabled(timeout=500):
-                    continue
-                field.fill(message, timeout=5000)
-                return str(selector)
-            except Exception:
-                continue
-    raise ValueError("已确认聊天页，但未能向任何可见输入框填入草稿。")
-
-
-def click_first_visible_send_button(page, browser_plan_item: dict[str, object]) -> str:
-    candidates = browser_plan_item.get("selector_candidates")
-    selectors = candidates.get("send_button") if isinstance(candidates, dict) else []
-    for selector in selectors if isinstance(selectors, list) else []:
-        locator = page.locator(str(selector))
-        count = min(int(locator.count()), 20)
-        visible_buttons = []
-        for index in range(count):
-            button = locator.nth(index)
-            try:
-                if not button.is_visible(timeout=500) or not button.is_enabled(timeout=500):
-                    continue
-                label = str(button.inner_text(timeout=500) or "").strip().replace(" ", "")
-                if label not in {"发送", "发送消息"}:
-                    continue
-                visible_buttons.append(button)
-            except Exception:
-                continue
-        if len(visible_buttons) > 1:
-            raise ValueError("当前聊天页存在多个可用的发送按钮，已停止发送。")
-        if len(visible_buttons) == 1:
-            visible_buttons[0].click(timeout=5000)
-            return str(selector)
-    raise ValueError("已确认聊天页，但未能找到唯一可用的发送按钮。")
 
 
 def url_host(url: str) -> str:

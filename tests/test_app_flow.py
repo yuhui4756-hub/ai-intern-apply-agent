@@ -4174,6 +4174,7 @@ def test_manual_edge_search_launch_uses_debug_profile(tmp_path, monkeypatch):
     from app.services import job_searcher
 
     launched = []
+    opened_urls = []
 
     class DummyProcess:
         pass
@@ -4182,6 +4183,7 @@ def test_manual_edge_search_launch_uses_debug_profile(tmp_path, monkeypatch):
     monkeypatch.setattr(job_searcher, "find_edge_executable", lambda: Path("C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe"))
     monkeypatch.setattr(job_searcher, "is_debug_endpoint_ready", lambda timeout_seconds=1: False)
     monkeypatch.setattr(job_searcher, "wait_for_debug_endpoint", lambda timeout_seconds=8: True)
+    monkeypatch.setattr(job_searcher, "open_url_in_debug_browser", lambda url: opened_urls.append(url) or True)
     monkeypatch.setattr(
         job_searcher.subprocess,
         "Popen",
@@ -4197,6 +4199,7 @@ def test_manual_edge_search_launch_uses_debug_profile(tmp_path, monkeypatch):
     assert "--new-window" in args
     assert any(str(tmp_path / "AIInternApplyAgent" / "browser" / "manual-msedge") in arg for arg in args)
     assert kwargs["stdout"] == job_searcher.subprocess.DEVNULL
+    assert opened_urls == [search_url]
 
 
 def test_github_project_service_parses_and_summarizes_snapshot():

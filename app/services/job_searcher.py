@@ -456,6 +456,30 @@ def close_controlled_edge_target(target: dict) -> bool:
 
 
 def evaluate_cdp_expression(target: dict, expression: str, timeout_seconds: float = 8):
+    result = send_cdp_command(
+        target,
+        "Runtime.evaluate",
+        {
+            "expression": expression,
+            "returnByValue": True,
+            "awaitPromise": True,
+        },
+        timeout_seconds=timeout_seconds,
+    )
+    if result.get("exceptionDetails"):
+        details = result["exceptionDetails"]
+        raise RuntimeError(str(details.get("text") or "页面脚本执行失败"))
+    remote = result.get("result") if isinstance(result.get("result"), dict) else {}
+    return remote.get("value")
+
+
+def send_cdp_command(
+    target: dict,
+    method: str,
+    params: dict | None = None,
+    *,
+    timeout_seconds: float = 8,
+) -> dict:
     websocket_url = str(target.get("webSocketDebuggerUrl") or "")
     if not websocket_url:
         raise ValueError("受控 Edge 页面缺少调试地址。")
@@ -467,12 +491,8 @@ def evaluate_cdp_expression(target: dict, expression: str, timeout_seconds: floa
     request_id = 1
     request = {
         "id": request_id,
-        "method": "Runtime.evaluate",
-        "params": {
-            "expression": expression,
-            "returnByValue": True,
-            "awaitPromise": True,
-        },
+        "method": method,
+        "params": params or {},
     }
     try:
         with connect(websocket_url, open_timeout=timeout_seconds, close_timeout=1) as websocket:
@@ -486,11 +506,7 @@ def evaluate_cdp_expression(target: dict, expression: str, timeout_seconds: floa
                 if response.get("error"):
                     raise RuntimeError(str(response["error"].get("message") or "CDP 请求失败"))
                 result = response.get("result") if isinstance(response.get("result"), dict) else {}
-                if result.get("exceptionDetails"):
-                    details = result["exceptionDetails"]
-                    raise RuntimeError(str(details.get("text") or "页面脚本执行失败"))
-                remote = result.get("result") if isinstance(result.get("result"), dict) else {}
-                return remote.get("value")
+                return result
     except ValueError:
         raise
     except Exception as exc:

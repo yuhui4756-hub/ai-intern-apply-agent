@@ -117,3 +117,138 @@ def test_message_probe_reads_cdp_snapshot_and_keeps_only_counts(monkeypatch):
     assert snapshots[0]["selectors"]["textarea"] == 1
     assert "countSelector" in expressions[0]
     assert "发送" in expressions[0]
+
+
+def test_cdp_fill_requires_one_verified_safe_target(monkeypatch):
+    target = {
+        "id": "chat-page",
+        "type": "page",
+        "url": "https://www.zhipin.com/job_detail/chat-ready.html",
+        "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/chat-page",
+    }
+    plan = cdp_chat_plan()
+    snapshot = cdp_chat_snapshot(target["url"])
+    expressions = []
+
+    monkeypatch.setattr(communication_browser, "wait_for_debug_endpoint", lambda **_kwargs: True)
+    monkeypatch.setattr(communication_browser, "read_controlled_edge_targets", lambda: [target])
+    monkeypatch.setattr(communication_browser, "capture_browser_probe_target_snapshot", lambda *_args: snapshot)
+    monkeypatch.setattr(
+        communication_browser,
+        "evaluate_cdp_expression",
+        lambda _target, expression: expressions.append(expression) or {"ok": True, "selector": "textarea"},
+    )
+
+    result = communication_browser.fill_message_in_controlled_edge(plan, "您好，想了解岗位主要工作内容。")
+
+    assert result["status"] == "已填入"
+    assert result["browser_clicked"] is False
+    assert len(expressions) == 1
+    assert "const message" in expressions[0]
+    assert "button.click" not in expressions[0]
+
+
+def test_cdp_send_rechecks_page_after_filling(monkeypatch):
+    target = {
+        "id": "chat-page",
+        "type": "page",
+        "url": "https://www.zhipin.com/job_detail/chat-ready.html",
+        "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/chat-page",
+    }
+    plan = cdp_chat_plan()
+    snapshot = cdp_chat_snapshot(target["url"])
+    snapshots = [snapshot, snapshot]
+    expressions = []
+    mouse_events = []
+
+    monkeypatch.setattr(communication_browser, "wait_for_debug_endpoint", lambda **_kwargs: True)
+    monkeypatch.setattr(communication_browser, "read_controlled_edge_targets", lambda: [target])
+    monkeypatch.setattr(communication_browser, "capture_browser_probe_target_snapshot", lambda *_args: snapshots.pop(0))
+    monkeypatch.setattr(
+        communication_browser,
+        "evaluate_cdp_expression",
+        lambda _target, expression: expressions.append(expression)
+        or (
+            {"ok": True, "selector": "textarea"}
+            if "const message" in expression
+            else {"ok": True, "selector": "button:has-text('发送')", "x": 120, "y": 80}
+        ),
+    )
+    monkeypatch.setattr(
+        communication_browser,
+        "send_cdp_command",
+        lambda _target, method, params, **_kwargs: mouse_events.append((method, params)) or {},
+    )
+
+    result = communication_browser.send_message_in_controlled_edge(plan, "您好，想了解岗位主要工作内容。")
+
+    assert result["status"] == "已发送"
+    assert result["browser_clicked"] is True
+    assert len(expressions) == 2
+    assert "const message" in expressions[0]
+    assert "button.click" not in expressions[1]
+    assert [event[1]["type"] for event in mouse_events] == ["mousePressed", "mouseReleased"]
+
+
+def test_cdp_fill_does_not_execute_when_sensitive_text_is_present(monkeypatch):
+    target = {
+        "id": "chat-page",
+        "type": "page",
+        "url": "https://www.zhipin.com/job_detail/chat-ready.html",
+        "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/chat-page",
+    }
+    plan = cdp_chat_plan()
+    snapshot = cdp_chat_snapshot(target["url"], extra_text="请先上传简历")
+    actions = []
+
+    monkeypatch.setattr(communication_browser, "wait_for_debug_endpoint", lambda **_kwargs: True)
+    monkeypatch.setattr(communication_browser, "read_controlled_edge_targets", lambda: [target])
+    monkeypatch.setattr(communication_browser, "capture_browser_probe_target_snapshot", lambda *_args: snapshot)
+    monkeypatch.setattr(communication_browser, "evaluate_cdp_expression", lambda *_args: actions.append(True))
+
+    try:
+        communication_browser.fill_message_in_controlled_edge(plan, "您好，想了解岗位主要工作内容。")
+    except ValueError as exc:
+        assert "未找到可安全填入草稿" in str(exc)
+    else:
+        raise AssertionError("敏感页面不能进入草稿填入")
+
+    assert not actions
+
+
+def cdp_chat_plan() -> dict[str, object]:
+    return {
+        "browser_action": "dry_run_ready",
+        "platform": "Boss 直聘",
+        "company": "测试智能科技",
+        "job_title": "AI Agent 开发实习生",
+        "source_url": "https://www.zhipin.com/job_detail/chat-ready.html",
+        "page_match": {
+            "domains": ["zhipin.com"],
+            "chat_url_tokens": ["job_detail"],
+            "chat_text_hints": ["请输入"],
+        },
+        "selector_candidates": {
+            "conversation_panel": ["[class*='chat']"],
+            "message_input": ["textarea", "[class*='input'] textarea"],
+            "send_button": ["button:has-text('发送')"],
+        },
+    }
+
+
+def cdp_chat_snapshot(url: str, extra_text: str = "") -> dict[str, object]:
+    text = f"测试智能科技 AI Agent 开发实习生 请输入内容后发送 {extra_text}"
+    return {
+        "url": url,
+        "title": "测试智能科技 HR 对话",
+        "host": "www.zhipin.com",
+        "text_length": len(text),
+        "text_digest": communication_browser.text_digest(text),
+        "normalized_text": communication_browser.normalize_probe_text(text),
+        "selectors": {
+            "[class*='chat']": 1,
+            "textarea": 1,
+            "[class*='input'] textarea": 1,
+            "button:has-text('发送')": 1,
+        },
+    }
