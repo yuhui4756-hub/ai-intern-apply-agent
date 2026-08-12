@@ -34,6 +34,7 @@ from .services.browser_patrol import capture_browser_patrol_observations, open_m
 from .services.application_browser import build_application_browser_plan, probe_application_browser_plan
 from .services.communication_browser import (
     build_browser_send_adapter_plan,
+    calibrate_controlled_edge_chat_pages,
     fill_message_in_controlled_edge,
     probe_browser_send_adapter_plan,
     send_message_in_controlled_edge,
@@ -194,6 +195,7 @@ def action_type_label(value: str) -> str:
         "communication_executor_dry_run": "自动回复演练",
         "communication_browser_dry_run": "浏览器发送演练",
         "communication_browser_probe": "浏览器页面探测",
+        "communication_browser_calibration": "聊天页结构校准",
         "communication_browser_fill": "浏览器填入草稿",
         "communication_autonomous_send": "自主沟通发送",
         "communication_autonomous_executor": "自主沟通执行",
@@ -2497,6 +2499,52 @@ def run_communication_browser_probe_dry_run(trigger_type: str = "manual_browser"
             },
         )
     return probe_plan
+
+
+def run_controlled_edge_chat_page_calibration(trigger_type: str = "manual_browser") -> dict[str, Any]:
+    try:
+        result = calibrate_controlled_edge_chat_pages()
+    except ValueError as exc:
+        result = {
+            "status": "浏览器未连接",
+            "note": str(exc)[:500],
+            "browser_connected": False,
+            "checked_page_count": 0,
+            "candidate_chat_count": 0,
+            "structure_ready_count": 0,
+            "review_count": 0,
+            "sensitive_count": 0,
+            "results": [],
+            "page_text_saved": False,
+            "page_url_saved": False,
+            "page_title_saved": False,
+            "browser_clicked": False,
+            "message_filled": False,
+        }
+    with connect() as conn:
+        log_agent_action(
+            conn,
+            action_type="communication_browser_calibration",
+            status=str(result["status"]),
+            summary=str(result["note"]),
+            decision={
+                "dry_run": True,
+                "trigger_type": trigger_type,
+                "browser_connected": bool(result.get("browser_connected")),
+                "checked_page_count": int(result.get("checked_page_count") or 0),
+                "candidate_chat_count": int(result.get("candidate_chat_count") or 0),
+                "structure_ready_count": int(result.get("structure_ready_count") or 0),
+                "review_count": int(result.get("review_count") or 0),
+                "sensitive_count": int(result.get("sensitive_count") or 0),
+                "results": result.get("results", []),
+                "page_text_saved": False,
+                "page_url_saved": False,
+                "page_title_saved": False,
+                "browser_clicked": False,
+                "message_filled": False,
+            },
+        )
+    return result
 
 
 def run_communication_browser_fill(draft_id: int, message: str) -> dict[str, Any]:
@@ -4807,6 +4855,17 @@ async def communication_browser_probe_dry_run_route(request: Request) -> Redirec
     if plan["status"] == "浏览器未连接":
         notice_type = "error"
     return redirect_with_notice(return_to, f"浏览器页面探测 dry-run：{plan['note']}", notice_type)
+
+
+@app.post("/communication-executor/browser-calibration-dry-run")
+async def communication_browser_calibration_dry_run_route(request: Request) -> RedirectResponse:
+    form = await request.form()
+    return_to = str(form.get("return_to") or "/communications")
+    if not return_to.startswith("/") or return_to.startswith("//"):
+        return_to = "/communications"
+    result = await run_in_threadpool(run_controlled_edge_chat_page_calibration, "manual_browser")
+    notice_type = "success" if result["status"] in {"校准完成", "未发现招聘平台页面"} else "error"
+    return redirect_with_notice(return_to, f"聊天页结构校准：{result['note']}", notice_type)
 
 
 @app.post("/conversation-captures/{capture_id}/feedback")

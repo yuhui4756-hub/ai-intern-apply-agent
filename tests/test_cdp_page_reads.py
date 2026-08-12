@@ -119,6 +119,96 @@ def test_message_probe_reads_cdp_snapshot_and_keeps_only_counts(monkeypatch):
     assert "发送" in expressions[0]
 
 
+def test_chat_page_calibration_keeps_only_structural_signals(monkeypatch):
+    targets = [
+        {
+            "id": "liepin-chat",
+            "type": "page",
+            "url": "https://c.liepin.com/im/chat",
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/liepin-chat",
+        },
+        {
+            "id": "boss-job",
+            "type": "page",
+            "url": "https://www.zhipin.com/web/geek/job",
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/boss-job",
+        },
+    ]
+    expressions = []
+
+    monkeypatch.setattr(communication_browser, "wait_for_debug_endpoint", lambda **_kwargs: True)
+    monkeypatch.setattr(communication_browser, "read_controlled_edge_targets", lambda: targets)
+    monkeypatch.setattr(
+        communication_browser,
+        "evaluate_cdp_expression",
+        lambda target, expression: expressions.append(expression)
+        or (
+            {
+                "chat_url_match": True,
+                "chat_text_hint_match": True,
+                "conversation_panel_count": 1,
+                "message_input_count": 1,
+                "send_button_count": 1,
+                "sensitive_signal_count": 0,
+            }
+            if target["id"] == "liepin-chat"
+            else {
+                "chat_url_match": False,
+                "chat_text_hint_match": False,
+                "conversation_panel_count": 0,
+                "message_input_count": 0,
+                "send_button_count": 0,
+                "sensitive_signal_count": 0,
+            }
+        ),
+    )
+
+    result = communication_browser.calibrate_controlled_edge_chat_pages()
+
+    assert result["status"] == "校准完成"
+    assert result["checked_page_count"] == 2
+    assert result["candidate_chat_count"] == 1
+    assert result["structure_ready_count"] == 1
+    assert result["results"][0]["platform"] == "猎聘"
+    assert result["results"][0]["status"] == "结构可校准"
+    assert result["results"][1]["status"] == "非聊天页"
+    assert result["page_text_saved"] is False
+    assert result["page_url_saved"] is False
+    assert result["browser_clicked"] is False
+    assert all("button.click" not in expression for expression in expressions)
+    assert all("location.href" not in str(item) for item in result["results"])
+
+
+def test_chat_page_calibration_marks_sensitive_candidate_for_manual_review(monkeypatch):
+    target = {
+        "id": "boss-chat",
+        "type": "page",
+        "url": "https://www.zhipin.com/geek/chat/example",
+        "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/boss-chat",
+    }
+
+    monkeypatch.setattr(communication_browser, "wait_for_debug_endpoint", lambda **_kwargs: True)
+    monkeypatch.setattr(communication_browser, "read_controlled_edge_targets", lambda: [target])
+    monkeypatch.setattr(
+        communication_browser,
+        "evaluate_cdp_expression",
+        lambda *_args: {
+            "chat_url_match": True,
+            "chat_text_hint_match": True,
+            "conversation_panel_count": 1,
+            "message_input_count": 1,
+            "send_button_count": 1,
+            "sensitive_signal_count": 1,
+        },
+    )
+
+    result = communication_browser.calibrate_controlled_edge_chat_pages()
+
+    assert result["sensitive_count"] == 1
+    assert result["structure_ready_count"] == 0
+    assert result["results"][0]["status"] == "含敏感提示"
+
+
 def test_cdp_fill_requires_one_verified_safe_target(monkeypatch):
     target = {
         "id": "chat-page",

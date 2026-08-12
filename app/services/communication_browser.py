@@ -141,6 +141,165 @@ FILL_BLOCKING_TEXT = (
 )
 
 
+def calibrate_controlled_edge_chat_pages(
+    *,
+    browser_channel: str = "msedge",
+) -> dict[str, object]:
+    """Read structural chat-page signals without returning page text, title, or URL."""
+    channel = normalize_browser_channel(browser_channel)
+    if channel != "msedge":
+        raise ValueError("当前聊天页结构校准先支持 Microsoft Edge。")
+    if not wait_for_debug_endpoint(timeout_seconds=3):
+        raise ValueError("没有检测到应用打开的 Edge 调试窗口，请先点击“打开受控 Edge 巡检窗口”。")
+
+    results: list[dict[str, object]] = []
+    for target in read_controlled_edge_targets():
+        url = target_url(target)
+        if not url.startswith(("http://", "https://")):
+            continue
+        platform, strategy = platform_strategy_for_url(url)
+        if not platform:
+            continue
+        try:
+            snapshot = evaluate_cdp_expression(target, chat_page_calibration_expression(strategy))
+        except Exception:
+            results.append({"platform": platform, "status": "读取失败"})
+            continue
+        results.append(chat_page_calibration_result(platform, snapshot))
+
+    candidate_chat_count = sum(1 for item in results if item.get("chat_page_candidate"))
+    structure_ready_count = sum(1 for item in results if item.get("status") == "结构可校准")
+    review_count = sum(1 for item in results if item.get("status") == "需人工校准")
+    sensitive_count = sum(1 for item in results if item.get("status") == "含敏感提示")
+    if not results:
+        status = "未发现招聘平台页面"
+        note = "已连接受控 Edge，但没有发现已打开的招聘平台页面。"
+    else:
+        status = "校准完成"
+        note = (
+            f"已只读校准 {len(results)} 个招聘平台页面：聊天页候选 {candidate_chat_count} 个，"
+            f"结构可校准 {structure_ready_count} 个，需人工校准 {review_count} 个。"
+        )
+    return {
+        "status": status,
+        "note": note,
+        "browser_connected": True,
+        "checked_page_count": len(results),
+        "candidate_chat_count": candidate_chat_count,
+        "structure_ready_count": structure_ready_count,
+        "review_count": review_count,
+        "sensitive_count": sensitive_count,
+        "results": results,
+        "page_text_saved": False,
+        "page_url_saved": False,
+        "page_title_saved": False,
+        "browser_clicked": False,
+        "message_filled": False,
+    }
+
+
+def platform_strategy_for_url(url: str) -> tuple[str, dict[str, object]]:
+    host = url_host(url)
+    for platform, strategy in PLATFORM_STRATEGIES.items():
+        domains = [str(domain).lower() for domain in list(strategy.get("domains") or [])]
+        if any(host == domain or host.endswith("." + domain) for domain in domains):
+            return platform, strategy
+    return "", {}
+
+
+def chat_page_calibration_expression(strategy: dict[str, object]) -> str:
+    panel_selectors = json.dumps(list(strategy.get("conversation_panel_selectors") or []), ensure_ascii=False)
+    input_selectors = json.dumps(list(strategy.get("message_input_selectors") or []), ensure_ascii=False)
+    send_selectors = json.dumps(list(strategy.get("send_button_selectors") or []), ensure_ascii=False)
+    chat_url_tokens = json.dumps([str(token).lower() for token in list(strategy.get("chat_url_tokens") or [])], ensure_ascii=False)
+    chat_text_hints = json.dumps(
+        [normalize_probe_text(str(hint)) for hint in list(strategy.get("chat_text_hints") or [])],
+        ensure_ascii=False,
+    )
+    blocking_text = json.dumps([normalize_probe_text(signal) for signal in FILL_BLOCKING_TEXT], ensure_ascii=False)
+    return f"""(() => {{
+        const panelSelectors = {panel_selectors};
+        const inputSelectors = {input_selectors};
+        const sendSelectors = {send_selectors};
+        const chatUrlTokens = {chat_url_tokens};
+        const chatTextHints = {chat_text_hints};
+        const blockingText = {blocking_text};
+        const textSelector = /^(.*):has-text\\((['\"])(.*?)\\2\\)$/;
+        const visible = element => {{
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+        }};
+        const matches = (selectors, predicate = () => true) => {{
+            const found = new Set();
+            for (const selector of selectors) {{
+                const match = selector.match(textSelector);
+                const baseSelector = match ? match[1] : selector;
+                const expectedText = match ? match[3] : '';
+                try {{
+                    for (const element of document.querySelectorAll(baseSelector)) {{
+                        const label = (element.innerText || element.textContent || '').trim().replace(/\\s+/g, '');
+                        if (visible(element) && (!expectedText || label.includes(expectedText)) && predicate(element, label)) found.add(element);
+                    }}
+                }} catch (_error) {{}}
+            }}
+            return Math.min(found.size, 20);
+        }};
+        const editable = element => {{
+            if (element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement) return !element.disabled && !element.readOnly;
+            return element.isContentEditable;
+        }};
+        const bodyText = document.body ? (document.body.innerText || '') : '';
+        const normalizedText = bodyText.toLowerCase().replace(/\\s+/g, '');
+        const href = location.href.toLowerCase();
+        return {{
+            chat_url_match: chatUrlTokens.some(token => href.includes(token)),
+            chat_text_hint_match: chatTextHints.some(hint => normalizedText.includes(hint)),
+            conversation_panel_count: matches(panelSelectors),
+            message_input_count: matches(inputSelectors, editable),
+            send_button_count: matches(sendSelectors, (element, label) => !element.disabled && (label === '发送' || label === '发送消息')),
+            sensitive_signal_count: blockingText.filter(token => normalizedText.includes(token)).length
+        }};
+    }})()"""
+
+
+def chat_page_calibration_result(platform: str, snapshot: object) -> dict[str, object]:
+    values = snapshot if isinstance(snapshot, dict) else {}
+    chat_url_match = bool(values.get("chat_url_match"))
+    chat_text_hint_match = bool(values.get("chat_text_hint_match"))
+    panel_count = bounded_count(values.get("conversation_panel_count"))
+    input_count = bounded_count(values.get("message_input_count"))
+    send_count = bounded_count(values.get("send_button_count"))
+    sensitive_signal_count = bounded_count(values.get("sensitive_signal_count"))
+    chat_page_candidate = bool(chat_url_match or chat_text_hint_match or panel_count)
+    if not chat_page_candidate:
+        status = "非聊天页"
+    elif sensitive_signal_count:
+        status = "含敏感提示"
+    elif input_count == 1 and send_count == 1:
+        status = "结构可校准"
+    else:
+        status = "需人工校准"
+    return {
+        "platform": platform,
+        "status": status,
+        "chat_page_candidate": chat_page_candidate,
+        "chat_url_match": chat_url_match,
+        "chat_text_hint_match": chat_text_hint_match,
+        "conversation_panel_count": panel_count,
+        "message_input_count": input_count,
+        "send_button_count": send_count,
+        "sensitive_signal_count": sensitive_signal_count,
+    }
+
+
+def bounded_count(value: object) -> int:
+    try:
+        return max(0, min(int(value or 0), 20))
+    except (TypeError, ValueError):
+        return 0
+
+
 def build_browser_send_adapter_plan(execution_plan: dict[str, object]) -> dict[str, object]:
     plans = list(execution_plan.get("plans") or [])
     browser_plans = [browser_plan_for_item(item) for item in plans if isinstance(item, dict)]

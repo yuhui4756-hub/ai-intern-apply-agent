@@ -1857,6 +1857,71 @@ def test_communication_browser_probe_route_logs_dry_run_without_sending(tmp_path
     assert "主要工作内容" not in action_log["decision_json"]
 
 
+def test_chat_page_calibration_route_logs_structural_results_only(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "chat-page-calibration.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db
+
+    init_db()
+    client = TestClient(main.app)
+    called = []
+    monkeypatch.setattr(
+        main,
+        "calibrate_controlled_edge_chat_pages",
+        lambda: called.append(True)
+        or {
+            "status": "校准完成",
+            "note": "已只读校准 1 个招聘平台页面：聊天页候选 1 个，结构可校准 1 个，需人工校准 0 个。",
+            "browser_connected": True,
+            "checked_page_count": 1,
+            "candidate_chat_count": 1,
+            "structure_ready_count": 1,
+            "review_count": 0,
+            "sensitive_count": 0,
+            "results": [
+                {
+                    "platform": "猎聘",
+                    "status": "结构可校准",
+                    "chat_page_candidate": True,
+                    "chat_url_match": True,
+                    "chat_text_hint_match": True,
+                    "conversation_panel_count": 1,
+                    "message_input_count": 1,
+                    "send_button_count": 1,
+                    "sensitive_signal_count": 0,
+                }
+            ],
+            "page_text_saved": False,
+            "page_url_saved": False,
+            "page_title_saved": False,
+            "browser_clicked": False,
+            "message_filled": False,
+        },
+    )
+
+    response = client.post(
+        "/communication-executor/browser-calibration-dry-run",
+        data={"return_to": "/communications"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"].startswith("/communications")
+    assert called == [True]
+    with connect() as conn:
+        action_log = conn.execute(
+            "SELECT action_type, status, decision_json FROM agent_action_logs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert action_log["action_type"] == "communication_browser_calibration"
+    assert action_log["status"] == "校准完成"
+    assert '"page_text_saved": false' in action_log["decision_json"]
+    assert '"page_url_saved": false' in action_log["decision_json"]
+    assert '"browser_clicked": false' in action_log["decision_json"]
+    assert "HR：" not in action_log["decision_json"]
+    assert "https://" not in action_log["decision_json"]
+
+
 def test_communication_browser_fill_requires_confirmation_and_never_sends(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "communication-browser-fill.sqlite3"))
 
