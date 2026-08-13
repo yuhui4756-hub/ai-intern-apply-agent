@@ -12,7 +12,7 @@
 - 管理投递状态和跳过原因。
 - 在收到面试邀请后生成准备计划、题库和复盘材料。
 
-需求规格见 [docs/requirements.md](docs/requirements.md)，自动化路线见 [docs/agent_automation_plan.md](docs/agent_automation_plan.md)，浏览器扩展说明见 [docs/browser_extension.md](docs/browser_extension.md)，当前完成度见 [docs/status.md](docs/status.md)。
+需求规格见 [docs/requirements.md](docs/requirements.md)，自动化路线见 [docs/agent_automation_plan.md](docs/agent_automation_plan.md)，浏览器扩展说明见 [docs/browser_extension.md](docs/browser_extension.md)，当前完成度见 [docs/status.md](docs/status.md)，工程取舍与简历素材见 [docs/resume_engineering_evidence.md](docs/resume_engineering_evidence.md)。
 
 ## Quick Start
 
