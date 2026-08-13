@@ -124,6 +124,7 @@ def init_db() -> None:
                 recommendation_reason TEXT NOT NULL DEFAULT '',
                 resume_reason TEXT NOT NULL DEFAULT '',
                 user_note TEXT NOT NULL DEFAULT '',
+                application_message TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT '待确认',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -379,6 +380,10 @@ def ensure_columns(conn: sqlite3.Connection) -> None:
     job_columns = table_column_names(conn, "job_postings")
     if "analysis_source" not in job_columns:
         conn.execute("ALTER TABLE job_postings ADD COLUMN analysis_source TEXT NOT NULL DEFAULT 'local_rules'")
+
+    application_columns = table_column_names(conn, "application_preparations")
+    if "application_message" not in application_columns:
+        conn.execute("ALTER TABLE application_preparations ADD COLUMN application_message TEXT NOT NULL DEFAULT ''")
 
     candidate_columns = table_column_names(conn, "job_candidates")
     candidate_defaults = {

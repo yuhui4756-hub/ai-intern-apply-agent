@@ -4,7 +4,7 @@
 <section class="page-head">
   <div>
     <h1>投递准备</h1>
-    <p>仅整理本地候选、投递理由和简历版本；确认后只会标记为待投递，不会操作招聘平台。</p>
+    <p>整理本地候选、投递理由、简历版本和可选附言；附言填入也需要单独确认，不会上传或提交。</p>
   </div>
   <div class="form-actions">
     <a class="button" href="/jobs">岗位列表</a>
@@ -55,6 +55,9 @@
               <label>备注
                 <textarea name="user_note" rows="3">{{ item.user_note }}</textarea>
               </label>
+              <label>投递附言（可选）
+                <textarea name="application_message" rows="4" placeholder="仅在平台弹出附言/自我介绍输入框时使用；内容由你自行确认">{{ item.application_message }}</textarea>
+              </label>
               <div class="form-actions">
                 <button class="button compact" type="submit" name="action" value="save">保存</button>
                 {% if item.status == "待确认" %}
@@ -75,10 +78,21 @@
               <input type="hidden" name="return_to" value="/applications">
               <button class="button compact" type="submit">只读演练</button>
             </form>
+            {% if item.application_message %}
+            <form method="post" action="/applications/{{ item.id }}/browser-fill-note" class="form-stack compact-form">
+              <label>确认短语
+                <input name="confirmation" placeholder="填入投递附言" autocomplete="off">
+              </label>
+              <input type="hidden" name="return_to" value="/applications">
+              <button class="button compact" type="submit">填入投递附言</button>
+            </form>
+            {% else %}
+            <p class="muted">保存投递附言后，才可在已核验的 Edge 页面填入。</p>
+            {% endif %}
             {% elif item.status == "已跳过" %}
             <p>未改变岗位状态。</p>
             {% else %}
-            <p>确认后不会自动上传简历或点击投递。</p>
+            <p>确认后不会自动上传简历、填写附言或点击投递。</p>
             {% endif %}
           </td>
         </tr>

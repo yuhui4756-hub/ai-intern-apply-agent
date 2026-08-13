@@ -31,7 +31,7 @@ from .services.analyzer import (
     strip_platform_safety_notice,
 )
 from .services.browser_patrol import capture_browser_patrol_observations, open_message_patrol_browser
-from .services.application_browser import build_application_browser_plan, probe_application_browser_plan
+from .services.application_browser import build_application_browser_plan, fill_application_note_in_controlled_edge, probe_application_browser_plan
 from .services.communication_browser import (
     build_browser_send_adapter_plan,
     calibrate_controlled_edge_chat_pages,
@@ -211,6 +211,7 @@ def action_type_label(value: str) -> str:
         "application_preparation": "投递准备",
         "application_browser_open": "投递页面打开",
         "application_browser_probe": "投递页面演练",
+        "application_browser_fill": "投递附言填入",
         "github_project_refresh": "GitHub 项目刷新",
     }.get(value or "", value or "-")
 
@@ -4573,6 +4574,7 @@ async def update_application_preparation(preparation_id: int, request: Request) 
     resume_id_raw = str(form.get("resume_id") or "").strip()
     resume_id = int(resume_id_raw) if resume_id_raw.isdigit() else None
     user_note = str(form.get("user_note") or "").strip()[:1500]
+    application_message = str(form.get("application_message") or "").strip()[:1500]
     return_to_job = str(form.get("return_to") or "") == "job"
     now = utc_now()
     with connect() as conn:
@@ -4597,10 +4599,10 @@ async def update_application_preparation(preparation_id: int, request: Request) 
         conn.execute(
             """
             UPDATE application_preparations
-            SET resume_id = ?, resume_reason = ?, user_note = ?, status = ?, updated_at = ?
+            SET resume_id = ?, resume_reason = ?, user_note = ?, application_message = ?, status = ?, updated_at = ?
             WHERE id = ?
             """,
-            (resume_id, resume_reason, user_note, status, now, preparation_id),
+            (resume_id, resume_reason, user_note, application_message, status, now, preparation_id),
         )
         event_type = {"save": "投递准备更新", "confirm": "投递准备确认", "skip": "投递准备跳过"}[action]
         event_content = {"save": "已更新投递准备。", "confirm": "已确认进入待投递；尚未在招聘平台执行投递。", "skip": "已跳过本次投递准备。"}[action]
@@ -4675,6 +4677,20 @@ async def probe_application_browser(preparation_id: int, request: Request) -> Re
     status = str(result.get("status") or "")
     notice_type = "success" if status == "探测完成" else "error" if status in {"浏览器未连接", "未找到投递准备"} else "info"
     return redirect_with_notice(return_to, f"投递页面只读演练：{result.get('note') or status}", notice_type)
+
+
+@app.post("/applications/{preparation_id}/browser-fill-note")
+async def fill_application_note_in_browser(preparation_id: int, request: Request) -> RedirectResponse:
+    form = await request.form()
+    return_to = str(form.get("return_to") or "/applications")
+    if not return_to.startswith("/") or return_to.startswith("//"):
+        return_to = "/applications"
+    if str(form.get("confirmation") or "").strip() != "填入投递附言":
+        return redirect_with_notice(return_to, "请在确认框中输入“填入投递附言”后再执行。", "error")
+
+    result = await run_in_threadpool(run_application_browser_note_fill, preparation_id)
+    notice_type = "success" if result.get("status") == "已填入" else "error"
+    return redirect_with_notice(return_to, f"投递附言填入：{result.get('note') or result.get('status')}", notice_type)
 
 
 @app.get("/communications")
@@ -5718,7 +5734,7 @@ def ensure_application_preparation_for_job(conn: Any, job_id: int, *, trigger_ty
 def application_browser_item(conn: Any, preparation_id: int) -> dict[str, Any] | None:
     row = conn.execute(
         """
-        SELECT p.id AS preparation_id, p.status AS preparation_status, p.resume_id,
+        SELECT p.id AS preparation_id, p.status AS preparation_status, p.resume_id, p.application_message,
                j.id AS job_id, j.platform, j.source_url, j.title AS job_title,
                j.company, j.status AS job_status, r.name AS resume_name
         FROM application_preparations p
@@ -5765,6 +5781,50 @@ def run_application_browser_probe(preparation_id: int) -> dict[str, Any]:
                 "browser_clicked": False,
                 "resume_uploaded": False,
                 "model_called": False,
+            },
+        )
+    return result
+
+
+def run_application_browser_note_fill(preparation_id: int) -> dict[str, Any]:
+    with connect() as conn:
+        item = application_browser_item(conn, preparation_id)
+    if not item:
+        return {"status": "未找到投递准备", "note": "没有找到这条投递准备。", "preparation_id": preparation_id}
+
+    message = str(item.get("application_message") or "").strip()
+    if not message:
+        return {"status": "未填入", "note": "请先在投递准备中填写投递附言。", "preparation_id": preparation_id}
+
+    plan = build_application_browser_plan(item)
+    try:
+        result = fill_application_note_in_controlled_edge(plan, message)
+    except ValueError as exc:
+        result = {
+            "status": "未填入",
+            "note": str(exc)[:500],
+            "application_message_filled": False,
+            "browser_clicked": False,
+            "resume_uploaded": False,
+        }
+
+    with connect() as conn:
+        log_agent_action(
+            conn,
+            action_type="application_browser_fill",
+            status=str(result.get("status") or "未知"),
+            summary=str(result.get("note") or "投递附言浏览器填入完成。"),
+            platform=str(item.get("platform") or ""),
+            job_id=int(item["job_id"]),
+            decision={
+                "preparation_id": preparation_id,
+                "application_message_length": len(message),
+                "filled_selector": result.get("filled_selector") or "",
+                "application_message_filled": bool(result.get("application_message_filled")),
+                "browser_clicked": False,
+                "resume_uploaded": False,
+                "model_called": False,
+                "user_confirmation_required": True,
             },
         )
     return result

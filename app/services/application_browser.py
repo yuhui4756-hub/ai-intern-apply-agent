@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from urllib.parse import urlparse
 
@@ -28,6 +29,14 @@ APPLICATION_PLATFORM_STRATEGIES: dict[str, dict[str, object]] = {
             "button:has-text('上传简历')",
             "button:has-text('选择简历')",
         ],
+        "application_note_selectors": [
+            "textarea[placeholder*='自我介绍']",
+            "textarea[placeholder*='附言']",
+            "textarea[placeholder*='留言']",
+            "textarea[name*='cover']",
+            "textarea[aria-label*='自我介绍']",
+            "[contenteditable='true'][aria-label*='自我介绍']",
+        ],
     },
     "猎聘": {
         "domains": ["liepin.com"],
@@ -40,6 +49,14 @@ APPLICATION_PLATFORM_STRATEGIES: dict[str, dict[str, object]] = {
             "input[type='file']",
             "button:has-text('上传简历')",
             "button:has-text('选择简历')",
+        ],
+        "application_note_selectors": [
+            "textarea[placeholder*='自我介绍']",
+            "textarea[placeholder*='附言']",
+            "textarea[placeholder*='留言']",
+            "textarea[name*='cover']",
+            "textarea[aria-label*='自我介绍']",
+            "[contenteditable='true'][aria-label*='自我介绍']",
         ],
     },
     "实习僧": {
@@ -54,6 +71,14 @@ APPLICATION_PLATFORM_STRATEGIES: dict[str, dict[str, object]] = {
             "button:has-text('上传简历')",
             "button:has-text('选择简历')",
         ],
+        "application_note_selectors": [
+            "textarea[placeholder*='自我介绍']",
+            "textarea[placeholder*='附言']",
+            "textarea[placeholder*='留言']",
+            "textarea[name*='cover']",
+            "textarea[aria-label*='自我介绍']",
+            "[contenteditable='true'][aria-label*='自我介绍']",
+        ],
     },
     "智联招聘": {
         "domains": ["zhaopin.com"],
@@ -66,6 +91,14 @@ APPLICATION_PLATFORM_STRATEGIES: dict[str, dict[str, object]] = {
             "input[type='file']",
             "button:has-text('上传简历')",
             "button:has-text('选择简历')",
+        ],
+        "application_note_selectors": [
+            "textarea[placeholder*='自我介绍']",
+            "textarea[placeholder*='附言']",
+            "textarea[placeholder*='留言']",
+            "textarea[name*='cover']",
+            "textarea[aria-label*='自我介绍']",
+            "[contenteditable='true'][aria-label*='自我介绍']",
         ],
     },
     "前程无忧": {
@@ -80,8 +113,29 @@ APPLICATION_PLATFORM_STRATEGIES: dict[str, dict[str, object]] = {
             "button:has-text('上传简历')",
             "button:has-text('选择简历')",
         ],
+        "application_note_selectors": [
+            "textarea[placeholder*='自我介绍']",
+            "textarea[placeholder*='附言']",
+            "textarea[placeholder*='留言']",
+            "textarea[name*='cover']",
+            "textarea[aria-label*='自我介绍']",
+            "[contenteditable='true'][aria-label*='自我介绍']",
+        ],
     },
 }
+
+APPLICATION_FILL_BLOCKING_SIGNALS = (
+    "验证码",
+    "人脸识别",
+    "身份证",
+    "银行卡",
+    "培训费",
+    "押金",
+    "贷款",
+    "付费",
+    "支付",
+    "收费",
+)
 
 
 def build_application_browser_plan(item: dict[str, object]) -> dict[str, object]:
@@ -94,6 +148,7 @@ def build_application_browser_plan(item: dict[str, object]) -> dict[str, object]
         "source_url": str(item.get("source_url") or ""),
         "resume_id": item.get("resume_id"),
         "resume_name": str(item.get("resume_name") or ""),
+        "application_message_length": len(str(item.get("application_message") or "").strip()),
         "browser_filled": False,
         "browser_clicked": False,
         "resume_uploaded": False,
@@ -120,7 +175,7 @@ def build_application_browser_plan(item: dict[str, object]) -> dict[str, object]
     return {
         **base,
         "browser_action": "dry_run_ready",
-        "reason": "已生成只读投递页探测策略，当前版本不会填写、上传或点击。",
+        "reason": "已生成投递页探测策略；投递附言需用户明确确认后才允许填入，当前不会上传、点击或提交。",
         "page_match": {
             "domains": strategy["domains"],
             "source_url_host": url_host(base["source_url"]),
@@ -128,17 +183,19 @@ def build_application_browser_plan(item: dict[str, object]) -> dict[str, object]
         "selector_candidates": {
             "application_button": strategy["application_button_selectors"],
             "resume_control": strategy["resume_control_selectors"],
+            "application_note": strategy["application_note_selectors"],
         },
         "dry_run_steps": [
             "连接应用打开的专用 Edge，并读取当前已打开页面的可见结构。",
             "以平台域名、公司名和岗位名称确认页面身份。",
-            "统计投递按钮和简历控件候选，不读取或保存页面正文。",
+            "统计投递按钮、简历控件和投递附言输入框候选，不读取或保存页面正文。",
             "不填写字段、不上传简历、不点击投递按钮。",
         ],
         "safety_checks": [
             "岗位、公司或平台不匹配时停止。",
             "页面出现验证码、身份信息、付费或风险提示时停止并转人工。",
-            "真实填写和点击投递需要后续独立的用户确认流程。",
+            "附言填入需要用户输入确认短语，并且只允许唯一可填写字段。",
+            "不会上传简历、点击投递或提交表单。",
         ],
     }
 
@@ -299,8 +356,133 @@ def score_application_page(plan: dict[str, object], snapshot: dict[str, object])
         "job_title_match": job_title_match,
         "application_button_count": application_button_count,
         "resume_control_count": resume_control_count,
+        "application_note_control_count": selector_count(snapshot, selectors.get("application_note")),
         "page_match_score": score,
     }
+
+
+def fill_application_note_in_controlled_edge(
+    plan: dict[str, object],
+    application_message: str,
+    *,
+    browser_channel: str = "msedge",
+) -> dict[str, object]:
+    """Fill one verified application-note field without uploading or submitting."""
+    if plan.get("browser_action") != "dry_run_ready":
+        raise ValueError(str(plan.get("reason") or "当前岗位不能进入投递附言填入流程。"))
+    message = str(application_message or "").strip()
+    if not message:
+        raise ValueError("投递附言为空，不能填入浏览器。")
+    if normalize_browser_channel(browser_channel) != "msedge":
+        raise ValueError("当前投递附言填入先支持 Microsoft Edge。")
+
+    try:
+        target, probe = find_unique_verified_application_target(plan)
+        action_result = evaluate_cdp_expression(target, fill_application_note_expression(plan, message))
+        selector = require_application_action_selector(action_result, action="填入投递附言")
+        return {
+            "status": "已填入",
+            "note": "已填入当前 Edge 的投递附言，未上传简历、未点击投递或提交。",
+            "filled_selector": selector,
+            "matched_page": probe,
+            "application_message_filled": True,
+            "browser_clicked": False,
+            "resume_uploaded": False,
+            "application_message_saved": False,
+        }
+    except ValueError:
+        raise
+    except Exception as exc:
+        detail = str(exc).strip() or exc.__class__.__name__
+        raise ValueError(f"无法填入当前 Edge 的投递附言：{detail[:180]}。") from exc
+
+
+def find_unique_verified_application_target(plan: dict[str, object]) -> tuple[dict, dict[str, object]]:
+    if not wait_for_debug_endpoint(timeout_seconds=3):
+        raise ValueError("没有检测到应用打开的 Edge 调试窗口，请先打开岗位页并完成只读演练。")
+
+    candidates: list[tuple[dict, dict[str, object]]] = []
+    for target in read_controlled_edge_targets():
+        if not target_url(target).startswith(("http://", "https://")):
+            continue
+        try:
+            snapshot = capture_application_target_snapshot(target, plan)
+        except Exception:
+            continue
+        if application_fill_blocking_signals(snapshot):
+            continue
+        probe = score_application_page(plan, snapshot)
+        identity_ok = bool(
+            probe["domain_match"]
+            and (probe["company_match"] or probe["job_title_match"] or probe["source_host_match"])
+        )
+        if identity_ok and int(probe["application_note_control_count"] or 0) > 0:
+            candidates.append((target, probe))
+
+    if not candidates:
+        raise ValueError("未找到身份匹配且有投递附言输入框的安全页面；请先在受控 Edge 手动打开投递弹窗后重试。")
+    if len(candidates) != 1:
+        raise ValueError("找到多个可填写的投递页面，已停止操作；请只保留当前岗位页面后重试。")
+    return candidates[0]
+
+
+def application_fill_blocking_signals(snapshot: dict[str, object]) -> list[str]:
+    text = str(snapshot.get("normalized_text") or "")
+    return [signal for signal in APPLICATION_FILL_BLOCKING_SIGNALS if normalize_text(signal) in text]
+
+
+def require_application_action_selector(result: object, *, action: str) -> str:
+    if not isinstance(result, dict) or not result.get("ok"):
+        reason = str(result.get("reason") or "页面未找到唯一可填写附言控件。") if isinstance(result, dict) else "页面没有返回动作结果。"
+        raise ValueError(f"{action}失败：{reason}")
+    selector = str(result.get("selector") or "")
+    if not selector:
+        raise ValueError(f"{action}失败：页面没有返回实际控件。")
+    return selector
+
+
+def fill_application_note_expression(plan: dict[str, object], application_message: str) -> str:
+    selector_payload = json.dumps(application_note_selectors(plan), ensure_ascii=False)
+    message_payload = json.dumps(application_message, ensure_ascii=False)
+    return f"""(() => {{
+        const selectors = {selector_payload};
+        const message = {message_payload};
+        const visible = element => {{
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+        }};
+        const editableNote = element =>
+            (element instanceof HTMLTextAreaElement && !element.disabled && !element.readOnly)
+            || element.isContentEditable;
+        const fields = new Map();
+        for (const selector of selectors) {{
+            try {{
+                for (const element of document.querySelectorAll(selector)) {{
+                    if (visible(element) && editableNote(element) && !fields.has(element)) fields.set(element, selector);
+                }}
+            }} catch (_error) {{}}
+        }}
+        if (fields.size !== 1) return {{ok: false, reason: fields.size ? '找到多个可填写投递附言输入框，已停止填入。' : '未找到唯一可填写投递附言输入框。'}};
+        const [[field, selector]] = fields.entries();
+        field.focus();
+        if (field instanceof HTMLTextAreaElement) {{
+            const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+            if (setter) setter.call(field, message);
+            else field.value = message;
+        }} else {{
+            field.textContent = message;
+        }}
+        field.dispatchEvent(new InputEvent('input', {{bubbles: true, inputType: 'insertText', data: message}}));
+        field.dispatchEvent(new Event('change', {{bubbles: true}}));
+        return {{ok: true, selector}};
+    }})()"""
+
+
+def application_note_selectors(plan: dict[str, object]) -> list[str]:
+    candidates = plan.get("selector_candidates")
+    values = candidates.get("application_note") if isinstance(candidates, dict) else []
+    return [str(selector) for selector in values if str(selector).strip()] if isinstance(values, list) else []
 
 
 def job_title_tokens(title: str) -> list[str]:

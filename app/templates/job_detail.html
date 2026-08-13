@@ -97,6 +97,9 @@
     <label>确认前备注
       <textarea name="user_note" rows="3" placeholder="例如：需要先确认到岗时间或补充项目描述">{{ application_preparation.user_note }}</textarea>
     </label>
+    <label>投递附言（可选）
+      <textarea name="application_message" rows="4" placeholder="仅在平台弹出附言/自我介绍输入框时使用；内容由你自行确认">{{ application_preparation.application_message }}</textarea>
+    </label>
     <input type="hidden" name="return_to" value="job">
     <div class="form-actions">
       <span class="badge">{{ application_preparation.status }}</span>
