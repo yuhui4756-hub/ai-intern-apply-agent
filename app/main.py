@@ -205,6 +205,7 @@ def action_type_label(value: str) -> str:
         "job_rescore": "本地重新评分",
         "demo_draft_created": "演练草稿",
         "interview_prep_auto_create": "面试准备",
+        "interview_prep_enhance": "智能面试准备",
         "interview_feedback_update": "面试反馈",
         "interview_practice": "模拟面试",
         "interview_recording": "面试录音",
@@ -5547,6 +5548,234 @@ def interview_feedback_context(conn: Any, job_id: int | None, limit: int = 8) ->
     return "\n".join(lines)
 
 
+def compact_interview_items(value: object, *, limit: int, item_limit: int = 300) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    items: list[str] = []
+    for raw in value:
+        item = str(raw or "").strip()
+        if item and item not in items:
+            items.append(item[:item_limit])
+        if len(items) >= limit:
+            break
+    return items
+
+
+def redact_interview_llm_text(value: str, limit: int) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "[邮箱已省略]", text)
+    text = re.sub(r"(?<!\d)(?:1[3-9]\d{9}|\+?86[-\s]?)?(?:1[3-9]\d{9})(?!\d)", "[手机号已省略]", text)
+    return text[:limit]
+
+
+def interview_candidate_context(conn: Any, job: dict[str, Any] | None) -> dict[str, Any]:
+    profile_row = conn.execute("SELECT * FROM candidate_profile ORDER BY id LIMIT 1").fetchone()
+    profile = {key: profile_row[key] for key in profile_row.keys()} if profile_row else {}
+    job_id = int(job["id"]) if job and job.get("id") else None
+    selected_resume_id = int(job["selected_resume_id"]) if job and job.get("selected_resume_id") else None
+    preparation_resume = None
+    if job_id:
+        preparation_resume = conn.execute(
+            """
+            SELECT r.*
+            FROM application_preparations p
+            JOIN resume_versions r ON r.id = p.resume_id
+            WHERE p.job_id = ? AND p.resume_id IS NOT NULL
+            ORDER BY CASE p.status WHEN '已确认' THEN 0 ELSE 1 END, p.updated_at DESC, p.id DESC
+            LIMIT 1
+            """,
+            (job_id,),
+        ).fetchone()
+    if preparation_resume:
+        resume = {key: preparation_resume[key] for key in preparation_resume.keys()}
+    elif selected_resume_id:
+        resume_row = conn.execute("SELECT * FROM resume_versions WHERE id = ?", (selected_resume_id,)).fetchone()
+        resume = {key: resume_row[key] for key in resume_row.keys()} if resume_row else {}
+    else:
+        resume = {}
+
+    projects: list[dict[str, Any]] = []
+    for raw_project in loads(profile.get("projects_json"), []):
+        if not isinstance(raw_project, dict):
+            continue
+        name = str(raw_project.get("name") or "").strip()[:160]
+        highlights = compact_interview_items(raw_project.get("highlights"), limit=5, item_limit=240)
+        if name or highlights:
+            projects.append({"name": name, "highlights": highlights})
+        if len(projects) >= 6:
+            break
+
+    return {
+        "education": str(profile.get("education") or "").strip()[:300],
+        "target_roles": compact_interview_items(loads(profile.get("target_roles"), []), limit=8, item_limit=100),
+        "skills": compact_interview_items(loads(profile.get("skills_json"), []), limit=30, item_limit=80),
+        "projects": projects,
+        "resume_version": str(resume.get("name") or "").strip()[:160],
+        "resume_target_role": str(resume.get("target_role") or "").strip()[:160],
+        "resume_evidence": redact_interview_llm_text(str(resume.get("parsed_text") or ""), 6000),
+    }
+
+
+def normalized_interview_job_context(job: dict[str, Any] | None) -> dict[str, Any]:
+    if not job:
+        return {}
+    extracted = job.get("extracted") if isinstance(job.get("extracted"), dict) else {}
+    return {
+        "title": str(job.get("title") or extracted.get("title") or "").strip()[:240],
+        "company": str(job.get("company") or extracted.get("company") or "").strip()[:240],
+        "city": str(job.get("city") or extracted.get("city") or "").strip()[:120],
+        "required_skills": compact_interview_items(extracted.get("required_skills"), limit=30, item_limit=100),
+        "bonus_skills": compact_interview_items(extracted.get("bonus_skills"), limit=20, item_limit=100),
+        "responsibilities": compact_interview_items(extracted.get("responsibilities"), limit=15, item_limit=300),
+        "requirements": compact_interview_items(extracted.get("requirements"), limit=15, item_limit=300),
+        "jd_text": redact_interview_llm_text(strip_platform_safety_notice(str(job.get("jd_text") or "")), 12000),
+    }
+
+
+def interview_prep_fallback(review: dict[str, Any], job: dict[str, Any] | None, feedback_context: str) -> dict[str, Any]:
+    generated = build_interview_review(job, "\n\n".join(item for item in [str(review.get("source_text") or "").strip(), feedback_context] if item))
+    saved_plan = loads(review.get("prep_plan_json"), {})
+    saved_questions = loads(review.get("question_bank_json"), [])
+    three_day_plan = compact_interview_items(saved_plan.get("three_day_plan") if isinstance(saved_plan, dict) else [], limit=5)
+    seven_day_plan = compact_interview_items(saved_plan.get("seven_day_plan") if isinstance(saved_plan, dict) else [], limit=10)
+    questions = compact_interview_items(saved_questions, limit=15, item_limit=400)
+    return {
+        "plan": {
+            "title": str((saved_plan if isinstance(saved_plan, dict) else {}).get("title") or generated["plan"]["title"]),
+            "three_day_plan": three_day_plan or generated["plan"]["three_day_plan"],
+            "seven_day_plan": seven_day_plan or generated["plan"]["seven_day_plan"],
+        },
+        "questions": questions or generated["questions"],
+        "markdown": str(review.get("review_markdown") or generated["markdown"]).strip(),
+    }
+
+
+def normalize_interview_prep_generation(result: object, fallback: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(result, dict):
+        raise ValueError("模型没有返回 JSON 对象。")
+    plan_source = result.get("plan") if isinstance(result.get("plan"), dict) else result
+    three_day_plan = compact_interview_items(plan_source.get("three_day_plan"), limit=5)
+    seven_day_plan = compact_interview_items(plan_source.get("seven_day_plan"), limit=10)
+    questions = compact_interview_items(result.get("questions"), limit=15, item_limit=400)
+    markdown = str(result.get("markdown") or result.get("review_markdown") or "").strip()[:16000]
+    model_fields = [
+        name
+        for name, value in {
+            "three_day_plan": three_day_plan,
+            "seven_day_plan": seven_day_plan,
+            "questions": questions,
+            "markdown": markdown,
+        }.items()
+        if value
+    ]
+    if not model_fields:
+        raise ValueError("模型没有返回可用的面试准备内容。")
+    fallback_plan = fallback["plan"]
+    return {
+        "plan": {
+            "title": str(plan_source.get("title") or fallback_plan["title"]).strip()[:240],
+            "three_day_plan": three_day_plan or fallback_plan["three_day_plan"],
+            "seven_day_plan": seven_day_plan or fallback_plan["seven_day_plan"],
+        },
+        "questions": questions or fallback["questions"],
+        "markdown": markdown or fallback["markdown"],
+        "model_fields": model_fields,
+    }
+
+
+def run_interview_preparation_enhancement(review_id: int) -> dict[str, Any]:
+    with connect() as conn:
+        review_row = conn.execute("SELECT * FROM interview_preparations WHERE id = ?", (review_id,)).fetchone()
+        if not review_row:
+            return {"status": "未找到", "note": "没有找到这条面试准备记录。"}
+        review = {key: review_row[key] for key in review_row.keys()}
+        job_row = conn.execute("SELECT * FROM job_postings WHERE id = ?", (review["job_id"],)).fetchone() if review.get("job_id") else None
+        job = parse_json_fields({key: job_row[key] for key in job_row.keys()}) if job_row else None
+        feedback_context = interview_feedback_context(conn, int(review["job_id"]) if review.get("job_id") else None)
+        candidate = interview_candidate_context(conn, job)
+        fallback = interview_prep_fallback(review, job, feedback_context)
+
+    client = client_for_task("interview_prep")
+    if not client or not client.configured:
+        result = {
+            "status": "未配置",
+            "note": "请先在设置中为“面试准备”配置可用模型，再生成智能强化准备。",
+            "model_called": False,
+        }
+    else:
+        payload = {
+            "job": normalized_interview_job_context(job),
+            "candidate": candidate,
+            "interview_context": {
+                "source_text": redact_interview_llm_text(str(review.get("source_text") or ""), 12000),
+                "unresolved_feedback": redact_interview_llm_text(feedback_context, 4000),
+                "existing_questions": fallback["questions"],
+            },
+        }
+        prompt = (
+            "你是 AI 应用开发实习的面试教练。根据岗位 JD、候选人明确提供的技能/项目事实和历史薄弱点，"
+            "生成有针对性的中文面试准备。不得编造候选人经历、公司业务、技术指标或掌握程度；"
+            "候选人资料未覆盖的技术只能标为待学习或待确认。"
+            "只输出 JSON：three_day_plan(3-5 条数组)、seven_day_plan(5-7 条数组)、"
+            "questions(8-15 条问题数组)、markdown(包含岗位重点、项目表达、模拟题和复习安排的 Markdown)。"
+            "问题要覆盖 JD 技术栈、项目追问、工程实践和行为面试，优先历史薄弱点。"
+        )
+        try:
+            generated = client.complete_json(
+                [
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": dumps(payload)},
+                ]
+            )
+            result = {
+                "status": "已增强",
+                "note": "已基于岗位、候选人事实和薄弱点更新本地面试准备。",
+                "content": normalize_interview_prep_generation(generated, fallback),
+                "model_called": True,
+            }
+        except Exception as exc:
+            if hasattr(client, "log_error"):
+                client.log_error(str(exc))
+            result = {
+                "status": "未增强",
+                "note": f"智能面试准备生成失败：{str(exc)[:240]}",
+                "model_called": True,
+            }
+
+    with connect() as conn:
+        current = conn.execute("SELECT job_id FROM interview_preparations WHERE id = ?", (review_id,)).fetchone()
+        if not current:
+            return {"status": "未找到", "note": "面试准备已不存在，未写入生成结果。"}
+        job_id = int(current["job_id"]) if current["job_id"] else None
+        if result.get("content"):
+            content = result["content"]
+            conn.execute(
+                """
+                UPDATE interview_preparations
+                SET prep_plan_json = ?, question_bank_json = ?, review_markdown = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (dumps(content["plan"]), dumps(content["questions"]), content["markdown"], utc_now(), review_id),
+            )
+        log_agent_action(
+            conn,
+            action_type="interview_prep_enhance",
+            status=str(result["status"]),
+            summary=str(result["note"]),
+            platform=str((job or {}).get("platform") or ""),
+            job_id=job_id,
+            decision={
+                "review_id": review_id,
+                "model_called": bool(result.get("model_called")),
+                "updated": bool(result.get("content")),
+                "model_fields": list((result.get("content") or {}).get("model_fields") or []),
+                "user_triggered": True,
+                "input_redacted": True,
+            },
+        )
+    return result
+
+
 def practice_question_key(question: str) -> str:
     return re.sub(r"\s+", "", question or "").lower()
 
@@ -6236,6 +6465,13 @@ def interview_detail(review_id: int, request: Request) -> Any:
             "notice_type": request.query_params.get("notice_type", "info"),
         },
     )
+
+
+@app.post("/interviews/{review_id}/enhance")
+async def enhance_interview_preparation(review_id: int) -> RedirectResponse:
+    result = await run_in_threadpool(run_interview_preparation_enhancement, review_id)
+    notice_type = "success" if result.get("status") == "已增强" else "error"
+    return redirect_with_notice(f"/interviews/{review_id}", str(result.get("note") or result.get("status")), notice_type)
 
 
 @app.get("/interviews/{review_id}/practice")

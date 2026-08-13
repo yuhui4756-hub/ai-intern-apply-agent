@@ -8,6 +8,9 @@
   </div>
   <div class="form-actions">
     <a class="button primary" href="/interviews/{{ review.id }}/practice">开始模拟面试</a>
+    <form method="post" action="/interviews/{{ review.id }}/enhance">
+      <button class="button" type="submit">智能强化准备</button>
+    </form>
     <a class="button" href="/interviews/{{ review.id }}/download">下载 Markdown</a>
     <a class="button" href="/interviews/{{ review.id }}/download.pdf">下载 PDF</a>
   </div>
@@ -16,6 +19,10 @@
 {% if notice %}
 <section class="notice {{ notice_type }}">{{ notice }}</section>
 {% endif %}
+
+<section class="panel compact-panel">
+  <p class="muted">智能强化准备会按“面试准备”模型路由，结合岗位 JD、候选人已填写的技能/项目和待练习薄弱点更新本地材料。仅在你点击后调用模型。</p>
+</section>
 
 <section class="grid-two">
   <div class="panel">
