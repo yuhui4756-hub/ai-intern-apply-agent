@@ -66,6 +66,103 @@ def test_browser_patrol_excludes_shixiseng_when_pc_messages_are_read_only(monkey
     assert not called
 
 
+def test_unread_scan_reads_only_boss_and_liepin_message_list_counts(monkeypatch):
+    targets = [
+        {
+            "id": "boss-messages",
+            "type": "page",
+            "url": "https://www.zhipin.com/web/geek/chat",
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/boss-messages",
+        },
+        {
+            "id": "liepin-messages",
+            "type": "page",
+            "url": "https://c.liepin.com/im/chat",
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/liepin-messages",
+        },
+        {
+            "id": "shixiseng-messages",
+            "type": "page",
+            "url": "https://www.shixiseng.com/message",
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/shixiseng-messages",
+        },
+    ]
+    expressions = []
+
+    monkeypatch.setattr(browser_patrol, "wait_for_debug_endpoint", lambda **_kwargs: True)
+    monkeypatch.setattr(browser_patrol, "read_controlled_edge_targets", lambda: targets)
+    monkeypatch.setattr(
+        browser_patrol,
+        "evaluate_cdp_expression",
+        lambda target, expression: expressions.append((target["id"], expression))
+        or (
+            {
+                "message_list_candidate": True,
+                "message_row_count": 4,
+                "unread_count": 2,
+                "unread_badge_count": 2,
+                "signal_types": ["badge", "unread"],
+            }
+            if target["id"] == "boss-messages"
+            else {
+                "message_list_candidate": True,
+                "message_row_count": 3,
+                "unread_count": 0,
+                "unread_badge_count": 0,
+                "signal_types": [],
+            }
+        ),
+    )
+
+    result = browser_patrol.scan_controlled_edge_unread_conversations()
+
+    assert result["status"] == "发现未读"
+    assert result["checked_page_count"] == 2
+    assert result["message_list_page_count"] == 2
+    assert result["unread_count"] == 2
+    assert result["results"][0] == {
+        "platform": "Boss 直聘",
+        "status": "发现未读",
+        "message_list_candidate": True,
+        "message_row_count": 4,
+        "unread_count": 2,
+        "unread_badge_count": 2,
+        "signal_types": ["badge", "unread"],
+    }
+    assert [item[0] for item in expressions] == ["boss-messages", "liepin-messages"]
+    assert all("click(" not in item[1] for item in expressions)
+    assert all("location.href" not in item[1] for item in expressions)
+    assert all("innerText" not in item[1] for item in expressions)
+
+
+def test_unread_scan_does_not_count_markers_without_a_message_list(monkeypatch):
+    target = {
+        "id": "boss-job",
+        "type": "page",
+        "url": "https://www.zhipin.com/web/geek/job",
+        "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/boss-job",
+    }
+    monkeypatch.setattr(browser_patrol, "wait_for_debug_endpoint", lambda **_kwargs: True)
+    monkeypatch.setattr(browser_patrol, "read_controlled_edge_targets", lambda: [target])
+    monkeypatch.setattr(
+        browser_patrol,
+        "evaluate_cdp_expression",
+        lambda *_args: {
+            "message_list_candidate": False,
+            "message_row_count": 0,
+            "unread_count": 8,
+            "unread_badge_count": 8,
+            "signal_types": ["badge"],
+        },
+    )
+
+    result = browser_patrol.scan_controlled_edge_unread_conversations()
+
+    assert result["status"] == "未识别消息列表"
+    assert result["unread_count"] == 0
+    assert result["results"][0]["unread_badge_count"] == 0
+
+
 def test_application_probe_reads_cdp_snapshot_and_selector_counts(monkeypatch):
     target = {
         "id": "job-page",

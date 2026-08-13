@@ -30,7 +30,11 @@ from .services.analyzer import (
     score_job,
     strip_platform_safety_notice,
 )
-from .services.browser_patrol import capture_browser_patrol_observations, open_message_patrol_browser
+from .services.browser_patrol import (
+    capture_browser_patrol_observations,
+    open_message_patrol_browser,
+    scan_controlled_edge_unread_conversations,
+)
 from .services.application_browser import build_application_browser_plan, fill_application_note_in_controlled_edge, probe_application_browser_plan
 from .services.communication_browser import (
     build_browser_send_adapter_plan,
@@ -197,6 +201,7 @@ def action_type_label(value: str) -> str:
         "communication_browser_dry_run": "浏览器发送演练",
         "communication_browser_probe": "浏览器页面探测",
         "communication_browser_calibration": "聊天页结构校准",
+        "unread_conversation_scan": "未读会话只读扫描",
         "communication_browser_fill": "浏览器填入草稿",
         "communication_autonomous_send": "自主沟通发送",
         "communication_autonomous_executor": "自主沟通执行",
@@ -2575,6 +2580,79 @@ def run_controlled_edge_chat_page_calibration(trigger_type: str = "manual_browse
     return result
 
 
+def run_unread_conversation_scan(trigger_type: str = "manual_browser") -> dict[str, Any]:
+    try:
+        result = scan_controlled_edge_unread_conversations()
+    except ValueError as exc:
+        result = {
+            "status": "浏览器未连接",
+            "note": str(exc)[:500],
+            "checked_page_count": 0,
+            "message_list_page_count": 0,
+            "unread_count": 0,
+            "error_count": 0,
+            "detector_version": "message-list-v1",
+            "results": [],
+            "page_text_saved": False,
+            "page_url_saved": False,
+            "page_title_saved": False,
+            "conversation_opened": False,
+            "browser_clicked": False,
+            "message_filled": False,
+            "message_sent": False,
+        }
+    with connect() as conn:
+        now = utc_now()
+        for item in result.get("results", []):
+            if not isinstance(item, dict):
+                continue
+            conn.execute(
+                """
+                INSERT INTO unread_conversation_scans (
+                    platform, status, trigger_type, checked_page_count, message_list_page_count,
+                    unread_count, unread_badge_count, signal_types_json, detector_version, note, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(item.get("platform") or ""),
+                    str(item.get("status") or ""),
+                    trigger_type,
+                    1,
+                    1 if item.get("message_list_candidate") else 0,
+                    int(item.get("unread_count") or 0),
+                    int(item.get("unread_badge_count") or 0),
+                    dumps(item.get("signal_types") or []),
+                    str(result.get("detector_version") or "message-list-v1"),
+                    "只读结构扫描；未读取或保存会话正文、名称、标题、链接。",
+                    now,
+                ),
+            )
+        log_agent_action(
+            conn,
+            action_type="unread_conversation_scan",
+            status=str(result["status"]),
+            summary=str(result["note"]),
+            decision={
+                "trigger_type": trigger_type,
+                "checked_page_count": int(result.get("checked_page_count") or 0),
+                "message_list_page_count": int(result.get("message_list_page_count") or 0),
+                "unread_count": int(result.get("unread_count") or 0),
+                "error_count": int(result.get("error_count") or 0),
+                "detector_version": str(result.get("detector_version") or ""),
+                "results": result.get("results", []),
+                "page_text_saved": False,
+                "page_url_saved": False,
+                "page_title_saved": False,
+                "conversation_opened": False,
+                "browser_clicked": False,
+                "message_filled": False,
+                "message_sent": False,
+                "model_called": False,
+            },
+        )
+    return result
+
+
 def run_communication_browser_fill(draft_id: int, message: str) -> dict[str, Any]:
     message = str(message or "").strip()
     policy = communication_policy()
@@ -4878,6 +4956,15 @@ def communications_page(request: Request) -> Any:
             LIMIT 40
             """
         ).fetchall()
+        unread_scans = conn.execute(
+            """
+            SELECT platform, status, trigger_type, unread_count, unread_badge_count,
+                   signal_types_json, detector_version, created_at
+            FROM unread_conversation_scans
+            ORDER BY created_at DESC, id DESC
+            LIMIT 20
+            """
+        ).fetchall()
         executor_status = communication_executor_page_status(conn)
     return templates.TemplateResponse(
         request,
@@ -4896,6 +4983,7 @@ def communications_page(request: Request) -> Any:
             "communication_mode_label": communication_mode_label,
             "action_logs": [{key: row[key] for key in row.keys()} for row in action_logs],
             "patrol_runs": [{key: row[key] for key in row.keys()} for row in patrol_runs],
+            "unread_scans": [{key: row[key] for key in row.keys()} for row in unread_scans],
             "action_type_label": action_type_label,
             "loads": loads,
             "notice": request.query_params.get("notice", ""),
@@ -5042,6 +5130,17 @@ async def communication_browser_calibration_dry_run_route(request: Request) -> R
     result = await run_in_threadpool(run_controlled_edge_chat_page_calibration, "manual_browser")
     notice_type = "success" if result["status"] in {"校准完成", "未发现招聘平台页面"} else "error"
     return redirect_with_notice(return_to, f"聊天页结构校准：{result['note']}", notice_type)
+
+
+@app.post("/message-patrol/unread-scan")
+async def trigger_unread_conversation_scan(request: Request) -> RedirectResponse:
+    form = await request.form()
+    return_to = str(form.get("return_to") or "/communications")
+    if not return_to.startswith("/") or return_to.startswith("//"):
+        return_to = "/communications"
+    result = await run_in_threadpool(run_unread_conversation_scan, "manual_browser")
+    notice_type = "success" if result["status"] in {"发现未读", "无未读", "未识别消息列表", "未发现可巡检页面"} else "error"
+    return redirect_with_notice(return_to, f"未读会话只读扫描：{result['status']}。{result['note']}", notice_type)
 
 
 @app.post("/conversation-captures/{capture_id}/feedback")

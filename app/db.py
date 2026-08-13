@@ -374,6 +374,21 @@ def init_db() -> None:
                 FOREIGN KEY(capture_id) REFERENCES conversation_captures(id) ON DELETE SET NULL
             );
 
+            CREATE TABLE IF NOT EXISTS unread_conversation_scans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                platform TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT '',
+                trigger_type TEXT NOT NULL DEFAULT '',
+                checked_page_count INTEGER NOT NULL DEFAULT 0,
+                message_list_page_count INTEGER NOT NULL DEFAULT 0,
+                unread_count INTEGER NOT NULL DEFAULT 0,
+                unread_badge_count INTEGER NOT NULL DEFAULT 0,
+                signal_types_json TEXT NOT NULL DEFAULT '[]',
+                detector_version TEXT NOT NULL DEFAULT '',
+                note TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS app_settings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 key TEXT NOT NULL UNIQUE,
