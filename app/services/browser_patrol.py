@@ -35,7 +35,8 @@ RECRUITMENT_DOMAINS = {
     "zhaopin.com": "智联招聘",
     "51job.com": "前程无忧",
 }
-PC_MESSAGE_AUTOMATION_PLATFORMS = {"Boss 直聘", "猎聘", "实习僧"}
+# 实习僧 PC 端仅可查看消息，不能可靠回复；巡检仅覆盖可双向沟通的平台。
+PC_MESSAGE_AUTOMATION_PLATFORMS = {"Boss 直聘", "猎聘"}
 
 
 def open_message_patrol_browser(start_url: str = "") -> str:

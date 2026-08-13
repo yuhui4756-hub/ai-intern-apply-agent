@@ -112,7 +112,9 @@ RECRUITMENT_PLATFORM_DOMAINS = {
     "前程无忧": ("51job.com",),
 }
 
-PC_MESSAGE_AUTOMATION_PLATFORMS = frozenset(PLATFORM_STRATEGIES)
+# 实习僧的 PC 端消息窗目前只能查看，不能可靠地输入或发送。保留它的
+# 页面识别与岗位能力，但不让任何 PC 沟通自动化路径进入该平台。
+PC_MESSAGE_AUTOMATION_PLATFORMS = frozenset({"Boss 直聘", "猎聘"})
 
 # Static resume controls are common in legitimate chat UIs. Conversation content
 # asking for a resume is still routed to a human by the separate send gate.
@@ -146,6 +148,9 @@ def calibrate_controlled_edge_chat_pages(
             continue
         platform = recruitment_platform_for_url(url)
         if not platform:
+            continue
+        if not is_pc_message_automation_platform(platform):
+            results.append(unsupported_platform_calibration_result(platform))
             continue
         strategy = PLATFORM_STRATEGIES.get(platform)
         if not strategy:

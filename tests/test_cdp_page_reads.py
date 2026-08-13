@@ -49,6 +49,23 @@ def test_browser_patrol_excludes_zhaopin_without_pc_message_automation(monkeypat
     assert not called
 
 
+def test_browser_patrol_excludes_shixiseng_when_pc_messages_are_read_only(monkeypatch):
+    target = {
+        "id": "shixiseng-page",
+        "type": "page",
+        "url": "https://www.shixiseng.com/message",
+        "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/shixiseng-page",
+    }
+    called = []
+
+    monkeypatch.setattr(browser_patrol, "wait_for_debug_endpoint", lambda **_kwargs: True)
+    monkeypatch.setattr(browser_patrol, "read_controlled_edge_targets", lambda: [target])
+    monkeypatch.setattr(browser_patrol, "evaluate_cdp_expression", lambda *_args: called.append(True))
+
+    assert browser_patrol.capture_browser_patrol_observations() == []
+    assert not called
+
+
 def test_application_probe_reads_cdp_snapshot_and_selector_counts(monkeypatch):
     target = {
         "id": "job-page",
@@ -274,6 +291,27 @@ def test_chat_page_calibration_marks_zhaopin_as_pc_message_automation_unavailabl
 
     assert result["unsupported_count"] == 1
     assert result["results"][0]["platform"] == "智联招聘"
+    assert result["results"][0]["status"] == "PC 消息自动化未启用"
+    assert not called
+
+
+def test_chat_page_calibration_marks_shixiseng_as_pc_message_automation_unavailable(monkeypatch):
+    target = {
+        "id": "shixiseng-page",
+        "type": "page",
+        "url": "https://www.shixiseng.com/message",
+        "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/shixiseng-page",
+    }
+    called = []
+
+    monkeypatch.setattr(communication_browser, "wait_for_debug_endpoint", lambda **_kwargs: True)
+    monkeypatch.setattr(communication_browser, "read_controlled_edge_targets", lambda: [target])
+    monkeypatch.setattr(communication_browser, "evaluate_cdp_expression", lambda *_args: called.append(True))
+
+    result = communication_browser.calibrate_controlled_edge_chat_pages()
+
+    assert result["unsupported_count"] == 1
+    assert result["results"][0]["platform"] == "实习僧"
     assert result["results"][0]["status"] == "PC 消息自动化未启用"
     assert not called
 
