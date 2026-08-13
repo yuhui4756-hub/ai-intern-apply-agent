@@ -203,6 +203,7 @@ def action_type_label(value: str) -> str:
         "job_discovery": "岗位发现",
         "job_candidate_feedback": "候选校准",
         "job_rescore": "本地重新评分",
+        "job_match_review": "岗位深度复核",
         "demo_draft_created": "演练草稿",
         "interview_prep_auto_create": "面试准备",
         "interview_prep_enhance": "智能面试准备",
@@ -5663,14 +5664,14 @@ def compact_interview_items(value: object, *, limit: int, item_limit: int = 300)
     return items
 
 
-def redact_interview_llm_text(value: str, limit: int) -> str:
+def redact_llm_text(value: str, limit: int) -> str:
     text = str(value or "").strip()
     text = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "[邮箱已省略]", text)
     text = re.sub(r"(?<!\d)(?:1[3-9]\d{9}|\+?86[-\s]?)?(?:1[3-9]\d{9})(?!\d)", "[手机号已省略]", text)
     return text[:limit]
 
 
-def interview_candidate_context(conn: Any, job: dict[str, Any] | None) -> dict[str, Any]:
+def candidate_context_for_job(conn: Any, job: dict[str, Any] | None) -> dict[str, Any]:
     profile_row = conn.execute("SELECT * FROM candidate_profile ORDER BY id LIMIT 1").fetchone()
     profile = {key: profile_row[key] for key in profile_row.keys()} if profile_row else {}
     job_id = int(job["id"]) if job and job.get("id") else None
@@ -5714,7 +5715,7 @@ def interview_candidate_context(conn: Any, job: dict[str, Any] | None) -> dict[s
         "projects": projects,
         "resume_version": str(resume.get("name") or "").strip()[:160],
         "resume_target_role": str(resume.get("target_role") or "").strip()[:160],
-        "resume_evidence": redact_interview_llm_text(str(resume.get("parsed_text") or ""), 6000),
+        "resume_evidence": redact_llm_text(str(resume.get("parsed_text") or ""), 6000),
     }
 
 
@@ -5730,7 +5731,7 @@ def normalized_interview_job_context(job: dict[str, Any] | None) -> dict[str, An
         "bonus_skills": compact_interview_items(extracted.get("bonus_skills"), limit=20, item_limit=100),
         "responsibilities": compact_interview_items(extracted.get("responsibilities"), limit=15, item_limit=300),
         "requirements": compact_interview_items(extracted.get("requirements"), limit=15, item_limit=300),
-        "jd_text": redact_interview_llm_text(strip_platform_safety_notice(str(job.get("jd_text") or "")), 12000),
+        "jd_text": redact_llm_text(strip_platform_safety_notice(str(job.get("jd_text") or "")), 12000),
     }
 
 
@@ -5794,7 +5795,7 @@ def run_interview_preparation_enhancement(review_id: int) -> dict[str, Any]:
         job_row = conn.execute("SELECT * FROM job_postings WHERE id = ?", (review["job_id"],)).fetchone() if review.get("job_id") else None
         job = parse_json_fields({key: job_row[key] for key in job_row.keys()}) if job_row else None
         feedback_context = interview_feedback_context(conn, int(review["job_id"]) if review.get("job_id") else None)
-        candidate = interview_candidate_context(conn, job)
+        candidate = candidate_context_for_job(conn, job)
         fallback = interview_prep_fallback(review, job, feedback_context)
 
     client = client_for_task("interview_prep")
@@ -5809,8 +5810,8 @@ def run_interview_preparation_enhancement(review_id: int) -> dict[str, Any]:
             "job": normalized_interview_job_context(job),
             "candidate": candidate,
             "interview_context": {
-                "source_text": redact_interview_llm_text(str(review.get("source_text") or ""), 12000),
-                "unresolved_feedback": redact_interview_llm_text(feedback_context, 4000),
+                "source_text": redact_llm_text(str(review.get("source_text") or ""), 12000),
+                "unresolved_feedback": redact_llm_text(feedback_context, 4000),
                 "existing_questions": fallback["questions"],
             },
         }
@@ -6006,6 +6007,149 @@ def application_recommendation_reason(job: dict[str, Any]) -> str:
     if missing_skills:
         parts.append("投递前仍需确认：" + "、".join(missing_skills[:4]) + "。")
     return "".join(parts)
+
+
+def local_match_review_context(job: dict[str, Any]) -> dict[str, Any]:
+    scoring = (job.get("extracted") or {}).get("scoring") or {}
+    return {
+        "score": int(job.get("match_score") or 0),
+        "match_level": str(job.get("match_level") or ""),
+        "recommendation": str(job.get("recommendation") or ""),
+        "risk_level": str(job.get("risk_level") or ""),
+        "matching_evidence": str(scoring.get("matching_evidence") or ""),
+        "matched_skills": compact_interview_items(scoring.get("matched_skills"), limit=20, item_limit=100),
+        "missing_skills": compact_interview_items(scoring.get("missing_skills"), limit=20, item_limit=100),
+        "fit_notes": compact_interview_items(scoring.get("fit_notes"), limit=12, item_limit=260),
+        "preference_notes": compact_interview_items(scoring.get("preference_notes"), limit=12, item_limit=260),
+        "risk_signals": compact_interview_items(scoring.get("risk_signals"), limit=12, item_limit=160),
+        "caution_signals": compact_interview_items(scoring.get("caution_signals"), limit=12, item_limit=160),
+    }
+
+
+def normalize_job_match_review(result: object) -> dict[str, Any]:
+    if not isinstance(result, dict):
+        raise ValueError("模型没有返回 JSON 对象。")
+    conclusion = str(result.get("conclusion") or result.get("summary") or "").strip()[:1400]
+    matched_evidence = compact_interview_items(result.get("matched_evidence"), limit=10, item_limit=360)
+    gaps = compact_interview_items(result.get("gaps"), limit=10, item_limit=360)
+    questions_to_confirm = compact_interview_items(result.get("questions_to_confirm"), limit=8, item_limit=360)
+    caution_points = compact_interview_items(result.get("caution_points"), limit=8, item_limit=360)
+    resume_focus = compact_interview_items(result.get("resume_focus"), limit=8, item_limit=360)
+    populated_fields = [
+        name
+        for name, value in {
+            "conclusion": conclusion,
+            "matched_evidence": matched_evidence,
+            "gaps": gaps,
+            "questions_to_confirm": questions_to_confirm,
+            "caution_points": caution_points,
+            "resume_focus": resume_focus,
+        }.items()
+        if value
+    ]
+    if not populated_fields:
+        raise ValueError("模型没有返回可用的匹配复核内容。")
+    return {
+        "conclusion": conclusion,
+        "matched_evidence": matched_evidence,
+        "gaps": gaps,
+        "questions_to_confirm": questions_to_confirm,
+        "caution_points": caution_points,
+        "resume_focus": resume_focus,
+        "model_fields": populated_fields,
+    }
+
+
+def run_job_match_review(job_id: int) -> dict[str, Any]:
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM job_postings WHERE id = ?", (job_id,)).fetchone()
+        if not row:
+            return {"status": "未找到", "note": "没有找到这个岗位。", "model_called": False}
+        job = parse_json_fields({key: row[key] for key in row.keys()})
+        candidate = candidate_context_for_job(conn, job)
+
+    client = client_for_task("job_match")
+    if not client or not client.configured:
+        result = {
+            "status": "未配置",
+            "note": "请先在设置中为“岗位匹配解释”配置可用模型，再进行深度匹配复核。",
+            "model_called": False,
+        }
+    else:
+        payload = {
+            "job": normalized_interview_job_context(job),
+            "candidate": candidate,
+            "local_rule_result": local_match_review_context(job),
+        }
+        prompt = (
+            "你是 AI 应用开发实习的岗位匹配复核助手。基于岗位 JD、候选人明确填写的技能/项目/简历事实和本地规则结果，"
+            "只给出可由用户复核的补充意见。不得编造候选人经历、公司业务、技术指标或技能熟练度；"
+            "候选人资料没有覆盖的内容必须描述为待学习、待确认或能力缺口。"
+            "不得替用户投递、联系招聘方、修改岗位分数、风险等级、推荐或状态，也不得淡化本地规则识别到的风险。"
+            "只输出 JSON：conclusion(string)、matched_evidence(array)、gaps(array)、questions_to_confirm(array)、"
+            "caution_points(array)、resume_focus(array)。"
+        )
+        try:
+            generated = client.complete_json(
+                [
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": dumps(payload)},
+                ]
+            )
+            result = {
+                "status": "已完成",
+                "note": "已生成补充性深度匹配复核，本地评分和岗位状态未改变。",
+                "content": normalize_job_match_review(generated),
+                "model_called": True,
+                "model_profile": str(client.profile.get("name") or ""),
+                "model_name": str(client.model or ""),
+            }
+        except Exception as exc:
+            if hasattr(client, "log_error"):
+                client.log_error(str(exc))
+            result = {
+                "status": "未完成",
+                "note": f"深度匹配复核生成失败：{str(exc)[:240]}",
+                "model_called": True,
+            }
+
+    with connect() as conn:
+        current = conn.execute("SELECT platform FROM job_postings WHERE id = ?", (job_id,)).fetchone()
+        if not current:
+            return {"status": "未找到", "note": "岗位已不存在，未写入复核结果。", "model_called": bool(result.get("model_called"))}
+        if result.get("content"):
+            conn.execute(
+                """
+                INSERT INTO job_match_reviews (job_id, status, review_json, model_profile, model_name, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job_id,
+                    str(result["status"]),
+                    dumps(result["content"]),
+                    str(result.get("model_profile") or ""),
+                    str(result.get("model_name") or ""),
+                    utc_now(),
+                ),
+            )
+        log_agent_action(
+            conn,
+            action_type="job_match_review",
+            status=str(result["status"]),
+            summary=str(result["note"]),
+            platform=str(current["platform"] or ""),
+            job_id=job_id,
+            decision={
+                "model_called": bool(result.get("model_called")),
+                "stored_review": bool(result.get("content")),
+                "model_fields": list((result.get("content") or {}).get("model_fields") or []),
+                "user_triggered": True,
+                "input_redacted": True,
+                "local_score_changed": False,
+                "job_status_changed": False,
+            },
+        )
+    return result
 
 
 def ensure_application_preparation_for_job(conn: Any, job_id: int, *, trigger_type: str) -> dict[str, Any]:
@@ -6212,6 +6356,10 @@ def job_detail(job_id: int, request: Request) -> Any:
     with connect() as conn:
         job = conn.execute("SELECT * FROM job_postings WHERE id = ?", (job_id,)).fetchone()
         research = conn.execute("SELECT * FROM company_research WHERE job_id = ? ORDER BY id", (job_id,)).fetchall()
+        match_review = conn.execute(
+            "SELECT * FROM job_match_reviews WHERE job_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+            (job_id,),
+        ).fetchone()
         events = conn.execute("SELECT * FROM application_events WHERE job_id = ? ORDER BY id DESC", (job_id,)).fetchall()
         interviews = conn.execute(
             "SELECT id, created_at FROM interview_preparations WHERE job_id = ? ORDER BY created_at DESC, id DESC",
@@ -6230,6 +6378,9 @@ def job_detail(job_id: int, request: Request) -> Any:
     if not job:
         return redirect("/jobs")
     job_data = parse_json_fields({key: job[key] for key in job.keys()})
+    match_review_data = {key: match_review[key] for key in match_review.keys()} if match_review else None
+    if match_review_data is not None:
+        match_review_data["content"] = loads(match_review_data.get("review_json"), {})
     application_eligible, application_block_reason = application_preparation_eligibility(job_data)
     return templates.TemplateResponse(
         request,
@@ -6237,6 +6388,7 @@ def job_detail(job_id: int, request: Request) -> Any:
         {
             "job": job_data,
             "research": [{key: row[key] for key in row.keys()} for row in research],
+            "match_review": match_review_data,
             "events": [{key: row[key] for key in row.keys()} for row in events],
             "interviews": [{key: row[key] for key in row.keys()} for row in interviews],
             "application_preparation": {key: preparation[key] for key in preparation.keys()} if preparation else None,
@@ -6248,6 +6400,13 @@ def job_detail(job_id: int, request: Request) -> Any:
             "notice_type": request.query_params.get("notice_type", "info"),
         },
     )
+
+
+@app.post("/jobs/{job_id}/match-review")
+async def review_job_match(job_id: int) -> RedirectResponse:
+    result = await run_in_threadpool(run_job_match_review, job_id)
+    notice_type = "success" if result.get("status") == "已完成" else "error"
+    return redirect_with_notice(f"/jobs/{job_id}", str(result.get("note") or result.get("status")), notice_type)
 
 
 @app.post("/jobs/{job_id}/status")

@@ -183,6 +183,13 @@ p {
   gap: 18px;
 }
 
+.review-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: start;
+}
+
 .cards {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
@@ -490,7 +497,8 @@ code {
   }
 
   .page-head,
-  .grid-two {
+  .grid-two,
+  .review-grid {
     grid-template-columns: 1fr;
     flex-direction: column;
   }

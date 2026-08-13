@@ -132,6 +132,17 @@ def init_db() -> None:
                 FOREIGN KEY(resume_id) REFERENCES resume_versions(id) ON DELETE SET NULL
             );
 
+            CREATE TABLE IF NOT EXISTS job_match_reviews (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT '',
+                review_json TEXT NOT NULL DEFAULT '{}',
+                model_profile TEXT NOT NULL DEFAULT '',
+                model_name TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(job_id) REFERENCES job_postings(id) ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS company_research (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 job_id INTEGER NOT NULL,

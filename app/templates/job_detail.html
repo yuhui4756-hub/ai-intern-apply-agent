@@ -61,6 +61,39 @@
 
 <section class="panel form-stack">
   <div class="panel-title">
+    <h2>深度匹配复核</h2>
+    {% if match_review %}<span class="badge">最近一次：{{ match_review.created_at }}</span>{% endif %}
+  </div>
+  <p class="muted">仅在你点击后调用“岗位匹配解释”模型路由，结合 JD、候选人明确填写的事实和本地规则结果生成补充意见。不会修改本地分数、建议、风险、岗位状态或触发投递。</p>
+  <form method="post" action="/jobs/{{ job.id }}/match-review">
+    <button class="button" type="submit">{% if match_review %}重新进行深度复核{% else %}进行深度匹配复核{% endif %}</button>
+  </form>
+  {% if match_review %}
+  {% set review = match_review.content %}
+  <div class="review-grid">
+    <div>{% if review.get("conclusion") %}<p><strong>复核结论：</strong>{{ review.get("conclusion") }}</p>{% endif %}</div>
+    <div><p><strong>模型：</strong>{{ match_review.model_profile or "-" }}{% if match_review.model_name %} / {{ match_review.model_name }}{% endif %}</p></div>
+  </div>
+  <div class="grid-two">
+    <div>
+      <p><strong>候选人已确认的匹配证据</strong></p>
+      <ul>{% for item in review.get("matched_evidence", []) %}<li>{{ item }}</li>{% else %}<li class="empty">未提供额外证据。</li>{% endfor %}</ul>
+      <p><strong>待补强 / 待确认</strong></p>
+      <ul>{% for item in review.get("gaps", []) %}<li>{{ item }}</li>{% else %}<li class="empty">未提供额外缺口。</li>{% endfor %}</ul>
+    </div>
+    <div>
+      <p><strong>沟通前可确认的问题</strong></p>
+      <ul>{% for item in review.get("questions_to_confirm", []) %}<li>{{ item }}</li>{% else %}<li class="empty">暂无。</li>{% endfor %}</ul>
+      <p><strong>复核提醒</strong></p>
+      <ul>{% for item in review.get("caution_points", []) %}<li>{{ item }}</li>{% else %}<li class="empty">暂无。</li>{% endfor %}</ul>
+    </div>
+  </div>
+  {% if review.get("resume_focus", []) %}<p><strong>简历突出方向：</strong>{{ review.get("resume_focus", []) | join("；") }}</p>{% endif %}
+  {% endif %}
+</section>
+
+<section class="panel form-stack">
+  <div class="panel-title">
     <h2>公司公开风险查询</h2>
     {% if research %}<span class="badge">已保存 {{ research | length }} 条来源</span>{% endif %}
   </div>
