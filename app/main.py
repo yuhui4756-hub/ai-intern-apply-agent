@@ -40,6 +40,7 @@ from .services.communication_browser import (
     send_message_in_controlled_edge,
 )
 from .services.conversation import classify_conversation, prepare_conversation_text
+from .services.control_layer import parse_control_intent, redact_control_text
 from .services.github_projects import (
     GitHubProjectError,
     dedupe_urls,
@@ -4231,6 +4232,139 @@ def dashboard(request: Request) -> Any:
             "notice_type": request.query_params.get("notice_type", "info"),
         },
     )
+
+
+def control_suggestions(intent_type: str, filters: dict[str, Any]) -> list[dict[str, str]]:
+    if intent_type == "search_draft":
+        return [{"label": "查看岗位搜索", "url": "/searches"}]
+    if intent_type == "stats":
+        return [{"label": "查看岗位列表", "url": "/jobs"}, {"label": "查看投递准备", "url": "/applications"}]
+    if intent_type == "explain_job" and filters.get("job_id"):
+        return [{"label": "打开岗位", "url": f"/jobs/{filters['job_id']}"}]
+    if intent_type == "ignore_broadcast":
+        return [{"label": "查看沟通记录", "url": "/communications"}]
+    return [{"label": "岗位搜索", "url": "/searches"}, {"label": "岗位列表", "url": "/jobs"}]
+
+
+def create_control_plan(conn: Any, conversation_id: int, action_type: str, summary: str, payload: dict[str, Any]) -> int:
+    cursor = conn.execute(
+        """
+        INSERT INTO control_plans (conversation_id, action_type, status, summary, payload_json, created_at)
+        VALUES (?, ?, '待确认', ?, ?, ?)
+        """,
+        (conversation_id, action_type, summary, dumps(payload), utc_now()),
+    )
+    return int(cursor.lastrowid)
+
+
+@app.get("/control")
+def control_page(request: Request) -> Any:
+    with connect() as conn:
+        latest = conn.execute("SELECT * FROM control_conversations ORDER BY id DESC LIMIT 1").fetchone()
+        pending = conn.execute("SELECT * FROM control_plans WHERE status = '待确认' ORDER BY id DESC").fetchall()
+    latest_data = {key: latest[key] for key in latest.keys()} if latest else None
+    if latest_data:
+        latest_data["evidence"] = loads(latest_data["evidence_json"], {})
+    return templates.TemplateResponse(request, "control.html", {
+        "latest": latest_data,
+        "pending_plans": [{key: row[key] for key in row.keys()} for row in pending],
+        "notice": request.query_params.get("notice", ""),
+        "notice_type": request.query_params.get("notice_type", "info"),
+    })
+
+
+@app.post("/control")
+async def create_control_request(request: Request) -> RedirectResponse:
+    form = await request.form()
+    message = str(form.get("message") or "").strip()
+    if not message:
+        return redirect_with_notice("/control", "请输入一个任务，例如“找杭州 Agent 实习，日薪至少 200”。", "error")
+    intent = parse_control_intent(message)
+    intent_type, filters = intent["type"], intent["filters"]
+    suggestions = control_suggestions(intent_type, filters)
+    evidence: dict[str, Any] = {"parser": "local_rules", "filters": filters, "suggestions": suggestions}
+    with connect() as conn:
+        conversation_cursor = conn.execute(
+            "INSERT INTO control_conversations (user_text, intent_type, response_text, evidence_json, created_at) VALUES (?, ?, '', '{}', ?)",
+            (redact_control_text(message), intent_type, utc_now()),
+        )
+        conversation_id = int(conversation_cursor.lastrowid)
+        if intent_type == "stats":
+            row = conn.execute("SELECT COUNT(*) AS total, SUM(CASE WHEN status = '待确认' THEN 1 ELSE 0 END) AS pending FROM job_postings").fetchone()
+            response_text = f"本地共有 {row['total']} 条岗位，其中 {row['pending'] or 0} 条待确认。可从岗位列表继续查看。"
+        elif intent_type == "explain_job" and filters.get("job_id"):
+            job = conn.execute("SELECT title, company, match_score, recommendation, risk_level, status FROM job_postings WHERE id = ?", (filters["job_id"],)).fetchone()
+            if job:
+                response_text = f"岗位 #{filters['job_id']}：{job['company']} - {job['title']}，匹配 {job['match_score']} 分，建议“{job['recommendation']}”，风险“{job['risk_level']}”，当前状态“{job['status']}”。"
+            else:
+                response_text = f"没有找到岗位 #{filters['job_id']}。请从岗位列表确认编号。"
+        elif intent_type == "search_draft":
+            role = filters.get("role") or "沿用画像目标岗位"
+            city = filters.get("city") or "沿用画像城市"
+            salary = filters.get("min_salary_per_day")
+            suffix = f"，最低日薪 {salary} 元" if salary else ""
+            summary = f"在受控 Edge 中发现 {city} 的 {role}{suffix}。"
+            plan_id = create_control_plan(conn, conversation_id, "job_discovery", summary, filters)
+            evidence["plan_id"] = plan_id
+            response_text = f"已生成计划：{summary}确认后才会调用现有受控岗位发现服务，不会由聊天直接操作浏览器。"
+        elif intent_type == "ignore_broadcast":
+            capture_id = filters.get("capture_id")
+            if capture_id:
+                summary = f"将对话采集 #{capture_id} 标记为无需回复/群发负样本。"
+                plan_id = create_control_plan(conn, conversation_id, "ignore_broadcast", summary, filters)
+                evidence["plan_id"] = plan_id
+                response_text = f"已生成本地标记计划。{summary}确认后只更新反馈和审计，不会回复或删除对话。"
+            else:
+                response_text = "请指定对话采集编号，例如“将对话 #12 的群发消息标为忽略”。"
+        elif intent_type == "show_plan":
+            response_text = "可先用“找杭州 Agent 实习，日薪至少 200”生成岗位发现计划；待确认计划不会自行执行。"
+        else:
+            response_text = "我目前可处理：生成岗位搜索条件草案、解释“岗位 #编号”、查看统计、查看计划，以及将“对话 #编号”的群发样本标为忽略。涉及外部动作都会先生成待确认计划。"
+        conn.execute(
+            "UPDATE control_conversations SET response_text = ?, evidence_json = ? WHERE id = ?",
+            (response_text, dumps(evidence), conversation_id),
+        )
+        log_agent_action(conn, action_type="control_request", status="已解析", summary=response_text, decision={"intent": intent_type, "filters": filters, "message_saved_redacted": True, "model_called": False})
+    return redirect_with_notice("/control", "已用本地规则解析任务。", "success")
+
+
+@app.post("/control/plans/{plan_id}/confirm")
+async def confirm_control_plan(plan_id: int) -> RedirectResponse:
+    with connect() as conn:
+        plan = conn.execute("SELECT * FROM control_plans WHERE id = ?", (plan_id,)).fetchone()
+        if not plan or plan["status"] != "待确认":
+            return redirect_with_notice("/control", "计划不存在或已处理。", "error")
+        payload = loads(plan["payload_json"], {})
+        conn.execute("UPDATE control_plans SET status = '执行中', confirmed_at = ? WHERE id = ?", (utc_now(), plan_id))
+    try:
+        if plan["action_type"] == "job_discovery":
+            result = await run_in_threadpool(run_controlled_job_discovery, payload)
+        elif plan["action_type"] == "ignore_broadcast":
+            capture_id = int(payload["capture_id"])
+            with connect() as conn:
+                capture = conn.execute("SELECT id FROM conversation_captures WHERE id = ?", (capture_id,)).fetchone()
+                if not capture:
+                    raise ValueError("没有找到该对话采集。")
+                conn.execute("UPDATE conversation_captures SET feedback_status = '正确', expected_message_type = '无需回复', feedback_note = '控制层确认：群发负样本', feedback_updated_at = ? WHERE id = ?", (utc_now(), capture_id))
+                log_agent_action(conn, action_type="conversation_feedback", status="无需回复", capture_id=capture_id, summary="控制层确认标记群发负样本。", decision={"source": "control_layer", "message_text_saved": False})
+            result = {"capture_id": capture_id, "status": "已标记"}
+        else:
+            raise ValueError("不支持的计划类型。")
+    except Exception as exc:
+        with connect() as conn:
+            conn.execute("UPDATE control_plans SET status = '失败', result_json = ?, completed_at = ? WHERE id = ?", (dumps({"error": str(exc)[:300]}), utc_now(), plan_id))
+        return redirect_with_notice("/control", f"计划执行失败：{str(exc)[:160]}", "error")
+    with connect() as conn:
+        conn.execute("UPDATE control_plans SET status = '已完成', result_json = ?, completed_at = ? WHERE id = ?", (dumps(result), utc_now(), plan_id))
+        log_agent_action(conn, action_type="control_plan", status="已完成", summary=str(plan["summary"]), decision={"plan_id": plan_id, "action_type": plan["action_type"], "result": result, "model_called": False})
+    return redirect_with_notice("/control", "已按确认计划调用既有服务。", "success")
+
+
+@app.post("/control/plans/{plan_id}/cancel")
+def cancel_control_plan(plan_id: int) -> RedirectResponse:
+    with connect() as conn:
+        cursor = conn.execute("UPDATE control_plans SET status = '已取消', completed_at = ? WHERE id = ? AND status = '待确认'", (utc_now(), plan_id))
+    return redirect_with_notice("/control", "已取消计划。" if cursor.rowcount else "计划不存在或已处理。", "info")
 
 
 @app.get("/resumes")

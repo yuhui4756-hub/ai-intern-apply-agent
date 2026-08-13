@@ -381,6 +381,29 @@ def init_db() -> None:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS control_conversations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_text TEXT NOT NULL DEFAULT '',
+                intent_type TEXT NOT NULL DEFAULT '',
+                response_text TEXT NOT NULL DEFAULT '',
+                evidence_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS control_plans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id INTEGER,
+                action_type TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT '待确认',
+                summary TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                result_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                confirmed_at TEXT NOT NULL DEFAULT '',
+                completed_at TEXT NOT NULL DEFAULT '',
+                FOREIGN KEY(conversation_id) REFERENCES control_conversations(id) ON DELETE SET NULL
+            );
             """
         )
         ensure_columns(conn)
