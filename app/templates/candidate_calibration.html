@@ -1,0 +1,92 @@
+{% extends "layout.html" %}
+{% block title %}候选校准报告 - 简历投递 Agent{% endblock %}
+{% block content %}
+<section class="page-head">
+  <div>
+    <h1>候选校准报告</h1>
+    <p>基于已保存的候选反馈汇总筛选质量；只读展示，不调用模型，也不会自动修改规则。</p>
+  </div>
+  <a class="button" href="/searches">返回岗位搜索</a>
+</section>
+
+{% if notice %}
+<section class="notice {{ notice_type }}">{{ notice }}</section>
+{% endif %}
+
+<section class="metrics">
+  <div class="metric"><span>累计候选</span><strong>{{ report.total_candidates }}</strong></div>
+  <div class="metric"><span>已标注</span><strong>{{ report.reviewed_count }}</strong></div>
+  <div class="metric"><span>正确</span><strong>{{ report.feedback_counts.get("正确", 0) }}</strong></div>
+  <div class="metric"><span>误判</span><strong>{{ report.feedback_counts.get("误判", 0) }}</strong></div>
+  <div class="metric"><span>详情待补充</span><strong>{{ report.detail_pending_count }}</strong></div>
+</section>
+
+<section class="panel">
+  <h2>建议关注</h2>
+  <ul>
+    {% for item in report.suggestions %}<li>{{ item }}</li>{% endfor %}
+  </ul>
+</section>
+
+<section class="panel">
+  <div class="panel-title"><h2>平台校准概览</h2><span class="muted">准确率仅统计已标注“正确 / 误判”的候选</span></div>
+  {% if report.platform_summary %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>平台</th><th>累计</th><th>已标注</th><th>正确</th><th>误判</th><th>待观察</th><th>已标注准确率</th></tr></thead>
+      <tbody>
+        {% for item in report.platform_summary %}
+        <tr>
+          <td>{{ item.platform }}</td>
+          <td>{{ item.total_count }}</td>
+          <td>{{ item.reviewed_count }}</td>
+          <td>{{ item.correct_count }}</td>
+          <td>{{ item.misclassified_count }}</td>
+          <td>{{ item.observing_count }}</td>
+          <td>{% if item.precision_percent is not none %}{{ item.precision_percent }}%{% else %}-{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}<p class="empty">还没有候选记录。</p>{% endif %}
+</section>
+
+<section class="grid-two">
+  <section class="panel">
+    <div class="panel-title"><h2>误判的期望分流</h2><span class="muted">仅统计已填写期望分流的误判</span></div>
+    {% if report.expected_summary %}
+    <ul>
+      {% for item in report.expected_summary %}<li>{{ item.expected_screening }}：{{ item.count }} 条</li>{% endfor %}
+    </ul>
+    {% else %}<p class="empty">还没有带期望分流的误判反馈。</p>{% endif %}
+  </section>
+  <section class="panel">
+    <div class="panel-title"><h2>使用边界</h2></div>
+    <p class="muted">本页不会改变岗位状态、重跑搜索、调用模型或访问招聘平台。确认规则调整前，请先复核具体样本。</p>
+  </section>
+</section>
+
+<section class="panel">
+  <div class="panel-title"><h2>最近误判样本</h2><span class="badge">{{ report.recent_misclassifications | length }} 条</span></div>
+  {% if report.recent_misclassifications %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>候选</th><th>平台与搜索</th><th>当前状态</th><th>期望分流</th><th>备注</th><th>时间</th></tr></thead>
+      <tbody>
+        {% for item in report.recent_misclassifications %}
+        <tr>
+          <td><a href="/searches/{{ item.search_run_id }}">{{ item.title or "候选岗位" }}</a><div class="muted">{{ item.company or "公司待补充" }} · {{ item.city or "城市待补充" }}</div></td>
+          <td>{{ item.platform or item.run_platform or "平台待补充" }}<div class="muted">{{ item.run_keyword or "-" }} · {{ item.run_city or "不限" }}</div></td>
+          <td>{{ item.status or "-" }}{% if item.error_message %}<div class="muted">{{ item.error_message }}</div>{% endif %}</td>
+          <td>{{ item.expected_screening or "未指定" }}</td>
+          <td>{{ item.feedback_note or "-" }}</td>
+          <td>{{ item.feedback_updated_at or "-" }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}<p class="empty">还没有误判反馈。</p>{% endif %}
+</section>
+{% endblock %}

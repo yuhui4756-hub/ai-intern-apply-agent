@@ -5187,6 +5187,108 @@ def search_detail(run_id: int, request: Request) -> Any:
     )
 
 
+def candidate_calibration_report(conn: Any) -> dict[str, Any]:
+    total_candidates = int(conn.execute("SELECT COUNT(*) AS count FROM job_candidates").fetchone()["count"])
+    feedback_counts = {
+        str(row["feedback_status"]): int(row["count"])
+        for row in conn.execute(
+            """
+            SELECT feedback_status, COUNT(*) AS count
+            FROM job_candidates
+            WHERE feedback_status != ''
+            GROUP BY feedback_status
+            """
+        ).fetchall()
+    }
+    reviewed_count = sum(feedback_counts.values())
+    platform_rows = conn.execute(
+        """
+        SELECT
+            platform,
+            COUNT(*) AS total_count,
+            SUM(CASE WHEN feedback_status != '' THEN 1 ELSE 0 END) AS reviewed_count,
+            SUM(CASE WHEN feedback_status = '正确' THEN 1 ELSE 0 END) AS correct_count,
+            SUM(CASE WHEN feedback_status = '误判' THEN 1 ELSE 0 END) AS misclassified_count,
+            SUM(CASE WHEN feedback_status = '待观察' THEN 1 ELSE 0 END) AS observing_count
+        FROM job_candidates
+        GROUP BY platform
+        ORDER BY misclassified_count DESC, reviewed_count DESC, total_count DESC, platform
+        """
+    ).fetchall()
+    platform_summary = []
+    for row in platform_rows:
+        correct_count = int(row["correct_count"] or 0)
+        misclassified_count = int(row["misclassified_count"] or 0)
+        settled_count = correct_count + misclassified_count
+        platform_summary.append(
+            {
+                "platform": str(row["platform"] or "平台待补充"),
+                "total_count": int(row["total_count"] or 0),
+                "reviewed_count": int(row["reviewed_count"] or 0),
+                "correct_count": correct_count,
+                "misclassified_count": misclassified_count,
+                "observing_count": int(row["observing_count"] or 0),
+                "precision_percent": round(correct_count / settled_count * 100) if settled_count else None,
+            }
+        )
+    expected_rows = conn.execute(
+        """
+        SELECT expected_screening, COUNT(*) AS count
+        FROM job_candidates
+        WHERE feedback_status = '误判' AND expected_screening != ''
+        GROUP BY expected_screening
+        ORDER BY count DESC, expected_screening
+        """
+    ).fetchall()
+    recent_misclassifications = conn.execute(
+        """
+        SELECT c.*, r.platform AS run_platform, r.keyword AS run_keyword, r.city AS run_city
+        FROM job_candidates c
+        LEFT JOIN job_search_runs r ON r.id = c.search_run_id
+        WHERE c.feedback_status = '误判'
+        ORDER BY c.feedback_updated_at DESC, c.id DESC
+        LIMIT 20
+        """
+    ).fetchall()
+    detail_pending_count = int(
+        conn.execute("SELECT COUNT(*) AS count FROM job_candidates WHERE status = '详情待补充'").fetchone()["count"]
+    )
+    suggestions: list[str] = []
+    if reviewed_count < 5:
+        suggestions.append("当前已标注样本不足 5 条，先在不同平台各积累几条正确和误判反馈，再决定是否调整筛选规则。")
+    if feedback_counts.get("误判", 0):
+        suggestions.append(f"有 {feedback_counts['误判']} 条候选被标记为误判，优先复核下方样本的标题、摘要和期望分流。")
+    if detail_pending_count:
+        suggestions.append(f"有 {detail_pending_count} 条候选仍为“详情待补充”，这反映详情页读取覆盖，不等同于筛选准确率。")
+    if not suggestions:
+        suggestions.append("还没有足够的候选校准反馈。搜索后可在候选详情中标记正确、误判或待观察。")
+    return {
+        "total_candidates": total_candidates,
+        "reviewed_count": reviewed_count,
+        "feedback_counts": feedback_counts,
+        "platform_summary": platform_summary,
+        "expected_summary": [{"expected_screening": str(row["expected_screening"]), "count": int(row["count"])} for row in expected_rows],
+        "recent_misclassifications": [{key: row[key] for key in row.keys()} for row in recent_misclassifications],
+        "detail_pending_count": detail_pending_count,
+        "suggestions": suggestions,
+    }
+
+
+@app.get("/calibration/candidates")
+def candidate_calibration_page(request: Request) -> Any:
+    with connect() as conn:
+        report = candidate_calibration_report(conn)
+    return templates.TemplateResponse(
+        request,
+        "candidate_calibration.html",
+        {
+            "report": report,
+            "notice": request.query_params.get("notice", ""),
+            "notice_type": request.query_params.get("notice_type", "info"),
+        },
+    )
+
+
 @app.post("/candidates/{candidate_id}/feedback")
 async def update_candidate_feedback(candidate_id: int, request: Request) -> RedirectResponse:
     form = await request.form()
