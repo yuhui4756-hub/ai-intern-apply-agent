@@ -39,6 +39,9 @@ def test_unread_scan_route_persists_counts_and_audit_only(tmp_path, monkeypatch)
     with connect() as conn:
         scan = conn.execute("SELECT * FROM unread_conversation_scans").fetchone()
         action = conn.execute("SELECT * FROM agent_action_logs WHERE action_type = 'unread_conversation_scan'").fetchone()
+        capture_count = conn.execute("SELECT COUNT(*) AS count FROM conversation_captures").fetchone()["count"]
+        draft_count = conn.execute("SELECT COUNT(*) AS count FROM message_drafts").fetchone()["count"]
+        model_call_count = conn.execute("SELECT COUNT(*) AS count FROM model_call_logs").fetchone()["count"]
     assert scan["platform"] == "Boss 直聘"
     assert scan["unread_count"] == 2
     assert scan["unread_badge_count"] == 2
@@ -51,8 +54,11 @@ def test_unread_scan_route_persists_counts_and_audit_only(tmp_path, monkeypatch)
     assert "url" not in decision
     assert "title" not in decision
     assert "text" not in decision
+    assert capture_count == 0
+    assert draft_count == 0
+    assert model_call_count == 0
 
     page = client.get("/communications")
     assert page.status_code == 200
-    assert "未读会话" in page.text
+    assert "未读候选会话" in page.text
     assert "message-list-v2" in page.text

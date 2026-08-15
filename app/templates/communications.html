@@ -23,12 +23,12 @@
 </section>
 
 <section class="panel">
-  <div class="panel-title"><div><h2>未读会话</h2><p class="muted">只检查已打开 Boss 直聘、猎聘消息列表的未读标记；不会打开会话、读取正文、填入或发送消息。</p></div><form method="post" action="/message-patrol/unread-scan" class="form-actions"><input type="hidden" name="return_to" value="/communications"><button class="button" type="submit">扫描当前 Edge 消息列表</button></form></div>
+  <div class="panel-title"><div><h2>未读候选会话</h2><p class="muted">只统计已打开 Boss 直聘、猎聘消息列表的未读结构标记，尚未判断岗位关联或是否需要回复；不会打开会话、读取正文、填入或发送消息。</p></div><form method="post" action="/message-patrol/unread-scan" class="form-actions"><input type="hidden" name="return_to" value="/communications"><button class="button" type="submit">扫描当前 Edge 消息列表</button></form></div>
   {% if unread_scans %}
-  <div class="table-wrap"><table><thead><tr><th>时间</th><th>平台</th><th>结果</th><th>未读</th><th>探测依据</th></tr></thead><tbody>
-    {% for scan in unread_scans %}<tr><td>{{ scan.created_at }}</td><td>{{ scan.platform }}</td><td>{{ scan.status }}</td><td><span class="badge">{{ scan.unread_count }}</span>{% if scan.unread_badge_count %}<span class="muted"> 标记 {{ scan.unread_badge_count }}</span>{% endif %}</td><td>{{ loads(scan.signal_types_json, []) | join("、") or "无" }}<div class="muted">{{ scan.detector_version }}</div></td></tr>{% endfor %}
+  <div class="table-wrap"><table><thead><tr><th>时间</th><th>平台</th><th>结果</th><th>未读候选</th><th>探测依据</th></tr></thead><tbody>
+    {% for scan in unread_scans %}<tr><td>{{ scan.created_at }}</td><td>{{ scan.platform }}</td><td>{{ scan.status }}</td><td><span class="badge">{{ scan.unread_count }}</span>{% if scan.unread_badge_count %}<span class="muted"> 显式标记 {{ scan.unread_badge_count }}</span>{% endif %}</td><td>{{ loads(scan.signal_types_json, []) | join("、") or "无" }}<div class="muted">{{ scan.detector_version }}</div></td></tr>{% endfor %}
   </tbody></table></div>
-  {% else %}<p class="empty">尚未扫描。请先在应用打开的受控 Edge 中手动打开 Boss 直聘或猎聘的消息列表。</p>{% endif %}
+  {% else %}<p class="empty">尚未扫描未读候选。请先在应用打开的受控 Edge 中手动打开 Boss 直聘或猎聘的消息列表。</p>{% endif %}
 </section>
 
 <section class="panel">
@@ -215,7 +215,7 @@
       <input type="hidden" name="return_to" value="/communications">
       <button class="button" type="submit">手动 tick</button>
       <button class="button" type="submit" formaction="/message-patrol/browser-dry-run">巡检当前 Edge</button>
-      <button class="button" type="submit" formaction="/message-patrol/unread-scan">扫描未读会话</button>
+      <button class="button" type="submit" formaction="/message-patrol/unread-scan">扫描未读候选</button>
       <button class="button" type="submit" formaction="/communication-executor/dry-run">执行草稿演练</button>
       <button class="button" type="submit" formaction="/communication-executor/browser-probe-dry-run">探测聊天页</button>
       <button class="button" type="submit" formaction="/communication-executor/browser-calibration-dry-run">校准聊天页结构</button>
