@@ -44,7 +44,7 @@ from .services.communication_browser import (
     send_message_in_controlled_edge,
 )
 from .services.conversation import classify_conversation, prepare_conversation_text
-from .services.control_layer import parse_control_intent, redact_control_text
+from .services.control_layer import CITY_NAMES, ROLE_NAMES, normalize_model_control_intent, parse_control_intent, redact_control_text
 from .services.github_projects import (
     GitHubProjectError,
     dedupe_urls,
@@ -4357,14 +4357,122 @@ def create_completed_control_execution(
     return int(cursor.lastrowid)
 
 
+def control_event(kind: str, status: str, summary: str) -> dict[str, str]:
+    return {"kind": kind, "status": status, "summary": summary}
+
+
+def control_history_for_model(limit: int = 6) -> list[dict[str, str]]:
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT user_text, response_text FROM control_conversations ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [
+        {
+            "user": str(row["user_text"] or "")[:700],
+            "assistant": str(row["response_text"] or "")[:700],
+        }
+        for row in reversed(rows)
+    ]
+
+
+def control_intent_messages(message: str, history: list[dict[str, str]]) -> list[dict[str, str]]:
+    role_options = "、".join(ROLE_NAMES)
+    city_options = "、".join(CITY_NAMES)
+    history_text = "\n".join(
+        f"用户：{item['user']}\nAgent：{item['assistant']}"
+        for item in history
+    ) or "（无）"
+    return [
+        {
+            "role": "system",
+            "content": (
+                "你是本地求职 Agent 的受限任务路由器。只输出 JSON 对象，不要回答用户，也不要输出分析过程。"
+                "允许的 type 只有 search_draft、stats、explain_job、ignore_broadcast、show_plan、help。"
+                "search_draft 的 filters 只能包含 role、city、min_salary_per_day；role 只能是"
+                f" {role_options} 或空字符串；city 只能是 {city_options} 或空字符串；薪资为整数或 null。"
+                "explain_job 只能返回正整数 job_id；ignore_broadcast 只能返回正整数 capture_id。"
+                "stats、show_plan、help 的 filters 必须为空对象。"
+                "“这个岗位”“去沟通”“投递”等没有明确编号的指令必须返回 help，不能猜测目标。"
+                "reason 只写一句不超过 40 个字的可公开判断摘要，不能写思维链、隐私信息或工具参数。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"最近已保存的对话：\n{history_text}\n\n当前任务：\n{redact_control_text(message)}",
+        },
+    ]
+
+
+def resolve_control_intent(message: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    fallback = parse_control_intent(message)
+    if fallback["type"] != "help":
+        return fallback, {
+            "parser": "local_rules",
+            "reasoning_summary": "本轮由本地规则完成任务理解，未产生模型调用。",
+            "events": [control_event("判断摘要", "完成", f"使用本地规则识别为“{fallback['type']}”，未调用 LLM。")],
+        }
+
+    client = client_for_task("control_intent")
+    if not client or not client.configured:
+        return fallback, {
+            "parser": "local_rules",
+            "reasoning_summary": "本轮由本地规则完成任务理解；当前没有可用的控制层模型。",
+            "events": [control_event("判断摘要", "完成", f"使用本地规则识别为“{fallback['type']}”，未调用 LLM。")],
+        }
+
+    try:
+        parsed = normalize_model_control_intent(client.complete_json(control_intent_messages(message, control_history_for_model())))
+        if not parsed:
+            raise ValueError("模型返回的意图不在允许范围内。")
+    except Exception as exc:
+        if hasattr(client, "log_error"):
+            client.log_error(str(exc))
+        return fallback, {
+            "parser": "local_rules",
+            "reasoning_summary": "模型意图理解不可用，已回退到本地规则；本轮安全边界不变。",
+            "events": [
+                control_event("模型调用", "已回退", f"控制层模型未产生可用受限意图：{str(exc)[:180]}"),
+                control_event("判断摘要", "完成", f"使用本地规则识别为“{fallback['type']}”。"),
+            ],
+        }
+
+    profile_name = str(getattr(client, "profile", {}).get("name") or "已配置模型")
+    model_name = str(getattr(client, "model", "") or "")
+    model_label = f"{profile_name}{f' / {model_name}' if model_name else ''}"
+    reason = str(parsed.pop("reason", "") or "")
+    reasoning_summary = reason or f"模型将本轮任务归类为“{parsed['type']}”，随后由本地策略层校验。"
+    return parsed, {
+        "parser": "llm_json",
+        "model": {"profile": profile_name, "name": model_name, "task_type": "control_intent"},
+        "reasoning_summary": reasoning_summary,
+        "events": [
+            control_event("模型调用", "完成", f"{model_label} 返回了受限结构化意图。"),
+            control_event("判断摘要", "完成", f"本地策略层校验通过：{parsed['type']}。"),
+        ],
+    }
+
+
+def control_conversation_data(row: Any) -> dict[str, Any]:
+    item = {key: row[key] for key in row.keys()}
+    item["evidence"] = loads(item["evidence_json"], {})
+    return item
+
+
+def load_control_conversation(conversation_id: int) -> dict[str, Any]:
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM control_conversations WHERE id = ?", (conversation_id,)).fetchone()
+    if not row:
+        raise ValueError("任务记录未保存。")
+    return control_conversation_data(row)
+
+
 @app.get("/control")
 def control_page(request: Request) -> Any:
     with connect() as conn:
         history_rows = conn.execute("SELECT * FROM control_conversations ORDER BY id DESC LIMIT 20").fetchall()
         pending = conn.execute("SELECT * FROM control_plans WHERE status = '待确认' ORDER BY id DESC").fetchall()
-    history = [{key: row[key] for key in row.keys()} for row in reversed(history_rows)]
-    for item in history:
-        item["evidence"] = loads(item["evidence_json"], {})
+    history = [control_conversation_data(row) for row in reversed(history_rows)]
     latest_data = history[-1] if history else None
     return templates.TemplateResponse(request, "control.html", {
         "latest": latest_data,
@@ -4375,16 +4483,23 @@ def control_page(request: Request) -> Any:
     })
 
 
-@app.post("/control")
-async def create_control_request(request: Request) -> RedirectResponse:
-    form = await request.form()
-    message = str(form.get("message") or "").strip()
+async def process_control_message(message: str) -> dict[str, Any]:
+    message = message.strip()
     if not message:
-        return redirect_with_notice("/control", "请输入一个任务，例如“找杭州 Agent 实习，日薪至少 200”。", "error")
-    intent = parse_control_intent(message)
+        raise ValueError("请输入一个任务，例如“找杭州 Agent 实习，日薪至少 200”。")
+    intent, parse_evidence = await run_in_threadpool(resolve_control_intent, message)
     intent_type, filters = intent["type"], intent["filters"]
     suggestions = control_suggestions(intent_type, filters)
-    evidence: dict[str, Any] = {"parser": "local_rules", "filters": filters, "suggestions": suggestions}
+    events = parse_evidence["events"]
+    evidence: dict[str, Any] = {
+        "parser": parse_evidence["parser"],
+        "filters": filters,
+        "suggestions": suggestions,
+        "reasoning_summary": parse_evidence["reasoning_summary"],
+        "events": events,
+    }
+    if parse_evidence.get("model"):
+        evidence["model"] = parse_evidence["model"]
     if intent_type == "search_draft":
         role = filters.get("role") or "沿用画像目标岗位"
         city = filters.get("city") or "沿用画像城市"
@@ -4397,6 +4512,13 @@ async def create_control_request(request: Request) -> RedirectResponse:
                 (redact_control_text(message), intent_type, utc_now()),
             )
             conversation_id = int(conversation_cursor.lastrowid)
+        events.append(
+            control_event(
+                "工具调用",
+                "执行中",
+                f"调用受控岗位发现：{city}，{role}{suffix or '，沿用画像筛选条件'}。",
+            )
+        )
         try:
             result = await run_in_threadpool(run_controlled_job_discovery, filters)
             execution_status = "已完成" if result.get("status") != "失败" else "失败"
@@ -4408,6 +4530,20 @@ async def create_control_request(request: Request) -> RedirectResponse:
             result = {"error": str(exc)[:300]}
             execution_status = "失败"
             response_text = f"岗位发现未完成：{result['error']}。未执行投递或沟通动作。"
+        events.append(
+            control_event(
+                "工具结果",
+                execution_status,
+                str(result.get("note") or result.get("error") or "岗位发现已返回结果。")[:500],
+            )
+        )
+        events.append(
+            control_event(
+                "安全结论",
+                "已拦截提交动作",
+                "本轮未发送消息、未上传简历、未投递。",
+            )
+        )
         evidence["execution"] = {
             "mode": "chat_direct_non_submitting",
             "action_type": "job_discovery",
@@ -4439,15 +4575,15 @@ async def create_control_request(request: Request) -> RedirectResponse:
                     "filters": filters,
                     "execution_mode": "chat_direct_non_submitting",
                     "message_saved_redacted": True,
-                    "model_called": False,
+                    "model_called": evidence["parser"] == "llm_json",
+                    "model_task_type": (evidence.get("model") or {}).get("task_type", ""),
                     "auto_apply": False,
                     "auto_message": False,
                     "message_text_saved": False,
                 },
                 error_message=str(result.get("error") or "")[:300],
             )
-        notice_type = "success" if execution_status == "已完成" else "error"
-        return redirect_with_notice("/control", "已执行聊天任务。", notice_type)
+        return load_control_conversation(conversation_id)
     with connect() as conn:
         conversation_cursor = conn.execute(
             "INSERT INTO control_conversations (user_text, intent_type, response_text, evidence_json, created_at) VALUES (?, ?, '', '{}', ?)",
@@ -4457,12 +4593,14 @@ async def create_control_request(request: Request) -> RedirectResponse:
         if intent_type == "stats":
             row = conn.execute("SELECT COUNT(*) AS total, SUM(CASE WHEN status = '待确认' THEN 1 ELSE 0 END) AS pending FROM job_postings").fetchone()
             response_text = f"本地共有 {row['total']} 条岗位，其中 {row['pending'] or 0} 条待确认。可从岗位列表继续查看。"
+            events.append(control_event("工具调用", "完成", "查询本地岗位统计，不访问浏览器或模型。"))
         elif intent_type == "explain_job" and filters.get("job_id"):
             job = conn.execute("SELECT title, company, match_score, recommendation, risk_level, status FROM job_postings WHERE id = ?", (filters["job_id"],)).fetchone()
             if job:
                 response_text = f"岗位 #{filters['job_id']}：{job['company']} - {job['title']}，匹配 {job['match_score']} 分，建议“{job['recommendation']}”，风险“{job['risk_level']}”，当前状态“{job['status']}”。"
             else:
                 response_text = f"没有找到岗位 #{filters['job_id']}。请从岗位列表确认编号。"
+            events.append(control_event("工具调用", "完成", "读取本地岗位记录并生成解释。"))
         elif intent_type == "ignore_broadcast":
             capture_id = filters.get("capture_id")
             if capture_id:
@@ -4470,6 +4608,7 @@ async def create_control_request(request: Request) -> RedirectResponse:
                 plan_id = create_control_plan(conn, conversation_id, "ignore_broadcast", summary, filters)
                 evidence["plan_id"] = plan_id
                 response_text = f"已生成本地标记计划。{summary}确认后只更新反馈和审计，不会回复或删除对话。"
+                events.append(control_event("安全结论", "等待确认", "群发标记会修改本地反馈，等待你确认后执行。"))
             else:
                 response_text = "请指定对话采集编号，例如“将对话 #12 的群发消息标为忽略”。"
         elif intent_type == "show_plan":
@@ -4480,8 +4619,47 @@ async def create_control_request(request: Request) -> RedirectResponse:
             "UPDATE control_conversations SET response_text = ?, evidence_json = ? WHERE id = ?",
             (response_text, dumps(evidence), conversation_id),
         )
-        log_agent_action(conn, action_type="control_request", status="已解析", summary=response_text, decision={"intent": intent_type, "filters": filters, "message_saved_redacted": True, "model_called": False})
-    return redirect_with_notice("/control", "已用本地规则解析任务。", "success")
+        log_agent_action(
+            conn,
+            action_type="control_request",
+            status="已解析",
+            summary=response_text,
+            decision={
+                "intent": intent_type,
+                "filters": filters,
+                "message_saved_redacted": True,
+                "model_called": evidence["parser"] == "llm_json",
+                "model_task_type": (evidence.get("model") or {}).get("task_type", ""),
+            },
+        )
+    return load_control_conversation(conversation_id)
+
+
+@app.post("/control")
+async def create_control_request(request: Request) -> RedirectResponse:
+    form = await request.form()
+    message = str(form.get("message") or "")
+    try:
+        conversation = await process_control_message(message)
+    except ValueError as exc:
+        return redirect_with_notice("/control", str(exc), "error")
+    notice_type = "error" if conversation["evidence"].get("execution", {}).get("status") == "失败" else "success"
+    return redirect_with_notice("/control", "已完成聊天任务。", notice_type)
+
+
+@app.post("/api/control/messages")
+async def control_message_api(request: Request) -> JSONResponse:
+    try:
+        payload = await request.json()
+    except ValueError:
+        return api_error("请求体必须是 JSON 对象。")
+    if not isinstance(payload, dict):
+        return api_error("请求体必须是 JSON 对象。")
+    try:
+        conversation = await process_control_message(str(payload.get("message") or ""))
+    except ValueError as exc:
+        return api_error(str(exc))
+    return JSONResponse({"ok": True, "conversation": conversation})
 
 
 @app.post("/control/plans/{plan_id}/confirm")

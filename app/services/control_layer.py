@@ -6,6 +6,65 @@ from typing import Any
 
 CITY_NAMES = ("北京", "上海", "广州", "深圳", "杭州", "重庆", "成都", "南京")
 ROLE_NAMES = ("AI 应用开发实习", "Agent 开发实习", "AI 后端实习", "RAG 开发实习")
+ALLOWED_CONTROL_INTENTS = ("search_draft", "stats", "explain_job", "ignore_broadcast", "show_plan", "help")
+
+
+def normalize_model_control_intent(value: Any) -> dict[str, Any] | None:
+    """Accept only the narrow intent schema that the policy layer understands."""
+    if not isinstance(value, dict):
+        return None
+    intent_type = str(value.get("type") or "").strip()
+    if intent_type not in ALLOWED_CONTROL_INTENTS:
+        return None
+    raw_filters = value.get("filters")
+    filters = raw_filters if isinstance(raw_filters, dict) else {}
+    reason = str(value.get("reason") or "").strip()[:240]
+
+    if intent_type == "search_draft":
+        if set(filters) - {"role", "city", "min_salary_per_day"}:
+            return None
+        role = str(filters.get("role") or "").strip()
+        city = str(filters.get("city") or "").strip()
+        salary = filters.get("min_salary_per_day")
+        if role and role not in ROLE_NAMES:
+            return None
+        if city and city not in CITY_NAMES:
+            return None
+        if salary in (None, ""):
+            min_salary = None
+        elif isinstance(salary, bool):
+            return None
+        else:
+            try:
+                min_salary = int(salary)
+            except (TypeError, ValueError):
+                return None
+            if not 0 <= min_salary <= 10000:
+                return None
+        return {
+            "type": intent_type,
+            "filters": {"role": role, "city": city, "min_salary_per_day": min_salary},
+            "reason": reason,
+        }
+
+    if intent_type in {"explain_job", "ignore_broadcast"}:
+        key = "job_id" if intent_type == "explain_job" else "capture_id"
+        if set(filters) != {key}:
+            return None
+        raw_id = filters.get(key)
+        if isinstance(raw_id, bool):
+            return None
+        try:
+            item_id = int(raw_id)
+        except (TypeError, ValueError):
+            return None
+        if item_id <= 0:
+            return None
+        return {"type": intent_type, "filters": {key: item_id}, "reason": reason}
+
+    if filters:
+        return None
+    return {"type": intent_type, "filters": {}, "reason": reason}
 
 
 def parse_control_intent(text: str) -> dict[str, Any]:

@@ -128,6 +128,7 @@ def database_path() -> Path:
 
 
 TASK_TYPES = [
+    ("control_intent", "控制层意图理解"),
     ("jd_extract", "JD 初步抽取"),
     ("job_match", "岗位匹配解释"),
     ("message_draft", "投递话术生成"),
