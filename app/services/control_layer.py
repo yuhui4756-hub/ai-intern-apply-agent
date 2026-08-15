@@ -7,6 +7,7 @@ from typing import Any
 CITY_NAMES = ("北京", "上海", "广州", "深圳", "杭州", "重庆", "成都", "南京")
 ROLE_NAMES = ("AI 应用开发实习", "Agent 开发实习", "AI 后端实习", "RAG 开发实习")
 ALLOWED_CONTROL_INTENTS = ("search_draft", "stats", "explain_job", "ignore_broadcast", "show_plan", "help")
+CONTROL_MEMORY_SECRET_PATTERN = re.compile(r"(?i)(?:sk-[a-z0-9_-]{12,}|(?:api[_\s-]*key|password|密码|token)\s*[:=]|bearer\s+[a-z0-9._-]{12,})")
 
 
 def normalize_model_control_intent(value: Any) -> dict[str, Any] | None:
@@ -67,6 +68,14 @@ def normalize_model_control_intent(value: Any) -> dict[str, Any] | None:
     return {"type": intent_type, "filters": {}, "reason": reason}
 
 
+def control_memory_contains_sensitive_text(text: str) -> bool:
+    return bool(
+        CONTROL_MEMORY_SECRET_PATTERN.search(text)
+        or re.search(r"1[3-9]\d{9}", text)
+        or re.search(r"[\w.+-]+@[\w.-]+", text)
+    )
+
+
 def parse_control_intent(text: str) -> dict[str, Any]:
     normalized = " ".join(text.strip().split())
     lower = normalized.lower()
@@ -86,11 +95,23 @@ def parse_control_intent(text: str) -> dict[str, Any]:
 
     if any(token in normalized for token in ("统计", "数据概览", "多少岗位", "投递情况")):
         return {"type": "stats", "filters": {}}
+    selected_job = re.search(r"(?:选择|选中|设为当前|当前选择)\s*(?:岗位|职位)?\s*#?(\d+)", normalized)
+    if selected_job:
+        return {"type": "select_job", "filters": {"job_id": int(selected_job.group(1))}}
+    remembered = re.match(r"^(?:请)?记住\s*[:：]?\s*(.+)$", normalized)
+    if remembered and remembered.group(1).strip():
+        return {"type": "remember_preference", "filters": {"content": remembered.group(1).strip()[:300]}}
+    if any(token in normalized for token in ("查看记忆", "当前记忆", "我的偏好", "我的记忆")):
+        return {"type": "show_memory", "filters": {}}
     if any(token in normalized for token in ("计划", "下一步", "怎么做")):
         return {"type": "show_plan", "filters": {}}
     if any(token in normalized for token in ("群发", "忽略", "无需回复")):
         capture_id = re.search(r"(?:记录|对话|采集)\s*#?(\d+)", normalized)
         return {"type": "ignore_broadcast", "filters": {"capture_id": int(capture_id.group(1)) if capture_id else None}}
+    if any(token in normalized for token in ("投递准备", "准备投递")):
+        job_id = re.search(r"(?:岗位|职位)\s*#?(\d+)", normalized)
+        if job_id:
+            return {"type": "prepare_application", "filters": {"job_id": int(job_id.group(1))}}
     if any(token in normalized for token in ("解释", "看看岗位", "岗位详情", "岗位 #")):
         job_id = re.search(r"(?:岗位|职位)\s*#?(\d+)", normalized)
         return {"type": "explain_job", "filters": {"job_id": int(job_id.group(1)) if job_id else None}}

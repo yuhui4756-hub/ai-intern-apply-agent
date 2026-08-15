@@ -30,6 +30,8 @@ document.addEventListener("click", async (event) => {
   const transcript = root.querySelector("[data-control-transcript]");
   const status = root.querySelector("[data-control-status]");
   const turnCount = root.querySelector("[data-turn-count]");
+  const activeMemory = root.querySelector("[data-active-memory]");
+  const preferenceMemory = root.querySelector("[data-memory-preferences]");
 
   const addText = (parent, tag, value, className = "") => {
     const element = document.createElement(tag);
@@ -90,6 +92,60 @@ document.addEventListener("click", async (event) => {
     transcript.scrollTop = transcript.scrollHeight;
   };
 
+  const appendMemoryForm = (parent, memory) => {
+    const form = document.createElement("form");
+    form.method = "post";
+    form.action = `/control/memories/${memory.id}/update`;
+    form.className = "control-memory-form";
+    const textarea = document.createElement("textarea");
+    textarea.name = "content";
+    textarea.rows = 2;
+    textarea.maxLength = 300;
+    textarea.value = memory.content || "";
+    form.appendChild(textarea);
+    const actions = document.createElement("div");
+    actions.className = "form-actions";
+    const save = document.createElement("button");
+    save.type = "submit";
+    save.className = "button compact";
+    save.textContent = "保存";
+    const remove = document.createElement("button");
+    remove.type = "submit";
+    remove.className = "button danger compact";
+    remove.formAction = `/control/memories/${memory.id}/delete`;
+    remove.textContent = "删除";
+    actions.append(save, remove);
+    form.appendChild(actions);
+    parent.appendChild(form);
+  };
+
+  const renderMemory = (memory) => {
+    if (!memory || !activeMemory || !preferenceMemory) return;
+    activeMemory.replaceChildren();
+    if (memory.active_job) {
+      addText(activeMemory, "strong", "当前岗位");
+      addText(activeMemory, "p", `#${memory.active_job.id} ${memory.active_job.company || ""} - ${memory.active_job.title || ""}`.trim());
+      const form = document.createElement("form");
+      form.method = "post";
+      form.action = "/control/memories/active/clear";
+      const clear = document.createElement("button");
+      clear.type = "submit";
+      clear.className = "button compact";
+      clear.textContent = "清除当前岗位";
+      form.appendChild(clear);
+      activeMemory.appendChild(form);
+    } else {
+      addText(activeMemory, "p", "尚未选择岗位。", "empty");
+    }
+
+    preferenceMemory.replaceChildren();
+    addText(preferenceMemory, "strong", "显式偏好");
+    addText(preferenceMemory, "p", "只保存你主动说“记住：...”的内容，不自动改画像或评分。", "muted");
+    const preferences = Array.isArray(memory.preferences) ? memory.preferences : [];
+    if (preferences.length) preferences.forEach((item) => appendMemoryForm(preferenceMemory, item));
+    else addText(preferenceMemory, "p", "没有显式偏好。", "empty");
+  };
+
   const setPending = (pending) => {
     form.classList.toggle("is-pending", pending);
     input.disabled = pending;
@@ -132,6 +188,7 @@ document.addEventListener("click", async (event) => {
       const turn = addTurn("Agent", conversation.response_text, "agent-turn");
       addTrace(turn, conversation.evidence);
       addSuggestions(turn, conversation.evidence?.suggestions);
+      renderMemory(conversation.memory);
       const count = transcript.querySelectorAll(".agent-turn").length;
       turnCount.textContent = `${count} 轮`;
     } catch (error) {

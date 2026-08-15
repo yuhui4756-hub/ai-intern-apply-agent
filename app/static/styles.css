@@ -553,6 +553,42 @@ th {
   top: 84px;
 }
 
+.control-memory {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.control-memory p {
+  margin: 5px 0;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.control-memory-preferences {
+  border-top: 1px solid var(--line);
+  padding-top: 13px;
+}
+
+.control-memory-form {
+  display: flex;
+  margin-top: 10px;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.control-memory-form textarea {
+  min-height: 56px;
+  padding: 7px 8px;
+  font-size: 13px;
+}
+
+.control-side-divider {
+  margin: 18px 0;
+  border: 0;
+  border-top: 1px solid var(--line);
+}
+
 .control-plan + .control-plan {
   margin-top: 14px;
   border-top: 1px solid var(--line);

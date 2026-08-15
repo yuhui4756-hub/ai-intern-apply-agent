@@ -44,7 +44,14 @@ from .services.communication_browser import (
     send_message_in_controlled_edge,
 )
 from .services.conversation import classify_conversation, prepare_conversation_text
-from .services.control_layer import CITY_NAMES, ROLE_NAMES, normalize_model_control_intent, parse_control_intent, redact_control_text
+from .services.control_layer import (
+    CITY_NAMES,
+    ROLE_NAMES,
+    control_memory_contains_sensitive_text,
+    normalize_model_control_intent,
+    parse_control_intent,
+    redact_control_text,
+)
 from .services.github_projects import (
     GitHubProjectError,
     dedupe_urls,
@@ -4319,6 +4326,10 @@ def control_suggestions(intent_type: str, filters: dict[str, Any]) -> list[dict[
         return [{"label": "查看岗位列表", "url": "/jobs"}, {"label": "查看投递准备", "url": "/applications"}]
     if intent_type == "explain_job" and filters.get("job_id"):
         return [{"label": "打开岗位", "url": f"/jobs/{filters['job_id']}"}]
+    if intent_type == "select_job" and filters.get("job_id"):
+        return [{"label": "打开岗位", "url": f"/jobs/{filters['job_id']}"}]
+    if intent_type == "prepare_application" and filters.get("job_id"):
+        return [{"label": "查看投递准备", "url": "/applications"}, {"label": "打开岗位", "url": f"/jobs/{filters['job_id']}"}]
     if intent_type == "ignore_broadcast":
         return [{"label": "查看沟通记录", "url": "/communications"}]
     return [{"label": "岗位搜索", "url": "/searches"}, {"label": "岗位列表", "url": "/jobs"}]
@@ -4359,6 +4370,85 @@ def create_completed_control_execution(
 
 def control_event(kind: str, status: str, summary: str) -> dict[str, str]:
     return {"kind": kind, "status": status, "summary": summary}
+
+
+def control_memory_overview(conn: Any) -> dict[str, Any]:
+    active_row = conn.execute(
+        "SELECT * FROM control_memories WHERE memory_type = 'active_job' ORDER BY updated_at DESC, id DESC LIMIT 1"
+    ).fetchone()
+    active_job: dict[str, Any] | None = None
+    if active_row:
+        active_value = loads(active_row["value_json"], {})
+        job_id = active_value.get("job_id")
+        if isinstance(job_id, int) and job_id > 0:
+            job_row = conn.execute(
+                "SELECT id, company, title, platform, match_score, recommendation, risk_level, status FROM job_postings WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if job_row:
+                active_job = {key: job_row[key] for key in job_row.keys()}
+                active_job["memory_id"] = int(active_row["id"])
+                active_job["updated_at"] = str(active_row["updated_at"] or "")
+
+    preference_rows = conn.execute(
+        "SELECT * FROM control_memories WHERE memory_type = 'preference' ORDER BY updated_at DESC, id DESC LIMIT 12"
+    ).fetchall()
+    preferences = []
+    for row in preference_rows:
+        value = loads(row["value_json"], {})
+        content = str(value.get("content") or "").strip()[:300]
+        if content:
+            preferences.append({"id": int(row["id"]), "content": content, "updated_at": str(row["updated_at"] or "")})
+    return {"active_job": active_job, "preferences": preferences}
+
+
+def load_control_memory_overview() -> dict[str, Any]:
+    with connect() as conn:
+        return control_memory_overview(conn)
+
+
+def set_active_control_job(conn: Any, job_id: int, conversation_id: int | None = None) -> dict[str, Any] | None:
+    row = conn.execute(
+        "SELECT id, company, title, platform, match_score, recommendation, risk_level, status FROM job_postings WHERE id = ?",
+        (job_id,),
+    ).fetchone()
+    if not row:
+        return None
+    job = {key: row[key] for key in row.keys()}
+    now = utc_now()
+    conn.execute("DELETE FROM control_memories WHERE memory_type = 'active_job'")
+    conn.execute(
+        "INSERT INTO control_memories (memory_type, value_json, source_conversation_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+        ("active_job", dumps({"job_id": int(job["id"])}), conversation_id, now, now),
+    )
+    return job
+
+
+def add_control_preference(conn: Any, content: str, conversation_id: int | None = None) -> int:
+    now = utc_now()
+    cursor = conn.execute(
+        "INSERT INTO control_memories (memory_type, value_json, source_conversation_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+        ("preference", dumps({"content": content.strip()[:300]}), conversation_id, now, now),
+    )
+    return int(cursor.lastrowid)
+
+
+def control_active_reference_intent(message: str, fallback: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    if fallback["type"] != "help":
+        return fallback, ""
+    normalized = " ".join(message.strip().split())
+    if not any(token in normalized for token in ("当前岗位", "这个岗位", "该岗位")):
+        return fallback, ""
+    memory = load_control_memory_overview()
+    active_job = memory.get("active_job")
+    if not active_job:
+        return {"type": "help", "filters": {"missing_active_job": True}}, "当前没有已选择的岗位。"
+    job_id = int(active_job["id"])
+    if any(token in normalized for token in ("投递准备", "准备投递")):
+        return {"type": "prepare_application", "filters": {"job_id": job_id}}, ""
+    if any(token in normalized for token in ("解释", "分析", "详情", "看看", "怎么样")):
+        return {"type": "explain_job", "filters": {"job_id": job_id}}, ""
+    return fallback, ""
 
 
 def control_history_for_model(limit: int = 6) -> list[dict[str, str]]:
@@ -4405,12 +4495,19 @@ def control_intent_messages(message: str, history: list[dict[str, str]]) -> list
 
 
 def resolve_control_intent(message: str) -> tuple[dict[str, Any], dict[str, Any]]:
-    fallback = parse_control_intent(message)
+    fallback, active_job_error = control_active_reference_intent(message, parse_control_intent(message))
     if fallback["type"] != "help":
         return fallback, {
             "parser": "local_rules",
             "reasoning_summary": "本轮由本地规则完成任务理解，未产生模型调用。",
             "events": [control_event("判断摘要", "完成", f"使用本地规则识别为“{fallback['type']}”，未调用 LLM。")],
+        }
+
+    if active_job_error:
+        return fallback, {
+            "parser": "local_rules",
+            "reasoning_summary": active_job_error,
+            "events": [control_event("工作记忆", "需要选择", "请先输入“选择岗位 #编号”，再使用“当前岗位”。")],
         }
 
     client = client_for_task("control_intent")
@@ -4467,17 +4564,25 @@ def load_control_conversation(conversation_id: int) -> dict[str, Any]:
     return control_conversation_data(row)
 
 
+def control_message_response(conversation_id: int) -> dict[str, Any]:
+    conversation = load_control_conversation(conversation_id)
+    conversation["memory"] = load_control_memory_overview()
+    return conversation
+
+
 @app.get("/control")
 def control_page(request: Request) -> Any:
     with connect() as conn:
         history_rows = conn.execute("SELECT * FROM control_conversations ORDER BY id DESC LIMIT 20").fetchall()
         pending = conn.execute("SELECT * FROM control_plans WHERE status = '待确认' ORDER BY id DESC").fetchall()
+        control_memory = control_memory_overview(conn)
     history = [control_conversation_data(row) for row in reversed(history_rows)]
     latest_data = history[-1] if history else None
     return templates.TemplateResponse(request, "control.html", {
         "latest": latest_data,
         "history": history,
         "pending_plans": [{key: row[key] for key in row.keys()} for row in pending],
+        "control_memory": control_memory,
         "notice": request.query_params.get("notice", ""),
         "notice_type": request.query_params.get("notice_type", "info"),
     })
@@ -4583,7 +4688,7 @@ async def process_control_message(message: str) -> dict[str, Any]:
                 },
                 error_message=str(result.get("error") or "")[:300],
             )
-        return load_control_conversation(conversation_id)
+        return control_message_response(conversation_id)
     with connect() as conn:
         conversation_cursor = conn.execute(
             "INSERT INTO control_conversations (user_text, intent_type, response_text, evidence_json, created_at) VALUES (?, ?, '', '{}', ?)",
@@ -4601,6 +4706,62 @@ async def process_control_message(message: str) -> dict[str, Any]:
             else:
                 response_text = f"没有找到岗位 #{filters['job_id']}。请从岗位列表确认编号。"
             events.append(control_event("工具调用", "完成", "读取本地岗位记录并生成解释。"))
+        elif intent_type == "select_job" and filters.get("job_id"):
+            job = set_active_control_job(conn, int(filters["job_id"]), conversation_id)
+            if job:
+                response_text = (
+                    f"已将岗位 #{job['id']} 设为当前工作记忆：{job['company']} - {job['title']}。"
+                    "后续可说“当前岗位怎么样”或“为当前岗位创建投递准备”。"
+                )
+                events.append(control_event("工作记忆", "完成", f"当前岗位已更新为 #{job['id']}。"))
+                log_agent_action(
+                    conn,
+                    action_type="control_memory",
+                    status="当前岗位已更新",
+                    summary=f"已选择当前岗位：{job['company']} - {job['title']}",
+                    job_id=int(job["id"]),
+                    decision={"memory_type": "active_job", "external_effect": False},
+                )
+            else:
+                response_text = f"没有找到岗位 #{filters['job_id']}，未更新工作记忆。"
+                events.append(control_event("工作记忆", "未找到", "岗位记录不存在，当前工作记忆保持不变。"))
+        elif intent_type == "remember_preference":
+            content = str(filters.get("content") or "").strip()[:300]
+            if control_memory_contains_sensitive_text(content):
+                response_text = "偏好记忆未保存：其中包含可能的联系方式或密钥。请在对应的安全设置或候选人画像中处理。"
+                events.append(control_event("长期记忆", "已拦截", "不保存可能的联系方式、密码、Token 或 API Key。"))
+            else:
+                memory_id = add_control_preference(conn, content, conversation_id)
+                response_text = f"已保存本地偏好记忆 #{memory_id}。它不会自动发送到招聘平台，也不会直接改变岗位评分。"
+                events.append(control_event("长期记忆", "完成", "仅保存你明确提出的本地偏好，可在右侧编辑或删除。"))
+                log_agent_action(
+                    conn,
+                    action_type="control_memory",
+                    status="偏好已保存",
+                    summary="已保存一条显式本地偏好记忆。",
+                    decision={"memory_type": "preference", "external_effect": False, "content_logged": False},
+                )
+        elif intent_type == "show_memory":
+            memory = control_memory_overview(conn)
+            active_job = memory.get("active_job")
+            active_label = (
+                f"#{active_job['id']} {active_job['company']} - {active_job['title']}"
+                if active_job else "未选择"
+            )
+            preference_text = "；".join(item["content"] for item in memory["preferences"][:3]) or "无"
+            response_text = f"当前岗位：{active_label}。本地偏好记忆 {len(memory['preferences'])} 条：{preference_text}。"
+            events.append(control_event("工作记忆", "完成", "读取本地工作记忆和显式偏好，不访问模型或浏览器。"))
+        elif intent_type == "prepare_application" and filters.get("job_id"):
+            result = ensure_application_preparation_for_job(conn, int(filters["job_id"]), trigger_type="control_chat")
+            preparation_id = result.get("preparation_id")
+            if preparation_id:
+                action = "已生成" if result.get("created") else "已有"
+                response_text = f"{action}岗位 #{filters['job_id']} 的本地投递准备 #{preparation_id}。请在投递准备页核对简历版本后再确认。"
+                events.append(control_event("工具调用", "完成", f"{action}本地投递准备 #{preparation_id}。"))
+                events.append(control_event("安全结论", "未执行投递", "未打开平台、未上传简历、未点击投递。"))
+            else:
+                response_text = f"暂未生成岗位 #{filters['job_id']} 的投递准备：{result.get('reason') or '岗位不满足本地准入条件'}"
+                events.append(control_event("工具调用", "未执行", str(result.get("reason") or "岗位不满足本地准入条件。")))
         elif intent_type == "ignore_broadcast":
             capture_id = filters.get("capture_id")
             if capture_id:
@@ -4613,6 +4774,8 @@ async def process_control_message(message: str) -> dict[str, Any]:
                 response_text = "请指定对话采集编号，例如“将对话 #12 的群发消息标为忽略”。"
         elif intent_type == "show_plan":
             response_text = "可直接说“找杭州 Agent 实习，日薪至少 200”，我会执行受控岗位发现并返回评分摘要；投递、发简历和敏感信息仍需人工确认。"
+        elif filters.get("missing_active_job"):
+            response_text = "还没有当前岗位。请先在岗位列表确认编号，再说“选择岗位 #编号”。"
         else:
             response_text = "我目前可直接执行：受控岗位搜索、JD 读取和评分，并可解释“岗位 #编号”、查看统计或查看计划。投递、发简历、敏感信息和沟通发送仍会保留人工确认。"
         conn.execute(
@@ -4632,7 +4795,7 @@ async def process_control_message(message: str) -> dict[str, Any]:
                 "model_task_type": (evidence.get("model") or {}).get("task_type", ""),
             },
         )
-    return load_control_conversation(conversation_id)
+    return control_message_response(conversation_id)
 
 
 @app.post("/control")
@@ -4660,6 +4823,59 @@ async def control_message_api(request: Request) -> JSONResponse:
     except ValueError as exc:
         return api_error(str(exc))
     return JSONResponse({"ok": True, "conversation": conversation})
+
+
+@app.post("/control/memories/active/clear")
+def clear_active_control_job() -> RedirectResponse:
+    with connect() as conn:
+        deleted = conn.execute("DELETE FROM control_memories WHERE memory_type = 'active_job'").rowcount
+        if deleted:
+            log_agent_action(
+                conn,
+                action_type="control_memory",
+                status="当前岗位已清除",
+                summary="用户清除了当前岗位工作记忆。",
+                decision={"memory_type": "active_job", "external_effect": False},
+            )
+    return redirect_with_notice("/control", "当前岗位工作记忆已清除。" if deleted else "没有可清除的当前岗位。", "success" if deleted else "info")
+
+
+@app.post("/control/memories/{memory_id}/update")
+async def update_control_preference(memory_id: int, request: Request) -> RedirectResponse:
+    form = await request.form()
+    content = str(form.get("content") or "").strip()[:300]
+    if not content:
+        return redirect_with_notice("/control", "偏好记忆不能为空。", "error")
+    if control_memory_contains_sensitive_text(content):
+        return redirect_with_notice("/control", "偏好记忆不能保存联系方式、密码、Token 或 API Key。", "error")
+    with connect() as conn:
+        row = conn.execute("SELECT id FROM control_memories WHERE id = ? AND memory_type = 'preference'", (memory_id,)).fetchone()
+        if not row:
+            return redirect_with_notice("/control", "偏好记忆不存在或不可编辑。", "error")
+        conn.execute("UPDATE control_memories SET value_json = ?, updated_at = ? WHERE id = ?", (dumps({"content": content}), utc_now(), memory_id))
+        log_agent_action(
+            conn,
+            action_type="control_memory",
+            status="偏好已更新",
+            summary="用户更新了一条本地偏好记忆。",
+            decision={"memory_type": "preference", "memory_id": memory_id, "external_effect": False, "content_logged": False},
+        )
+    return redirect_with_notice("/control", "偏好记忆已更新。", "success")
+
+
+@app.post("/control/memories/{memory_id}/delete")
+def delete_control_preference(memory_id: int) -> RedirectResponse:
+    with connect() as conn:
+        deleted = conn.execute("DELETE FROM control_memories WHERE id = ? AND memory_type = 'preference'", (memory_id,)).rowcount
+        if deleted:
+            log_agent_action(
+                conn,
+                action_type="control_memory",
+                status="偏好已删除",
+                summary="用户删除了一条本地偏好记忆。",
+                decision={"memory_type": "preference", "memory_id": memory_id, "external_effect": False},
+            )
+    return redirect_with_notice("/control", "偏好记忆已删除。" if deleted else "偏好记忆不存在。", "success" if deleted else "error")
 
 
 @app.post("/control/plans/{plan_id}/confirm")

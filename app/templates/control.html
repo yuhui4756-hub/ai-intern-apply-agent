@@ -57,6 +57,27 @@
     </form>
   </div>
   <aside class="panel control-pending-panel">
+    <div class="panel-title"><h2>工作记忆</h2><span class="badge">本地</span></div>
+    <div class="control-memory" data-control-memory>
+      <div class="control-memory-active" data-active-memory>
+        {% if control_memory.active_job %}
+        <strong>当前岗位</strong>
+        <p>#{{ control_memory.active_job.id }} {{ control_memory.active_job.company }} - {{ control_memory.active_job.title }}</p>
+        <form method="post" action="/control/memories/active/clear"><button class="button compact" type="submit">清除当前岗位</button></form>
+        {% else %}<p class="empty">尚未选择岗位。</p>{% endif %}
+      </div>
+      <div class="control-memory-preferences" data-memory-preferences>
+        <strong>显式偏好</strong>
+        <p class="muted">只保存你主动说“记住：...”的内容，不自动改画像或评分。</p>
+        {% for memory in control_memory.preferences %}
+        <form method="post" action="/control/memories/{{ memory.id }}/update" class="control-memory-form">
+          <textarea name="content" rows="2" maxlength="300">{{ memory.content }}</textarea>
+          <div class="form-actions"><button class="button compact" type="submit">保存</button><button class="button danger compact" type="submit" formaction="/control/memories/{{ memory.id }}/delete">删除</button></div>
+        </form>
+        {% else %}<p class="empty">没有显式偏好。</p>{% endfor %}
+      </div>
+    </div>
+    <hr class="control-side-divider">
     <div class="panel-title"><h2>待确认动作</h2><span class="badge">{{ pending_plans|length }}</span></div>
     <p class="muted">只在这里确认会影响外部平台或本地标记的动作。</p>
     {% for plan in pending_plans %}

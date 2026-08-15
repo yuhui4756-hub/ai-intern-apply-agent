@@ -1,6 +1,28 @@
 from fastapi.testclient import TestClient
 
 
+def create_memory_test_job(conn, now):
+    resume_id = conn.execute(
+        "INSERT INTO resume_versions (name, target_role, is_default, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+        ("Agent 开发版", "Agent 开发实习", 1, now, now),
+    ).lastrowid
+    job_id = conn.execute(
+        """
+        INSERT INTO job_postings (
+            platform, title, company, city, jd_text, selected_resume_id,
+            match_score, match_level, risk_level, recommendation, status,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "Boss 直聘", "AI Agent 开发实习生", "记忆测试科技", "杭州",
+            "参与 Python、FastAPI 和 Agent 应用开发。", resume_id,
+            86, "高匹配", "低", "必投", "待确认", now, now,
+        ),
+    ).lastrowid
+    return int(job_id)
+
+
 def test_control_layer_runs_non_destructive_search_from_chat(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control.sqlite3"))
     from app import main
@@ -171,6 +193,97 @@ def test_control_message_api_rejects_extra_model_filter_fields(tmp_path, monkeyp
     conversation = response.json()["conversation"]
     assert conversation["intent_type"] == "help"
     assert conversation["evidence"]["parser"] == "local_rules"
+
+
+def test_control_memory_requires_explicit_job_selection_and_resolves_current_job(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-memory.sqlite3"))
+    from app import main
+    from app.db import connect, init_db, utc_now
+
+    init_db()
+    with connect() as conn:
+        job_id = create_memory_test_job(conn, utc_now())
+    monkeypatch.setattr(main, "client_for_task", lambda _task_type: None)
+    client = TestClient(main.app)
+
+    missing = client.post("/api/control/messages", json={"message": "当前岗位怎么样"}).json()["conversation"]
+    selected = client.post("/api/control/messages", json={"message": f"选择岗位 #{job_id}"}).json()["conversation"]
+    current = client.post("/api/control/messages", json={"message": "当前岗位怎么样"}).json()["conversation"]
+
+    assert missing["intent_type"] == "help"
+    assert "还没有当前岗位" in missing["response_text"]
+    assert selected["intent_type"] == "select_job"
+    assert selected["memory"]["active_job"]["id"] == job_id
+    assert current["intent_type"] == "explain_job"
+    assert "记忆测试科技" in current["response_text"]
+    assert current["memory"]["active_job"]["id"] == job_id
+
+
+def test_control_memory_can_save_preference_and_prepare_selected_job_locally(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-memory-prepare.sqlite3"))
+    from app import main
+    from app.db import connect, init_db, utc_now
+
+    init_db()
+    with connect() as conn:
+        job_id = create_memory_test_job(conn, utc_now())
+    monkeypatch.setattr(main, "client_for_task", lambda _task_type: None)
+    client = TestClient(main.app)
+
+    selected = client.post("/api/control/messages", json={"message": f"选择岗位 #{job_id}"})
+    remembered = client.post("/api/control/messages", json={"message": "记住：不考虑驻场岗位"}).json()["conversation"]
+    prepared = client.post("/api/control/messages", json={"message": "为当前岗位创建投递准备"}).json()["conversation"]
+
+    assert selected.status_code == 200
+    assert remembered["intent_type"] == "remember_preference"
+    assert remembered["memory"]["preferences"][0]["content"] == "不考虑驻场岗位"
+    assert prepared["intent_type"] == "prepare_application"
+    assert "未打开平台、未上传简历、未点击投递" in " ".join(event["summary"] for event in prepared["evidence"]["events"])
+    with connect() as conn:
+        preparation = conn.execute("SELECT status FROM application_preparations WHERE job_id = ?", (job_id,)).fetchone()
+    assert preparation["status"] == "待确认"
+
+
+def test_control_memory_preferences_can_be_updated_and_deleted_from_page(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-memory-edit.sqlite3"))
+    from app import main
+    from app.db import connect, init_db
+
+    init_db()
+    monkeypatch.setattr(main, "client_for_task", lambda _task_type: None)
+    client = TestClient(main.app)
+    created = client.post("/api/control/messages", json={"message": "记住：优先考虑成长性"}).json()["conversation"]
+    memory_id = created["memory"]["preferences"][0]["id"]
+
+    updated = client.post(f"/control/memories/{memory_id}/update", data={"content": "优先考虑工程成长性"}, follow_redirects=False)
+    with connect() as conn:
+        saved = conn.execute("SELECT value_json FROM control_memories WHERE id = ?", (memory_id,)).fetchone()
+    deleted = client.post(f"/control/memories/{memory_id}/delete", follow_redirects=False)
+    with connect() as conn:
+        remaining = conn.execute("SELECT COUNT(*) AS count FROM control_memories WHERE id = ?", (memory_id,)).fetchone()["count"]
+
+    assert updated.status_code == 303
+    assert "工程成长性" in saved["value_json"]
+    assert deleted.status_code == 303
+    assert remaining == 0
+
+
+def test_control_memory_rejects_sensitive_preference_content(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-memory-sensitive.sqlite3"))
+    from app import main
+    from app.db import connect, init_db
+
+    init_db()
+    monkeypatch.setattr(main, "client_for_task", lambda _task_type: None)
+    response = TestClient(main.app).post("/api/control/messages", json={"message": "记住：API Key=sk-abcdefghijklmnop"})
+
+    assert response.status_code == 200
+    conversation = response.json()["conversation"]
+    assert "未保存" in conversation["response_text"]
+    assert any(event["status"] == "已拦截" for event in conversation["evidence"]["events"])
+    with connect() as conn:
+        count = conn.execute("SELECT COUNT(*) AS count FROM control_memories").fetchone()["count"]
+    assert count == 0
 
 
 def test_control_layer_marks_broadcast_only_after_confirmation(tmp_path, monkeypatch):

@@ -406,6 +406,16 @@ def init_db() -> None:
                 created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS control_memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                memory_type TEXT NOT NULL,
+                value_json TEXT NOT NULL DEFAULT '{}',
+                source_conversation_id INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(source_conversation_id) REFERENCES control_conversations(id) ON DELETE SET NULL
+            );
+
             CREATE TABLE IF NOT EXISTS control_plans (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 conversation_id INTEGER,
