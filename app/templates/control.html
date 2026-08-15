@@ -1,21 +1,24 @@
 {% extends "layout.html" %}
 {% block title %}任务控制 - 简历投递 Agent{% endblock %}
 {% block content %}
-<section class="page-head"><div><h1>任务控制</h1><p>用自然语言整理任务；浏览器、状态修改和研究动作始终先展示计划并等待确认。</p></div><a class="button" href="/">返回流程</a></section>
+<section class="page-head"><div><h1>Agent 对话</h1><p>直接布置搜索、读取和分析任务；投递、发简历和敏感信息仍由你确认。</p></div><a class="button" href="/">返回流程</a></section>
 {% if notice %}<section class="notice {{ notice_type }}">{{ notice }}</section>{% endif %}
 <section class="panel">
   <form method="post" action="/control" class="stack-form">
-    <label>你想做什么<textarea name="message" rows="3" placeholder="例如：找杭州 Agent 实习，日薪至少 200"></textarea></label>
-    <div class="form-actions"><button class="button primary" type="submit">生成受限计划</button></div>
+    <label>你想做什么<textarea name="message" rows="3" placeholder="例如：根据我的画像找杭州 Agent 实习，日薪至少 200"></textarea></label>
+    <div class="form-actions"><button class="button primary" type="submit">发送任务</button></div>
   </form>
 </section>
-{% if latest %}
-<section class="panel"><div class="panel-title"><h2>最近理解</h2><span class="badge">{{ latest.intent_type }}</span></div>
-  <p>{{ latest.response_text }}</p>
-  {% if latest.evidence.suggestions %}<div class="form-actions">{% for item in latest.evidence.suggestions %}<a class="button" href="{{ item.url }}">{{ item.label }}</a>{% endfor %}</div>{% endif %}
+{% if history %}
+<section class="panel"><div class="panel-title"><h2>任务记录</h2><span class="badge">{{ history|length }}</span></div>
+  {% for item in history %}
+  <div class="list-item"><strong>你</strong><p>{{ item.user_text }}</p><strong>Agent</strong><p>{{ item.response_text }}</p>
+    {% if item.evidence.suggestions %}<div class="form-actions">{% for suggestion in item.evidence.suggestions %}<a class="button" href="{{ suggestion.url }}">{{ suggestion.label }}</a>{% endfor %}</div>{% endif %}
+  </div>
+  {% endfor %}
 </section>
 {% endif %}
-<section class="panel"><div class="panel-title"><h2>待确认计划</h2><span class="badge">{{ pending_plans|length }}</span></div>
+<section class="panel"><div class="panel-title"><h2>需要确认的动作</h2><span class="badge">{{ pending_plans|length }}</span></div>
 {% for plan in pending_plans %}
   <div class="list-item"><strong>{{ plan.summary }}</strong><p class="muted">{{ plan.created_at }}</p>
     <form method="post" action="/control/plans/{{ plan.id }}/confirm" class="inline-form"><button class="button primary" type="submit">确认执行</button></form>

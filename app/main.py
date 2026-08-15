@@ -4335,16 +4335,40 @@ def create_control_plan(conn: Any, conversation_id: int, action_type: str, summa
     return int(cursor.lastrowid)
 
 
+def create_completed_control_execution(
+    conn: Any,
+    conversation_id: int,
+    action_type: str,
+    summary: str,
+    payload: dict[str, Any],
+    result: dict[str, Any],
+    status: str,
+) -> int:
+    now = utc_now()
+    cursor = conn.execute(
+        """
+        INSERT INTO control_plans (
+            conversation_id, action_type, status, summary, payload_json, result_json,
+            created_at, confirmed_at, completed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (conversation_id, action_type, status, summary, dumps(payload), dumps(result), now, now, now),
+    )
+    return int(cursor.lastrowid)
+
+
 @app.get("/control")
 def control_page(request: Request) -> Any:
     with connect() as conn:
-        latest = conn.execute("SELECT * FROM control_conversations ORDER BY id DESC LIMIT 1").fetchone()
+        history_rows = conn.execute("SELECT * FROM control_conversations ORDER BY id DESC LIMIT 20").fetchall()
         pending = conn.execute("SELECT * FROM control_plans WHERE status = '待确认' ORDER BY id DESC").fetchall()
-    latest_data = {key: latest[key] for key in latest.keys()} if latest else None
-    if latest_data:
-        latest_data["evidence"] = loads(latest_data["evidence_json"], {})
+    history = [{key: row[key] for key in row.keys()} for row in reversed(history_rows)]
+    for item in history:
+        item["evidence"] = loads(item["evidence_json"], {})
+    latest_data = history[-1] if history else None
     return templates.TemplateResponse(request, "control.html", {
         "latest": latest_data,
+        "history": history,
         "pending_plans": [{key: row[key] for key in row.keys()} for row in pending],
         "notice": request.query_params.get("notice", ""),
         "notice_type": request.query_params.get("notice_type", "info"),
@@ -4361,6 +4385,69 @@ async def create_control_request(request: Request) -> RedirectResponse:
     intent_type, filters = intent["type"], intent["filters"]
     suggestions = control_suggestions(intent_type, filters)
     evidence: dict[str, Any] = {"parser": "local_rules", "filters": filters, "suggestions": suggestions}
+    if intent_type == "search_draft":
+        role = filters.get("role") or "沿用画像目标岗位"
+        city = filters.get("city") or "沿用画像城市"
+        salary = filters.get("min_salary_per_day")
+        suffix = f"，最低日薪 {salary} 元" if salary else ""
+        summary = f"在受控 Edge 中发现 {city} 的 {role}{suffix}。"
+        with connect() as conn:
+            conversation_cursor = conn.execute(
+                "INSERT INTO control_conversations (user_text, intent_type, response_text, evidence_json, created_at) VALUES (?, ?, '', '{}', ?)",
+                (redact_control_text(message), intent_type, utc_now()),
+            )
+            conversation_id = int(conversation_cursor.lastrowid)
+        try:
+            result = await run_in_threadpool(run_controlled_job_discovery, filters)
+            execution_status = "已完成" if result.get("status") != "失败" else "失败"
+            response_text = (
+                f"已执行岗位发现：{result.get('note') or '任务已完成。'}"
+                " 已保留搜索、JD 评分和审计记录；未发送消息、未上传简历、未投递。"
+            )
+        except Exception as exc:
+            result = {"error": str(exc)[:300]}
+            execution_status = "失败"
+            response_text = f"岗位发现未完成：{result['error']}。未执行投递或沟通动作。"
+        evidence["execution"] = {
+            "mode": "chat_direct_non_submitting",
+            "action_type": "job_discovery",
+            "status": execution_status,
+            "result": result,
+        }
+        with connect() as conn:
+            execution_id = create_completed_control_execution(
+                conn,
+                conversation_id,
+                "job_discovery",
+                summary,
+                filters,
+                result,
+                execution_status,
+            )
+            evidence["execution_id"] = execution_id
+            conn.execute(
+                "UPDATE control_conversations SET response_text = ?, evidence_json = ? WHERE id = ?",
+                (response_text, dumps(evidence), conversation_id),
+            )
+            log_agent_action(
+                conn,
+                action_type="control_request",
+                status=execution_status,
+                summary=response_text,
+                decision={
+                    "intent": intent_type,
+                    "filters": filters,
+                    "execution_mode": "chat_direct_non_submitting",
+                    "message_saved_redacted": True,
+                    "model_called": False,
+                    "auto_apply": False,
+                    "auto_message": False,
+                    "message_text_saved": False,
+                },
+                error_message=str(result.get("error") or "")[:300],
+            )
+        notice_type = "success" if execution_status == "已完成" else "error"
+        return redirect_with_notice("/control", "已执行聊天任务。", notice_type)
     with connect() as conn:
         conversation_cursor = conn.execute(
             "INSERT INTO control_conversations (user_text, intent_type, response_text, evidence_json, created_at) VALUES (?, ?, '', '{}', ?)",
@@ -4376,15 +4463,6 @@ async def create_control_request(request: Request) -> RedirectResponse:
                 response_text = f"岗位 #{filters['job_id']}：{job['company']} - {job['title']}，匹配 {job['match_score']} 分，建议“{job['recommendation']}”，风险“{job['risk_level']}”，当前状态“{job['status']}”。"
             else:
                 response_text = f"没有找到岗位 #{filters['job_id']}。请从岗位列表确认编号。"
-        elif intent_type == "search_draft":
-            role = filters.get("role") or "沿用画像目标岗位"
-            city = filters.get("city") or "沿用画像城市"
-            salary = filters.get("min_salary_per_day")
-            suffix = f"，最低日薪 {salary} 元" if salary else ""
-            summary = f"在受控 Edge 中发现 {city} 的 {role}{suffix}。"
-            plan_id = create_control_plan(conn, conversation_id, "job_discovery", summary, filters)
-            evidence["plan_id"] = plan_id
-            response_text = f"已生成计划：{summary}确认后才会调用现有受控岗位发现服务，不会由聊天直接操作浏览器。"
         elif intent_type == "ignore_broadcast":
             capture_id = filters.get("capture_id")
             if capture_id:
@@ -4395,9 +4473,9 @@ async def create_control_request(request: Request) -> RedirectResponse:
             else:
                 response_text = "请指定对话采集编号，例如“将对话 #12 的群发消息标为忽略”。"
         elif intent_type == "show_plan":
-            response_text = "可先用“找杭州 Agent 实习，日薪至少 200”生成岗位发现计划；待确认计划不会自行执行。"
+            response_text = "可直接说“找杭州 Agent 实习，日薪至少 200”，我会执行受控岗位发现并返回评分摘要；投递、发简历和敏感信息仍需人工确认。"
         else:
-            response_text = "我目前可处理：生成岗位搜索条件草案、解释“岗位 #编号”、查看统计、查看计划，以及将“对话 #编号”的群发样本标为忽略。涉及外部动作都会先生成待确认计划。"
+            response_text = "我目前可直接执行：受控岗位搜索、JD 读取和评分，并可解释“岗位 #编号”、查看统计或查看计划。投递、发简历、敏感信息和沟通发送仍会保留人工确认。"
         conn.execute(
             "UPDATE control_conversations SET response_text = ?, evidence_json = ? WHERE id = ?",
             (response_text, dumps(evidence), conversation_id),
