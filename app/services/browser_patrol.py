@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from urllib.parse import urlparse
 
@@ -37,7 +38,13 @@ RECRUITMENT_DOMAINS = {
 }
 # 实习僧 PC 端仅可查看消息，不能可靠回复；巡检仅覆盖可双向沟通的平台。
 PC_MESSAGE_AUTOMATION_PLATFORMS = {"Boss 直聘", "猎聘"}
-UNREAD_DISCOVERY_DETECTOR_VERSION = "message-list-v1"
+UNREAD_DISCOVERY_DETECTOR_VERSION = "message-list-v2"
+UNREAD_DISCOVERY_STRATEGIES = {
+    "猎聘": {
+        "row_selector": ".im-ui-contact-list-item",
+        "unread_selector": ".im-ui-contact-list-item .im-ui-avatar-weak-unread",
+    }
+}
 
 
 def open_message_patrol_browser(start_url: str = "") -> str:
@@ -136,7 +143,7 @@ def scan_controlled_edge_unread_conversations(
             if platform not in PC_MESSAGE_AUTOMATION_PLATFORMS:
                 continue
             try:
-                snapshot = evaluate_cdp_expression(target, unread_message_list_expression())
+                snapshot = evaluate_cdp_expression(target, unread_message_list_expression(platform))
             except Exception:
                 results.append(unread_scan_result(platform, {"read_error": True}))
                 continue
@@ -151,38 +158,48 @@ def scan_controlled_edge_unread_conversations(
         raise ValueError(f"无法读取受控 Edge 消息列表：{message[:160]}。请先在受控 Edge 打开 Boss 直聘或猎聘的消息列表。") from exc
 
 
-def unread_message_list_expression() -> str:
+def unread_message_list_expression(platform: str = "") -> str:
     """Return counts only. The browser script never opens a row or returns its text, title, or URL."""
+    strategy = UNREAD_DISCOVERY_STRATEGIES.get(platform, {})
+    row_selector = json.dumps(str(strategy.get("row_selector") or ""), ensure_ascii=False)
+    unread_selector = json.dumps(str(strategy.get("unread_selector") or ""), ensure_ascii=False)
     return """(() => {
-        const rowHints = /chat|conversation|session|dialog|message|contact|talk|im|list|item|会话|消息|沟通/;
-        const unreadHints = /unread|badge|red[-_]?dot|new[-_]?message|notification|未读|红点/;
+        const rowHints = /(?:^|[-_])(chat|conversation|session|dialog|message|contact|talk|im)(?:[-_]|$)|会话|消息|沟通/i;
+        const unreadHints = /unread|red[-_]?dot|new[-_]?message|未读|红点/i;
+        const rowSelector = __ROW_SELECTOR__;
+        const unreadSelector = __UNREAD_SELECTOR__;
         const visible = element => {
             const style = window.getComputedStyle(element);
             const rect = element.getBoundingClientRect();
             return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
         };
         const metadata = element => [
-            element.className || '', element.getAttribute('role') || '', element.getAttribute('aria-label') || '',
+            element.getAttribute('class') || '', element.getAttribute('role') || '', element.getAttribute('aria-label') || '',
             element.getAttribute('data-testid') || '', element.getAttribute('data-status') || ''
         ].join(' ').toLowerCase();
         const elements = Array.from(document.querySelectorAll('[class], [role], [aria-label], [data-testid], [data-status]'));
-        const rows = elements.filter(element => visible(element) && rowHints.test(metadata(element)));
-        const candidates = elements.filter(element => {
+        const genericRows = elements.filter(element => visible(element) && rowHints.test(metadata(element)));
+        const rows = rowSelector
+            ? Array.from(document.querySelectorAll(rowSelector)).filter(visible)
+            : genericRows;
+        const genericCandidates = elements.filter(element => {
             if (!visible(element)) return false;
             const detail = metadata(element);
             if (unreadHints.test(detail)) return true;
             const parentDetail = metadata(element.parentElement || element);
-            const markerText = (element.textContent || '').trim();
-            return unreadHints.test(parentDetail) && (/^\\d{1,3}$/.test(markerText) || markerText === '未读');
+            return unreadHints.test(parentDetail);
         });
+        const candidates = unreadSelector
+            ? Array.from(document.querySelectorAll(unreadSelector)).filter(visible)
+            : genericCandidates;
         const unreadRows = new Set();
         const signalTypes = new Set();
         for (const marker of candidates) {
             const detail = metadata(marker);
             const parentDetail = metadata(marker.parentElement || marker);
             if (/(unread|未读|new[-_]?message)/.test(detail + parentDetail)) signalTypes.add('unread');
-            if (/(badge|red[-_]?dot|红点|notification)/.test(detail + parentDetail)) signalTypes.add('badge');
-            let current = marker;
+            if (/(red[-_]?dot|红点)/.test(detail + parentDetail)) signalTypes.add('badge');
+            let current = marker.parentElement;
             for (let depth = 0; current && depth < 8; depth += 1, current = current.parentElement) {
                 if (rows.includes(current)) {
                     unreadRows.add(current);
@@ -199,7 +216,7 @@ def unread_message_list_expression() -> str:
             unread_badge_count: Math.min(candidates.length, 100),
             signal_types: Array.from(signalTypes).sort()
         };
-    })()"""
+    })()""".replace("__ROW_SELECTOR__", row_selector).replace("__UNREAD_SELECTOR__", unread_selector)
 
 
 def unread_scan_result(platform: str, snapshot: object) -> dict[str, object]:

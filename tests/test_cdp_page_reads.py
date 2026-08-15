@@ -135,6 +135,15 @@ def test_unread_scan_reads_only_boss_and_liepin_message_list_counts(monkeypatch)
     assert all("innerText" not in item[1] for item in expressions)
 
 
+def test_liepin_unread_expression_requires_calibrated_row_and_explicit_unread_marker():
+    expression = browser_patrol.unread_message_list_expression("猎聘")
+
+    assert ".im-ui-contact-list-item" in expression
+    assert ".im-ui-avatar-weak-unread" in expression
+    assert "unread|red" in expression
+    assert "notification" not in expression
+
+
 def test_unread_scan_does_not_count_markers_without_a_message_list(monkeypatch):
     target = {
         "id": "boss-job",

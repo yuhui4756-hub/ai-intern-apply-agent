@@ -17,7 +17,7 @@ def test_unread_scan_route_persists_counts_and_audit_only(tmp_path, monkeypatch)
             "message_list_page_count": 1,
             "unread_count": 2,
             "error_count": 0,
-            "detector_version": "message-list-v1",
+            "detector_version": "message-list-v2",
             "results": [
                 {
                     "platform": "Boss 直聘",
@@ -55,4 +55,4 @@ def test_unread_scan_route_persists_counts_and_audit_only(tmp_path, monkeypatch)
     page = client.get("/communications")
     assert page.status_code == 200
     assert "未读会话" in page.text
-    assert "message-list-v1" in page.text
+    assert "message-list-v2" in page.text
