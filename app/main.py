@@ -40,6 +40,7 @@ from .services.communication_browser import (
     build_browser_send_adapter_plan,
     calibrate_controlled_edge_chat_pages,
     fill_message_in_controlled_edge,
+    is_pc_message_automation_platform,
     probe_browser_send_adapter_plan,
     send_message_in_controlled_edge,
 )
@@ -224,6 +225,7 @@ def action_type_label(value: str) -> str:
         "interview_practice": "模拟面试",
         "interview_recording": "面试录音",
         "application_preparation": "投递准备",
+        "communication_preparation": "沟通准备",
         "application_browser_open": "投递页面打开",
         "application_browser_probe": "投递页面演练",
         "application_browser_fill": "投递附言填入",
@@ -4330,6 +4332,8 @@ def control_suggestions(intent_type: str, filters: dict[str, Any]) -> list[dict[
         return [{"label": "打开岗位", "url": f"/jobs/{filters['job_id']}"}]
     if intent_type == "prepare_application" and filters.get("job_id"):
         return [{"label": "查看投递准备", "url": "/applications"}, {"label": "打开岗位", "url": f"/jobs/{filters['job_id']}"}]
+    if intent_type == "prepare_communication" and filters.get("job_id"):
+        return [{"label": "查看沟通草稿", "url": "/communications#pending-drafts"}, {"label": "打开岗位", "url": f"/jobs/{filters['job_id']}"}]
     if intent_type == "ignore_broadcast":
         return [{"label": "查看沟通记录", "url": "/communications"}]
     return [{"label": "岗位搜索", "url": "/searches"}, {"label": "岗位列表", "url": "/jobs"}]
@@ -4444,6 +4448,8 @@ def control_active_reference_intent(message: str, fallback: dict[str, Any]) -> t
     if not active_job:
         return {"type": "help", "filters": {"missing_active_job": True}}, "当前没有已选择的岗位。"
     job_id = int(active_job["id"])
+    if any(token in normalized for token in ("准备沟通", "沟通准备", "准备打招呼", "开始沟通", "去沟通", "聊一下")):
+        return {"type": "prepare_communication", "filters": {"job_id": job_id}}, ""
     if any(token in normalized for token in ("投递准备", "准备投递")):
         return {"type": "prepare_application", "filters": {"job_id": job_id}}, ""
     if any(token in normalized for token in ("解释", "分析", "详情", "看看", "怎么样")):
@@ -4478,10 +4484,10 @@ def control_intent_messages(message: str, history: list[dict[str, str]]) -> list
             "role": "system",
             "content": (
                 "你是本地求职 Agent 的受限任务路由器。只输出 JSON 对象，不要回答用户，也不要输出分析过程。"
-                "允许的 type 只有 search_draft、stats、explain_job、ignore_broadcast、show_plan、help。"
+                "允许的 type 只有 search_draft、stats、explain_job、prepare_application、prepare_communication、ignore_broadcast、show_plan、help。"
                 "search_draft 的 filters 只能包含 role、city、min_salary_per_day；role 只能是"
                 f" {role_options} 或空字符串；city 只能是 {city_options} 或空字符串；薪资为整数或 null。"
-                "explain_job 只能返回正整数 job_id；ignore_broadcast 只能返回正整数 capture_id。"
+                "explain_job、prepare_application、prepare_communication 只能返回正整数 job_id；ignore_broadcast 只能返回正整数 capture_id。"
                 "stats、show_plan、help 的 filters 必须为空对象。"
                 "“这个岗位”“去沟通”“投递”等没有明确编号的指令必须返回 help，不能猜测目标。"
                 "reason 只写一句不超过 40 个字的可公开判断摘要，不能写思维链、隐私信息或工具参数。"
@@ -4761,6 +4767,27 @@ async def process_control_message(message: str) -> dict[str, Any]:
                 events.append(control_event("安全结论", "未执行投递", "未打开平台、未上传简历、未点击投递。"))
             else:
                 response_text = f"暂未生成岗位 #{filters['job_id']} 的投递准备：{result.get('reason') or '岗位不满足本地准入条件'}"
+                events.append(control_event("工具调用", "未执行", str(result.get("reason") or "岗位不满足本地准入条件。")))
+        elif intent_type == "prepare_communication" and filters.get("job_id"):
+            result = ensure_communication_preparation_for_job(conn, int(filters["job_id"]), trigger_type="control_chat")
+            draft_id = result.get("draft_id")
+            if draft_id:
+                action = "已生成" if result.get("created") else "已有"
+                response_text = (
+                    f"{action}岗位 #{filters['job_id']} 的本地沟通准备草稿 #{draft_id}。"
+                    f"{result.get('platform_note') or '请在沟通记录页人工审核。'}"
+                    "本轮未打开聊天页、未填入消息、未发送消息。"
+                )
+                events.append(control_event("工具调用", "完成", f"{action}本地沟通准备草稿 #{draft_id}。"))
+                events.append(control_event("安全结论", "未执行外部沟通", "未打开聊天页、未填入消息、未发送消息。"))
+                evidence["execution"] = {
+                    "mode": "chat_direct_local_preparation",
+                    "action_type": "communication_preparation",
+                    "status": "已完成",
+                    "result": result,
+                }
+            else:
+                response_text = f"暂未生成岗位 #{filters['job_id']} 的沟通准备：{result.get('reason') or '岗位不满足本地准入条件'}"
                 events.append(control_event("工具调用", "未执行", str(result.get("reason") or "岗位不满足本地准入条件。")))
         elif intent_type == "ignore_broadcast":
             capture_id = filters.get("capture_id")
@@ -6909,6 +6936,123 @@ def ensure_application_preparation_for_job(conn: Any, job_id: int, *, trigger_ty
         },
     )
     return {"created": True, "preparation_id": preparation_id, "resume_name": resume.get("name") if resume else ""}
+
+
+def communication_preparation_platform_note(platform: str) -> tuple[str, str]:
+    if is_pc_message_automation_platform(platform):
+        return "supported", f"{platform} 可在沟通记录页人工审核后进入既有的受控填入确认流程。"
+    if platform == "实习僧":
+        return "manual_only", "实习僧 PC 端暂不支持消息填入或发送，草稿仅供复制后在移动端人工处理。"
+    if platform in {"智联招聘", "前程无忧"}:
+        return "manual_only", f"{platform} 尚未启用可验证的 PC 消息自动化，草稿仅供人工处理。"
+    return "manual_only", "该平台尚未配置消息自动化，草稿仅供人工处理。"
+
+
+def communication_preparation_message(job: dict[str, Any]) -> tuple[str, list[str]]:
+    extracted = job.get("extracted") if isinstance(job.get("extracted"), dict) else {}
+    title = str(job.get("title") or extracted.get("title") or "该实习岗位").strip()
+    required_skills = [str(item).strip() for item in extracted.get("required_skills") or [] if str(item).strip()]
+    questions = ["岗位的主要工作内容和团队当前优先推进的方向"]
+    if required_skills:
+        questions.append(f"实际会使用的技术栈，以及 {'、'.join(required_skills[:3])} 在项目中的应用场景")
+    else:
+        questions.append("实际会使用的技术栈和协作方式")
+    if not str(extracted.get("internship_days") or "").strip() or not str(extracted.get("internship_duration") or "").strip():
+        questions.append("实习周期和每周到岗要求")
+    message = f"您好，我对「{title}」实习岗位很感兴趣，想进一步了解一下{'、'.join(questions)}。如果方便，期待和您沟通，谢谢！"
+    return message, questions
+
+
+def ensure_communication_preparation_for_job(conn: Any, job_id: int, *, trigger_type: str) -> dict[str, Any]:
+    row = conn.execute("SELECT * FROM job_postings WHERE id = ?", (job_id,)).fetchone()
+    if not row:
+        return {"created": False, "draft_id": None, "reason": "岗位不存在。"}
+
+    job = parse_json_fields({key: row[key] for key in row.keys()})
+    eligible, reason = application_preparation_eligibility(job)
+    if not eligible:
+        return {"created": False, "draft_id": None, "reason": reason}
+
+    platform = str(job.get("platform") or "")
+    capability, platform_note = communication_preparation_platform_note(platform)
+    existing = conn.execute(
+        """
+        SELECT id, status FROM message_drafts
+        WHERE job_id = ? AND draft_type = '聊天沟通准备' AND status = '待确认'
+        ORDER BY id DESC LIMIT 1
+        """,
+        (job_id,),
+    ).fetchone()
+    if existing:
+        return {
+            "created": False,
+            "draft_id": int(existing["id"]),
+            "status": str(existing["status"] or "待确认"),
+            "platform_capability": capability,
+            "platform_note": platform_note,
+        }
+
+    message, questions = communication_preparation_message(job)
+    now = utc_now()
+    reason_text = "聊天指令生成的本地沟通准备；仅基于岗位记录与 JD 提问点，不来自真实 HR 对话。草稿模式下需人工审核。"
+    cursor = conn.execute(
+        """
+        INSERT INTO message_drafts (
+            job_id, platform, draft_type, status, communication_mode,
+            followup_index, followup_limit, reason, message, risk_flags_json,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            job_id,
+            platform,
+            "聊天沟通准备",
+            "待确认",
+            "draft",
+            0,
+            0,
+            reason_text,
+            message,
+            dumps(["未采集真实 HR 对话；草稿不能视为已获得沟通邀请。"]),
+            now,
+            now,
+        ),
+    )
+    draft_id = int(cursor.lastrowid)
+    label = " - ".join(item for item in [job.get("company"), job.get("title")] if item) or f"岗位 {job_id}"
+    conn.execute(
+        "INSERT INTO application_events (job_id, event_type, content, created_at) VALUES (?, ?, ?, ?)",
+        (job_id, "沟通准备生成", f"{label} 已生成本地沟通准备草稿，未发送消息。", now),
+    )
+    log_agent_action(
+        conn,
+        action_type="communication_preparation",
+        status="待确认",
+        summary=f"已生成本地沟通准备：{label}",
+        platform=platform,
+        job_id=job_id,
+        draft_id=draft_id,
+        decision={
+            "trigger_type": trigger_type,
+            "draft_type": "聊天沟通准备",
+            "communication_mode": "draft",
+            "question_count": len(questions),
+            "platform_capability": capability,
+            "browser_opened": False,
+            "message_filled": False,
+            "message_sent": False,
+            "model_called": False,
+            "hr_conversation_used": False,
+        },
+    )
+    return {
+        "created": True,
+        "draft_id": draft_id,
+        "platform_capability": capability,
+        "platform_note": platform_note,
+        "message_length": len(message),
+        "question_count": len(questions),
+    }
 
 
 def application_browser_item(conn: Any, preparation_id: int) -> dict[str, Any] | None:

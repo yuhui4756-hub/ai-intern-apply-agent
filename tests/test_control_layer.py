@@ -244,6 +244,107 @@ def test_control_memory_can_save_preference_and_prepare_selected_job_locally(tmp
     assert preparation["status"] == "待确认"
 
 
+def test_control_communication_preparation_requires_an_explicit_current_job(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-communication-missing.sqlite3"))
+    from app import main
+    from app.db import init_db
+
+    monkeypatch.setattr(main, "client_for_task", lambda _task_type: None)
+    init_db()
+    conversation = TestClient(main.app).post(
+        "/api/control/messages", json={"message": "为当前岗位准备沟通"}
+    ).json()["conversation"]
+
+    assert conversation["intent_type"] == "help"
+    assert "还没有当前岗位" in conversation["response_text"]
+    assert conversation["evidence"]["events"][0]["kind"] == "工作记忆"
+
+
+def test_control_communication_preparation_rejects_low_match_or_high_risk_jobs(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-communication-ineligible.sqlite3"))
+    from app import main
+    from app.db import connect, init_db, utc_now
+
+    monkeypatch.setattr(main, "client_for_task", lambda _task_type: None)
+    init_db()
+    with connect() as conn:
+        low_match_job_id = create_memory_test_job(conn, utc_now())
+        high_risk_job_id = create_memory_test_job(conn, utc_now())
+        conn.execute("UPDATE job_postings SET recommendation = ? WHERE id = ?", ("跳过", low_match_job_id))
+        conn.execute("UPDATE job_postings SET risk_level = ? WHERE id = ?", ("高", high_risk_job_id))
+    client = TestClient(main.app)
+    client.post("/api/control/messages", json={"message": f"选择岗位 #{low_match_job_id}"})
+    low_match = client.post("/api/control/messages", json={"message": "为当前岗位准备沟通"}).json()["conversation"]
+    high_risk = client.post(
+        "/api/control/messages", json={"message": f"为岗位 #{high_risk_job_id} 准备沟通"}
+    ).json()["conversation"]
+    with connect() as conn:
+        draft_count = conn.execute("SELECT COUNT(*) AS count FROM message_drafts").fetchone()["count"]
+
+    assert low_match["intent_type"] == "prepare_communication"
+    assert "暂未生成" in low_match["response_text"]
+    assert high_risk["intent_type"] == "prepare_communication"
+    assert "风险不是“低/低风险”" in high_risk["response_text"]
+    assert draft_count == 0
+
+
+def test_control_communication_preparation_creates_local_draft_without_browser_actions(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-communication.sqlite3"))
+    from app import main
+    from app.db import connect, init_db, loads, utc_now
+
+    calls = []
+    monkeypatch.setattr(main, "client_for_task", lambda _task_type: None)
+    monkeypatch.setattr(main, "fill_message_in_controlled_edge", lambda *args, **kwargs: calls.append("fill"))
+    monkeypatch.setattr(main, "send_message_in_controlled_edge", lambda *args, **kwargs: calls.append("send"))
+    init_db()
+    with connect() as conn:
+        job_id = create_memory_test_job(conn, utc_now())
+    client = TestClient(main.app)
+    client.post("/api/control/messages", json={"message": f"选择岗位 #{job_id}"})
+    conversation = client.post("/api/control/messages", json={"message": "为当前岗位准备沟通"}).json()["conversation"]
+    with connect() as conn:
+        draft = conn.execute(
+            "SELECT job_id, platform, draft_type, status, communication_mode, message, reason FROM message_drafts"
+        ).fetchone()
+        log = conn.execute(
+            "SELECT decision_json FROM agent_action_logs WHERE action_type = 'communication_preparation'"
+        ).fetchone()
+        capture_count = conn.execute("SELECT COUNT(*) AS count FROM conversation_captures").fetchone()["count"]
+
+    assert conversation["intent_type"] == "prepare_communication"
+    assert conversation["evidence"]["execution"]["mode"] == "chat_direct_local_preparation"
+    assert draft["job_id"] == job_id
+    assert draft["draft_type"] == "聊天沟通准备"
+    assert draft["status"] == "待确认"
+    assert draft["communication_mode"] == "draft"
+    assert "主要工作内容" in draft["message"]
+    assert "不来自真实 HR 对话" in draft["reason"]
+    assert calls == []
+    assert capture_count == 0
+    assert loads(log["decision_json"], {})["message_sent"] is False
+
+
+def test_control_communication_preparation_marks_unsupported_platform_manual_only(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-communication-platform.sqlite3"))
+    from app import main
+    from app.db import connect, init_db, utc_now
+
+    monkeypatch.setattr(main, "client_for_task", lambda _task_type: None)
+    init_db()
+    with connect() as conn:
+        job_id = create_memory_test_job(conn, utc_now())
+        conn.execute("UPDATE job_postings SET platform = ? WHERE id = ?", ("实习僧", job_id))
+    client = TestClient(main.app)
+    client.post("/api/control/messages", json={"message": f"选择岗位 #{job_id}"})
+    conversation = client.post("/api/control/messages", json={"message": "为当前岗位准备沟通"}).json()["conversation"]
+
+    result = conversation["evidence"]["execution"]["result"]
+    assert result["platform_capability"] == "manual_only"
+    assert "移动端人工处理" in result["platform_note"]
+    assert "实习僧 PC 端" in conversation["response_text"]
+
+
 def test_control_memory_preferences_can_be_updated_and_deleted_from_page(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-memory-edit.sqlite3"))
     from app import main

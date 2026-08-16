@@ -6,7 +6,16 @@ from typing import Any
 
 CITY_NAMES = ("北京", "上海", "广州", "深圳", "杭州", "重庆", "成都", "南京")
 ROLE_NAMES = ("AI 应用开发实习", "Agent 开发实习", "AI 后端实习", "RAG 开发实习")
-ALLOWED_CONTROL_INTENTS = ("search_draft", "stats", "explain_job", "ignore_broadcast", "show_plan", "help")
+ALLOWED_CONTROL_INTENTS = (
+    "search_draft",
+    "stats",
+    "explain_job",
+    "prepare_application",
+    "prepare_communication",
+    "ignore_broadcast",
+    "show_plan",
+    "help",
+)
 CONTROL_MEMORY_SECRET_PATTERN = re.compile(r"(?i)(?:sk-[a-z0-9_-]{12,}|(?:api[_\s-]*key|password|密码|token)\s*[:=]|bearer\s+[a-z0-9._-]{12,})")
 
 
@@ -48,8 +57,8 @@ def normalize_model_control_intent(value: Any) -> dict[str, Any] | None:
             "reason": reason,
         }
 
-    if intent_type in {"explain_job", "ignore_broadcast"}:
-        key = "job_id" if intent_type == "explain_job" else "capture_id"
+    if intent_type in {"explain_job", "prepare_application", "prepare_communication", "ignore_broadcast"}:
+        key = "capture_id" if intent_type == "ignore_broadcast" else "job_id"
         if set(filters) != {key}:
             return None
         raw_id = filters.get(key)
@@ -108,6 +117,10 @@ def parse_control_intent(text: str) -> dict[str, Any]:
     if any(token in normalized for token in ("群发", "忽略", "无需回复")):
         capture_id = re.search(r"(?:记录|对话|采集)\s*#?(\d+)", normalized)
         return {"type": "ignore_broadcast", "filters": {"capture_id": int(capture_id.group(1)) if capture_id else None}}
+    if any(token in normalized for token in ("准备沟通", "沟通准备", "准备打招呼", "开始沟通", "去沟通")):
+        job_id = re.search(r"(?:岗位|职位)\s*#?(\d+)", normalized)
+        if job_id:
+            return {"type": "prepare_communication", "filters": {"job_id": int(job_id.group(1))}}
     if any(token in normalized for token in ("投递准备", "准备投递")):
         job_id = re.search(r"(?:岗位|职位)\s*#?(\d+)", normalized)
         if job_id:
