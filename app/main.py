@@ -1034,6 +1034,64 @@ def insert_company_research(
     return len(results)
 
 
+def run_company_research_for_job(
+    job_id: int,
+    *,
+    requested_depth: str = "auto",
+    trigger_type: str = "job_detail",
+) -> dict[str, Any]:
+    if requested_depth not in {"auto", "quick", "standard", "deep"}:
+        return {"status": "未执行", "reason": "检索深度无效。"}
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM job_postings WHERE id = ?", (job_id,)).fetchone()
+        if not row:
+            return {"status": "未执行", "reason": "岗位不存在。"}
+        job = {key: row[key] for key in row.keys()}
+        company = str(job.get("company") or "").strip()
+        if not company:
+            return {"status": "未执行", "reason": "公司名称为空，请先补充岗位信息。"}
+
+        search_depth = company_research_depth(job, requested_depth)
+        result_count = insert_company_research(
+            conn,
+            job_id,
+            company,
+            str(job.get("title") or ""),
+            str(job.get("city") or ""),
+            search_depth,
+            replace_existing=True,
+        )
+        status = "完成" if result_count else "无结果"
+        note = (
+            f"已查询“{company}”的公开公司资料，保存 {result_count} 条来源。"
+            if result_count
+            else f"未找到“{company}”可保存的公开公司资料，已保留原有查询结果。"
+        )
+        log_agent_action(
+            conn,
+            action_type="company_risk_research",
+            status=status,
+            summary=note,
+            platform=str(job.get("platform") or ""),
+            job_id=job_id,
+            decision={
+                "search_depth": search_depth,
+                "source_count": result_count,
+                "model_called": False,
+                "user_triggered": True,
+                "trigger_type": trigger_type,
+                "recruitment_platform_accessed": False,
+            },
+        )
+    return {
+        "status": status,
+        "note": note,
+        "source_count": result_count,
+        "search_depth": search_depth,
+        "company": company,
+    }
+
+
 def normalized_company_name(value: str) -> str:
     return re.sub(r"\s+", "", value or "").lower()
 
@@ -4328,6 +4386,8 @@ def control_suggestions(intent_type: str, filters: dict[str, Any]) -> list[dict[
         return [{"label": "查看岗位列表", "url": "/jobs"}, {"label": "查看投递准备", "url": "/applications"}]
     if intent_type == "explain_job" and filters.get("job_id"):
         return [{"label": "打开岗位", "url": f"/jobs/{filters['job_id']}"}]
+    if intent_type == "company_research" and filters.get("job_id"):
+        return [{"label": "查看公司来源", "url": f"/jobs/{filters['job_id']}"}]
     if intent_type == "select_job" and filters.get("job_id"):
         return [{"label": "打开岗位", "url": f"/jobs/{filters['job_id']}"}]
     if intent_type == "prepare_application" and filters.get("job_id"):
@@ -4441,13 +4501,16 @@ def control_active_reference_intent(message: str, fallback: dict[str, Any]) -> t
     if fallback["type"] != "help":
         return fallback, ""
     normalized = " ".join(message.strip().split())
-    if not any(token in normalized for token in ("当前岗位", "这个岗位", "该岗位")):
+    if not any(token in normalized for token in ("当前岗位", "这个岗位", "该岗位", "当前公司", "这家公司", "该公司")):
         return fallback, ""
     memory = load_control_memory_overview()
     active_job = memory.get("active_job")
     if not active_job:
         return {"type": "help", "filters": {"missing_active_job": True}}, "当前没有已选择的岗位。"
     job_id = int(active_job["id"])
+    if any(token in normalized for token in ("公司风险", "查公司", "公司尽调", "公司背调", "公司怎么样")):
+        search_depth = "deep" if any(token in normalized for token in ("深度", "详细")) else "quick" if "快速" in normalized else "standard" if "标准" in normalized else "auto"
+        return {"type": "company_research", "filters": {"job_id": job_id, "search_depth": search_depth}}, ""
     if any(token in normalized for token in ("准备沟通", "沟通准备", "准备打招呼", "开始沟通", "去沟通", "聊一下")):
         return {"type": "prepare_communication", "filters": {"job_id": job_id}}, ""
     if any(token in normalized for token in ("投递准备", "准备投递")):
@@ -4484,12 +4547,12 @@ def control_intent_messages(message: str, history: list[dict[str, str]]) -> list
             "role": "system",
             "content": (
                 "你是本地求职 Agent 的受限任务路由器。只输出 JSON 对象，不要回答用户，也不要输出分析过程。"
-                "允许的 type 只有 search_draft、stats、explain_job、prepare_application、prepare_communication、ignore_broadcast、show_plan、help。"
+                "允许的 type 只有 search_draft、stats、explain_job、ignore_broadcast、show_plan、help。"
                 "search_draft 的 filters 只能包含 role、city、min_salary_per_day；role 只能是"
                 f" {role_options} 或空字符串；city 只能是 {city_options} 或空字符串；薪资为整数或 null。"
-                "explain_job、prepare_application、prepare_communication 只能返回正整数 job_id；ignore_broadcast 只能返回正整数 capture_id。"
+                "explain_job 只能返回正整数 job_id；ignore_broadcast 只能返回正整数 capture_id。"
                 "stats、show_plan、help 的 filters 必须为空对象。"
-                "“这个岗位”“去沟通”“投递”等没有明确编号的指令必须返回 help，不能猜测目标。"
+                "公司查询、沟通准备和投递准备必须返回 help，不能猜测目标；它们只由本地规则在用户明确编号或已选择当前岗位后处理。"
                 "reason 只写一句不超过 40 个字的可公开判断摘要，不能写思维链、隐私信息或工具参数。"
             ),
         },
@@ -4691,6 +4754,74 @@ async def process_control_message(message: str) -> dict[str, Any]:
                     "auto_apply": False,
                     "auto_message": False,
                     "message_text_saved": False,
+                },
+                error_message=str(result.get("error") or "")[:300],
+            )
+        return control_message_response(conversation_id)
+    if intent_type == "company_research" and filters.get("job_id"):
+        requested_depth = str(filters.get("search_depth") or "auto")
+        summary = f"查询岗位 #{filters['job_id']} 的公开公司风险信息（{requested_depth}）。"
+        with connect() as conn:
+            conversation_cursor = conn.execute(
+                "INSERT INTO control_conversations (user_text, intent_type, response_text, evidence_json, created_at) VALUES (?, ?, '', '{}', ?)",
+                (redact_control_text(message), intent_type, utc_now()),
+            )
+            conversation_id = int(conversation_cursor.lastrowid)
+        events.append(control_event("工具调用", "执行中", f"查询岗位 #{filters['job_id']} 的公开公司信息，检索深度为“{requested_depth}”。"))
+        try:
+            result = await run_in_threadpool(
+                lambda: run_company_research_for_job(
+                    int(filters["job_id"]), requested_depth=requested_depth, trigger_type="control_chat"
+                )
+            )
+            execution_status = str(result.get("status") or "完成")
+            if execution_status == "未执行":
+                response_text = f"公司公开风险查询未执行：{result.get('reason') or '当前岗位不满足查询条件'}"
+            else:
+                response_text = str(result.get("note") or "公司公开风险查询已完成。")
+        except Exception as exc:
+            result = {"status": "失败", "error": str(exc)[:300]}
+            execution_status = "失败"
+            response_text = f"公司公开风险查询未完成：{result['error']}。"
+        events.append(control_event("工具结果", execution_status, response_text[:500]))
+        events.append(control_event("安全结论", "仅公开检索", "未访问招聘平台、未发送消息、未改变投递或沟通状态。"))
+        evidence["execution"] = {
+            "mode": "chat_direct_public_research",
+            "action_type": "company_research",
+            "status": execution_status,
+            "result": result,
+        }
+        with connect() as conn:
+            execution_id = create_completed_control_execution(
+                conn,
+                conversation_id,
+                "company_research",
+                summary,
+                filters,
+                result,
+                execution_status,
+            )
+            evidence["execution_id"] = execution_id
+            conn.execute(
+                "UPDATE control_conversations SET response_text = ?, evidence_json = ? WHERE id = ?",
+                (response_text, dumps(evidence), conversation_id),
+            )
+            log_agent_action(
+                conn,
+                action_type="control_request",
+                status=execution_status,
+                summary=response_text,
+                job_id=int(filters["job_id"]),
+                decision={
+                    "intent": intent_type,
+                    "filters": filters,
+                    "execution_mode": "chat_direct_public_research",
+                    "message_saved_redacted": True,
+                    "model_called": evidence["parser"] == "llm_json",
+                    "model_task_type": (evidence.get("model") or {}).get("task_type", ""),
+                    "recruitment_platform_accessed": False,
+                    "auto_apply": False,
+                    "auto_message": False,
                 },
                 error_message=str(result.get("error") or "")[:300],
             )

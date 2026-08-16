@@ -195,6 +195,38 @@ def test_control_message_api_rejects_extra_model_filter_fields(tmp_path, monkeyp
     assert conversation["evidence"]["parser"] == "local_rules"
 
 
+def test_control_message_api_rejects_model_selected_company_research(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-model-company-research.sqlite3"))
+    from app import main
+    from app.db import connect, init_db, utc_now
+
+    class FakeClient:
+        configured = True
+        profile = {"name": "不合规模型"}
+        model = "unsafe-model"
+
+        def complete_json(self, _messages):
+            return {"type": "company_research", "filters": {"job_id": 1, "search_depth": "deep"}, "reason": "不应选择岗位"}
+
+        def log_error(self, _message):
+            pass
+
+    calls = []
+    init_db()
+    with connect() as conn:
+        create_memory_test_job(conn, utc_now())
+    monkeypatch.setattr(main, "client_for_task", lambda task_type: FakeClient() if task_type == "control_intent" else None)
+    monkeypatch.setattr(main, "search_company", lambda *args: calls.append(args) or [])
+    conversation = TestClient(main.app).post(
+        "/api/control/messages", json={"message": "判断一下企业是否可靠"}
+    ).json()["conversation"]
+
+    assert conversation["intent_type"] == "help"
+    assert conversation["evidence"]["parser"] == "local_rules"
+    assert any(event["kind"] == "模型调用" and event["status"] == "已回退" for event in conversation["evidence"]["events"])
+    assert calls == []
+
+
 def test_control_memory_requires_explicit_job_selection_and_resolves_current_job(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-memory.sqlite3"))
     from app import main
@@ -242,6 +274,90 @@ def test_control_memory_can_save_preference_and_prepare_selected_job_locally(tmp
     with connect() as conn:
         preparation = conn.execute("SELECT status FROM application_preparations WHERE job_id = ?", (job_id,)).fetchone()
     assert preparation["status"] == "待确认"
+
+
+def test_control_company_research_requires_an_explicit_current_job(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-company-research-missing.sqlite3"))
+    from app import main
+    from app.db import init_db
+
+    called = []
+    monkeypatch.setattr(main, "client_for_task", lambda _task_type: None)
+    monkeypatch.setattr(main, "search_company", lambda *args: called.append(args) or [])
+    init_db()
+    conversation = TestClient(main.app).post(
+        "/api/control/messages", json={"message": "查当前岗位的公司风险"}
+    ).json()["conversation"]
+
+    assert conversation["intent_type"] == "help"
+    assert "还没有当前岗位" in conversation["response_text"]
+    assert called == []
+
+
+def test_control_company_research_persists_public_sources_without_platform_actions(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-company-research.sqlite3"))
+    from app import main
+    from app.db import connect, init_db, loads, utc_now
+    from app.services.research import SearchResult
+
+    calls = []
+
+    def fake_search(company, title, city, depth):
+        calls.append((company, title, city, depth))
+        return [SearchResult(title="企业公开资料", url="https://example.test/company", summary="公开查询摘要")]
+
+    monkeypatch.setattr(main, "client_for_task", lambda _task_type: None)
+    monkeypatch.setattr(main, "search_company", fake_search)
+    init_db()
+    with connect() as conn:
+        job_id = create_memory_test_job(conn, utc_now())
+    client = TestClient(main.app)
+    client.post("/api/control/messages", json={"message": f"选择岗位 #{job_id}"})
+    conversation = client.post(
+        "/api/control/messages", json={"message": "深度查询当前岗位的公司风险"}
+    ).json()["conversation"]
+    with connect() as conn:
+        source = conn.execute(
+            "SELECT source_title, source_url, summary FROM company_research WHERE job_id = ?", (job_id,)
+        ).fetchone()
+        action = conn.execute(
+            "SELECT decision_json FROM agent_action_logs WHERE action_type = 'company_risk_research'"
+        ).fetchone()
+        draft_count = conn.execute("SELECT COUNT(*) AS count FROM message_drafts").fetchone()["count"]
+
+    assert conversation["intent_type"] == "company_research"
+    assert conversation["evidence"]["execution"]["mode"] == "chat_direct_public_research"
+    assert calls == [("记忆测试科技", "AI Agent 开发实习生", "杭州", "deep")]
+    assert source["source_title"] == "企业公开资料"
+    assert source["source_url"] == "https://example.test/company"
+    decision = loads(action["decision_json"], {})
+    assert decision["recruitment_platform_accessed"] is False
+    assert draft_count == 0
+    assert "未访问招聘平台" in conversation["response_text"] or any(
+        "未访问招聘平台" in event["summary"] for event in conversation["evidence"]["events"]
+    )
+
+
+def test_control_company_research_blocks_missing_company_without_network_call(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-company-research-no-company.sqlite3"))
+    from app import main
+    from app.db import connect, init_db, utc_now
+
+    called = []
+    monkeypatch.setattr(main, "client_for_task", lambda _task_type: None)
+    monkeypatch.setattr(main, "search_company", lambda *args: called.append(args) or [])
+    init_db()
+    with connect() as conn:
+        job_id = create_memory_test_job(conn, utc_now())
+        conn.execute("UPDATE job_postings SET company = '' WHERE id = ?", (job_id,))
+    client = TestClient(main.app)
+    conversation = client.post(
+        "/api/control/messages", json={"message": f"查询岗位 #{job_id} 的公司风险"}
+    ).json()["conversation"]
+
+    assert conversation["intent_type"] == "company_research"
+    assert "公司名称为空" in conversation["response_text"]
+    assert called == []
 
 
 def test_control_communication_preparation_requires_an_explicit_current_job(tmp_path, monkeypatch):

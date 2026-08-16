@@ -10,8 +10,17 @@ ALLOWED_CONTROL_INTENTS = (
     "search_draft",
     "stats",
     "explain_job",
+    "company_research",
     "prepare_application",
     "prepare_communication",
+    "ignore_broadcast",
+    "show_plan",
+    "help",
+)
+MODEL_ROUTABLE_CONTROL_INTENTS = (
+    "search_draft",
+    "stats",
+    "explain_job",
     "ignore_broadcast",
     "show_plan",
     "help",
@@ -24,7 +33,7 @@ def normalize_model_control_intent(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
     intent_type = str(value.get("type") or "").strip()
-    if intent_type not in ALLOWED_CONTROL_INTENTS:
+    if intent_type not in MODEL_ROUTABLE_CONTROL_INTENTS:
         return None
     raw_filters = value.get("filters")
     filters = raw_filters if isinstance(raw_filters, dict) else {}
@@ -57,8 +66,8 @@ def normalize_model_control_intent(value: Any) -> dict[str, Any] | None:
             "reason": reason,
         }
 
-    if intent_type in {"explain_job", "prepare_application", "prepare_communication", "ignore_broadcast"}:
-        key = "capture_id" if intent_type == "ignore_broadcast" else "job_id"
+    if intent_type in {"explain_job", "ignore_broadcast"}:
+        key = "job_id" if intent_type == "explain_job" else "capture_id"
         if set(filters) != {key}:
             return None
         raw_id = filters.get(key)
@@ -117,6 +126,12 @@ def parse_control_intent(text: str) -> dict[str, Any]:
     if any(token in normalized for token in ("群发", "忽略", "无需回复")):
         capture_id = re.search(r"(?:记录|对话|采集)\s*#?(\d+)", normalized)
         return {"type": "ignore_broadcast", "filters": {"capture_id": int(capture_id.group(1)) if capture_id else None}}
+    company_research = any(token in normalized for token in ("公司风险", "查公司", "公司尽调", "公司背调", "公司怎么样"))
+    if company_research:
+        job_id = re.search(r"(?:岗位|职位)\s*#?(\d+)", normalized)
+        if job_id:
+            search_depth = "deep" if any(token in normalized for token in ("深度", "详细")) else "quick" if "快速" in normalized else "standard" if "标准" in normalized else "auto"
+            return {"type": "company_research", "filters": {"job_id": int(job_id.group(1)), "search_depth": search_depth}}
     if any(token in normalized for token in ("准备沟通", "沟通准备", "准备打招呼", "开始沟通", "去沟通")):
         job_id = re.search(r"(?:岗位|职位)\s*#?(\d+)", normalized)
         if job_id:
