@@ -258,6 +258,32 @@ def test_control_message_api_rejects_model_selected_match_review(tmp_path, monke
     assert calls == []
 
 
+def test_control_message_api_rejects_model_selected_job_comparison(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-model-compare.sqlite3"))
+    from app import main
+    from app.db import init_db
+
+    class FakeClient:
+        configured = True
+        profile = {"name": "不合规模型"}
+        model = "unsafe-model"
+
+        def complete_json(self, _messages):
+            return {"type": "compare_jobs", "filters": {"job_ids": [1, 2]}, "reason": "不应选择岗位"}
+
+        def log_error(self, _message):
+            pass
+
+    init_db()
+    monkeypatch.setattr(main, "client_for_task", lambda task_type: FakeClient() if task_type == "control_intent" else None)
+    conversation = TestClient(main.app).post(
+        "/api/control/messages", json={"message": "帮我在这两个机会中选一个"}
+    ).json()["conversation"]
+
+    assert conversation["intent_type"] == "help"
+    assert conversation["evidence"]["parser"] == "local_rules"
+
+
 def test_control_memory_requires_explicit_job_selection_and_resolves_current_job(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-memory.sqlite3"))
     from app import main
@@ -461,6 +487,97 @@ def test_control_match_review_runs_for_selected_job_without_browser_actions(tmp_
     assert decision["job_score_changed"] is False
     assert decision["job_status_changed"] is False
     assert draft_count == 0
+
+
+def test_control_compares_two_jobs_without_model_or_workflow_side_effects(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-compare.sqlite3"))
+    from app import main
+    from app.db import connect, dumps, init_db, loads, utc_now
+
+    init_db()
+    monkeypatch.setattr(main, "client_for_task", lambda _task_type: None)
+    with connect() as conn:
+        first_job_id = create_memory_test_job(conn, utc_now())
+        first_resume_id = conn.execute("SELECT selected_resume_id FROM job_postings WHERE id = ?", (first_job_id,)).fetchone()["selected_resume_id"]
+        conn.execute(
+            "UPDATE job_postings SET salary_text = ?, extracted_json = ? WHERE id = ?",
+            ("250-350 元/天", dumps({"scoring": {"matched_skills": ["Python", "FastAPI"], "missing_skills": ["Docker"]}}), first_job_id),
+        )
+        second_job_id = conn.execute(
+            """
+            INSERT INTO job_postings (
+                platform, title, company, city, salary_text, jd_text, selected_resume_id,
+                extracted_json, match_score, match_level, risk_level, recommendation, status,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "猎聘", "RAG 开发实习生", "比较测试科技", "杭州", "200-260 元/天", "参与 RAG 应用开发。", first_resume_id,
+                dumps({"scoring": {"matched_skills": ["Python"], "missing_skills": ["向量数据库", "Docker"]}}),
+                79, "中匹配", "低", "可冲", "待确认", utc_now(), utc_now(),
+            ),
+        ).lastrowid
+
+    conversation = TestClient(main.app).post(
+        "/api/control/messages", json={"message": f"比较岗位 #{first_job_id} 和岗位 #{second_job_id}"}
+    ).json()["conversation"]
+    with connect() as conn:
+        job_rows = conn.execute(
+            "SELECT id, match_score, recommendation, risk_level, status FROM job_postings WHERE id IN (?, ?) ORDER BY id",
+            (first_job_id, second_job_id),
+        ).fetchall()
+        plan = conn.execute("SELECT * FROM control_plans ORDER BY id DESC LIMIT 1").fetchone()
+        action = conn.execute(
+            "SELECT decision_json FROM agent_action_logs WHERE action_type = 'control_request' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        draft_count = conn.execute("SELECT COUNT(*) AS count FROM message_drafts").fetchone()["count"]
+
+    assert conversation["intent_type"] == "compare_jobs"
+    assert conversation["evidence"]["parser"] == "local_rules"
+    assert conversation["evidence"]["execution"]["mode"] == "chat_direct_local_comparison"
+    assert conversation["evidence"]["execution"]["result"]["preferred_job_id"] == first_job_id
+    assert f"建议优先处理岗位 #{first_job_id}" in conversation["response_text"]
+    assert "250-350 元/天" in conversation["response_text"]
+    assert [tuple(row) for row in job_rows] == [
+        (first_job_id, 86, "必投", "低", "待确认"),
+        (second_job_id, 79, "可冲", "低", "待确认"),
+    ]
+    assert plan["action_type"] == "compare_jobs"
+    assert plan["status"] == "已完成"
+    decision = loads(action["decision_json"], {})
+    assert decision["model_called"] is False
+    assert decision["browser_accessed"] is False
+    assert decision["job_score_changed"] is False
+    assert decision["job_status_changed"] is False
+    assert draft_count == 0
+
+
+def test_control_comparison_reports_missing_job_without_model_or_browser(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-compare-missing.sqlite3"))
+    from app import main
+    from app.db import connect, init_db, loads, utc_now
+
+    init_db()
+    monkeypatch.setattr(main, "client_for_task", lambda _task_type: None)
+    with connect() as conn:
+        job_id = create_memory_test_job(conn, utc_now())
+
+    conversation = TestClient(main.app).post(
+        "/api/control/messages", json={"message": f"比较岗位 #{job_id} 和岗位 #999"}
+    ).json()["conversation"]
+    with connect() as conn:
+        plan = conn.execute("SELECT * FROM control_plans ORDER BY id DESC LIMIT 1").fetchone()
+        action = conn.execute(
+            "SELECT decision_json FROM agent_action_logs WHERE action_type = 'control_request' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+
+    assert conversation["intent_type"] == "compare_jobs"
+    assert conversation["evidence"]["execution"]["status"] == "未找到"
+    assert "没有找到岗位 #999" in conversation["response_text"]
+    assert plan["status"] == "未找到"
+    decision = loads(action["decision_json"], {})
+    assert decision["model_called"] is False
+    assert decision["browser_accessed"] is False
 
 
 def test_control_communication_preparation_requires_an_explicit_current_job(tmp_path, monkeypatch):

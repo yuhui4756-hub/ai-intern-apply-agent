@@ -4386,6 +4386,9 @@ def control_suggestions(intent_type: str, filters: dict[str, Any]) -> list[dict[
         return [{"label": "查看岗位列表", "url": "/jobs"}, {"label": "查看投递准备", "url": "/applications"}]
     if intent_type == "explain_job" and filters.get("job_id"):
         return [{"label": "打开岗位", "url": f"/jobs/{filters['job_id']}"}]
+    if intent_type == "compare_jobs":
+        job_ids = [int(job_id) for job_id in filters.get("job_ids") or [] if isinstance(job_id, int) and job_id > 0]
+        return [{"label": f"打开岗位 #{job_id}", "url": f"/jobs/{job_id}"} for job_id in job_ids]
     if intent_type == "job_match_review" and filters.get("job_id"):
         return [{"label": "查看深度复核", "url": f"/jobs/{filters['job_id']}"}]
     if intent_type == "company_research" and filters.get("job_id"):
@@ -4436,6 +4439,82 @@ def create_completed_control_execution(
 
 def control_event(kind: str, status: str, summary: str) -> dict[str, str]:
     return {"kind": kind, "status": status, "summary": summary}
+
+
+def local_job_comparison_item(job: dict[str, Any]) -> dict[str, Any]:
+    scoring = (job.get("extracted") or {}).get("scoring") or {}
+    return {
+        "id": int(job["id"]),
+        "company": str(job.get("company") or "未填写公司"),
+        "title": str(job.get("title") or "未填写岗位名称"),
+        "match_score": int(job.get("match_score") or 0),
+        "recommendation": str(job.get("recommendation") or "待确认"),
+        "risk_level": str(job.get("risk_level") or "待确认"),
+        "status": str(job.get("status") or "待分析"),
+        "salary_text": str(job.get("salary_text") or "未披露"),
+        "matched_skills": compact_interview_items(scoring.get("matched_skills"), limit=4, item_limit=80),
+        "missing_skills": compact_interview_items(scoring.get("missing_skills"), limit=3, item_limit=80),
+        "risk_signals": compact_interview_items(scoring.get("risk_signals"), limit=3, item_limit=100),
+        "caution_signals": compact_interview_items(scoring.get("caution_signals"), limit=3, item_limit=100),
+        "skip_reason": str(job.get("skip_reason") or "").strip()[:180],
+    }
+
+
+def local_job_comparison_priority(item: dict[str, Any]) -> tuple[int, int, int]:
+    recommendation_rank = {"必投": 3, "可冲": 2, "可投递": 2, "待确认": 1, "跳过": 0}.get(item["recommendation"], 1)
+    blocked = item["risk_level"] == "高" or item["recommendation"] == "跳过" or item["status"] in {"已归档", "已忽略"}
+    return (0 if blocked else 1, recommendation_rank, item["match_score"])
+
+
+def compare_local_jobs(first: dict[str, Any], second: dict[str, Any]) -> dict[str, Any]:
+    first_item = local_job_comparison_item(first)
+    second_item = local_job_comparison_item(second)
+    first_priority = local_job_comparison_priority(first_item)
+    second_priority = local_job_comparison_priority(second_item)
+    if first_priority == second_priority:
+        preferred_job_id = None
+        reason_codes = ["当前本地评分、建议和风险没有形成明确优先级。"]
+    else:
+        preferred = first_item if first_priority > second_priority else second_item
+        other = second_item if preferred is first_item else first_item
+        preferred_job_id = preferred["id"]
+        reason_codes = []
+        if local_job_comparison_priority(preferred)[0] > local_job_comparison_priority(other)[0]:
+            reason_codes.append("另一岗位已归档、已忽略、标为跳过或存在高风险。")
+        if preferred["recommendation"] != other["recommendation"]:
+            reason_codes.append(f"本地建议为“{preferred['recommendation']}”，高于另一岗位的“{other['recommendation']}”。")
+        if preferred["match_score"] != other["match_score"]:
+            reason_codes.append(f"匹配分 {preferred['match_score']}，另一岗位为 {other['match_score']}。")
+    return {
+        "jobs": [first_item, second_item],
+        "preferred_job_id": preferred_job_id,
+        "reason_codes": reason_codes,
+    }
+
+
+def local_job_comparison_response(comparison: dict[str, Any]) -> str:
+    jobs = comparison["jobs"]
+    preferred_job_id = comparison.get("preferred_job_id")
+    lines = []
+    for item in jobs:
+        facts = [
+            f"岗位 #{item['id']} {item['company']} - {item['title']}：匹配分 {item['match_score']}，建议“{item['recommendation']}”，风险“{item['risk_level']}”，薪资 {item['salary_text']}。"
+        ]
+        if item["matched_skills"]:
+            facts.append("已匹配：" + "、".join(item["matched_skills"]) + "。")
+        if item["missing_skills"]:
+            facts.append("待补强：" + "、".join(item["missing_skills"]) + "。")
+        if item["risk_signals"] or item["caution_signals"]:
+            facts.append("注意：" + "、".join((item["risk_signals"] + item["caution_signals"])[:3]) + "。")
+        if item["skip_reason"]:
+            facts.append("归档原因：" + item["skip_reason"] + "。")
+        lines.append("".join(facts))
+    if preferred_job_id:
+        lines.append(f"按当前本地证据，建议优先处理岗位 #{preferred_job_id}。" + " ".join(comparison["reason_codes"]))
+    else:
+        lines.append("按当前本地证据无法区分优先级；建议先补全薪资、JD 或公司公开信息后再判断。")
+    lines.append("本轮未调用模型、未访问浏览器、未改变岗位评分或状态，也未创建沟通或投递动作。")
+    return " ".join(lines)
 
 
 def control_memory_overview(conn: Any) -> dict[str, Any]:
@@ -4556,7 +4635,7 @@ def control_intent_messages(message: str, history: list[dict[str, str]]) -> list
                 f" {role_options} 或空字符串；city 只能是 {city_options} 或空字符串；薪资为整数或 null。"
                 "explain_job 只能返回正整数 job_id；ignore_broadcast 只能返回正整数 capture_id。"
                 "stats、show_plan、help 的 filters 必须为空对象。"
-                "深度匹配复核、公司查询、沟通准备和投递准备必须返回 help，不能猜测目标；它们只由本地规则在用户明确编号或已选择当前岗位后处理。"
+                "岗位比较、深度匹配复核、公司查询、沟通准备和投递准备必须返回 help，不能猜测目标；它们只由本地规则在用户明确编号或已选择当前岗位后处理。"
                 "reason 只写一句不超过 40 个字的可公开判断摘要，不能写思维链、隐私信息或工具参数。"
             ),
         },
@@ -4760,6 +4839,96 @@ async def process_control_message(message: str) -> dict[str, Any]:
                     "message_text_saved": False,
                 },
                 error_message=str(result.get("error") or "")[:300],
+            )
+        return control_message_response(conversation_id)
+    if intent_type == "compare_jobs":
+        job_ids = [int(job_id) for job_id in filters.get("job_ids") or [] if isinstance(job_id, int) and job_id > 0]
+        if len(job_ids) != 2 or job_ids[0] == job_ids[1]:
+            response_text = "请指定两个不同的岗位编号，例如“比较岗位 #12 和岗位 #15”。"
+            events.append(control_event("工具调用", "未执行", "岗位比较需要两个不同的明确岗位编号。"))
+            with connect() as conn:
+                cursor = conn.execute(
+                    "INSERT INTO control_conversations (user_text, intent_type, response_text, evidence_json, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (redact_control_text(message), intent_type, response_text, dumps(evidence), utc_now()),
+                )
+                conversation_id = int(cursor.lastrowid)
+                log_agent_action(
+                    conn,
+                    action_type="control_request",
+                    status="未执行",
+                    summary=response_text,
+                    decision={"intent": intent_type, "filters": filters, "message_saved_redacted": True, "model_called": False},
+                )
+            return control_message_response(conversation_id)
+        summary = f"比较岗位 #{job_ids[0]} 与岗位 #{job_ids[1]} 的本地优先级。"
+        with connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM job_postings WHERE id IN (?, ?)",
+                (job_ids[0], job_ids[1]),
+            ).fetchall()
+            jobs_by_id = {int(row["id"]): parse_json_fields({key: row[key] for key in row.keys()}) for row in rows}
+            missing_job_ids = [job_id for job_id in job_ids if job_id not in jobs_by_id]
+            if missing_job_ids:
+                execution_status = "未找到"
+                result_summary = {"status": execution_status, "job_ids": job_ids, "missing_job_ids": missing_job_ids, "model_called": False}
+                response_text = "没有找到岗位 #" + "、#".join(str(job_id) for job_id in missing_job_ids) + "，未执行比较。"
+            else:
+                comparison = compare_local_jobs(jobs_by_id[job_ids[0]], jobs_by_id[job_ids[1]])
+                execution_status = "已完成"
+                result_summary = {
+                    "status": execution_status,
+                    "job_ids": job_ids,
+                    "preferred_job_id": comparison["preferred_job_id"],
+                    "reason_codes": comparison["reason_codes"],
+                    "model_called": False,
+                    "browser_accessed": False,
+                }
+                response_text = local_job_comparison_response(comparison)
+            conversation_cursor = conn.execute(
+                "INSERT INTO control_conversations (user_text, intent_type, response_text, evidence_json, created_at) VALUES (?, ?, '', '{}', ?)",
+                (redact_control_text(message), intent_type, utc_now()),
+            )
+            conversation_id = int(conversation_cursor.lastrowid)
+            execution_id = create_completed_control_execution(
+                conn,
+                conversation_id,
+                "compare_jobs",
+                summary,
+                {"job_ids": job_ids},
+                result_summary,
+                execution_status,
+            )
+            evidence["execution"] = {
+                "mode": "chat_direct_local_comparison",
+                "action_type": "compare_jobs",
+                "status": execution_status,
+                "result": result_summary,
+            }
+            evidence["execution_id"] = execution_id
+            events.append(control_event("工具调用", "完成" if execution_status == "已完成" else execution_status, "读取本地岗位分析结果进行比较。"))
+            events.append(control_event("工具结果", execution_status, response_text[:500]))
+            events.append(control_event("安全结论", "仅本地读取", "未调用模型、未访问浏览器、未修改岗位或创建沟通/投递动作。"))
+            conn.execute(
+                "UPDATE control_conversations SET response_text = ?, evidence_json = ? WHERE id = ?",
+                (response_text, dumps(evidence), conversation_id),
+            )
+            log_agent_action(
+                conn,
+                action_type="control_request",
+                status=execution_status,
+                summary=response_text,
+                decision={
+                    "intent": intent_type,
+                    "filters": {"job_ids": job_ids},
+                    "execution_mode": "chat_direct_local_comparison",
+                    "message_saved_redacted": True,
+                    "model_called": False,
+                    "browser_accessed": False,
+                    "auto_apply": False,
+                    "auto_message": False,
+                    "job_score_changed": False,
+                    "job_status_changed": False,
+                },
             )
         return control_message_response(conversation_id)
     if intent_type == "job_match_review" and filters.get("job_id"):
