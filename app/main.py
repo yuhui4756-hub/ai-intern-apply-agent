@@ -49,6 +49,7 @@ from .services.control_layer import (
     CITY_NAMES,
     ROLE_NAMES,
     control_memory_contains_sensitive_text,
+    explicit_control_job_ids,
     normalize_model_control_intent,
     parse_control_intent,
     redact_control_text,
@@ -4579,16 +4580,24 @@ def add_control_preference(conn: Any, content: str, conversation_id: int | None 
 
 
 def control_active_reference_intent(message: str, fallback: dict[str, Any]) -> tuple[dict[str, Any], str]:
-    if fallback["type"] != "help":
-        return fallback, ""
     normalized = " ".join(message.strip().split())
-    if not any(token in normalized for token in ("当前岗位", "这个岗位", "该岗位", "当前公司", "这家公司", "该公司")):
+    active_reference = any(token in normalized for token in ("当前岗位", "这个岗位", "该岗位", "当前公司", "这家公司", "该公司"))
+    if fallback["type"] == "compare_jobs" and not active_reference:
+        return fallback, ""
+    if fallback["type"] != "help" and not (fallback["type"] == "compare_jobs" and active_reference):
+        return fallback, ""
+    if not active_reference:
         return fallback, ""
     memory = load_control_memory_overview()
     active_job = memory.get("active_job")
     if not active_job:
         return {"type": "help", "filters": {"missing_active_job": True}}, "当前没有已选择的岗位。"
     job_id = int(active_job["id"])
+    if any(token in normalized for token in ("比较", "对比", "哪个更适合", "哪个值得优先", "优先沟通哪个")):
+        comparison_ids = [item for item in explicit_control_job_ids(normalized) if item != job_id]
+        if comparison_ids:
+            return {"type": "compare_jobs", "filters": {"job_ids": [job_id, comparison_ids[0]]}}, ""
+        return {"type": "compare_jobs", "filters": {"job_ids": [job_id]}}, ""
     if any(token in normalized for token in ("深度匹配复核", "深度复核", "匹配复核", "匹配解释")):
         return {"type": "job_match_review", "filters": {"job_id": job_id}}, ""
     if any(token in normalized for token in ("公司风险", "查公司", "公司尽调", "公司背调", "公司怎么样")):

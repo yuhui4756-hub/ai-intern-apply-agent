@@ -30,6 +30,15 @@ MODEL_ROUTABLE_CONTROL_INTENTS = (
 CONTROL_MEMORY_SECRET_PATTERN = re.compile(r"(?i)(?:sk-[a-z0-9_-]{12,}|(?:api[_\s-]*key|password|密码|token)\s*[:=]|bearer\s+[a-z0-9._-]{12,})")
 
 
+def explicit_control_job_ids(text: str) -> list[int]:
+    job_ids = []
+    for raw_id in re.findall(r"(?:岗位|职位)?\s*#\s*(\d+)", text):
+        job_id = int(raw_id)
+        if job_id not in job_ids:
+            job_ids.append(job_id)
+    return job_ids
+
+
 def normalize_model_control_intent(value: Any) -> dict[str, Any] | None:
     """Accept only the narrow intent schema that the policy layer understands."""
     if not isinstance(value, dict):
@@ -128,12 +137,8 @@ def parse_control_intent(text: str) -> dict[str, Any]:
     if any(token in normalized for token in ("群发", "忽略", "无需回复")):
         capture_id = re.search(r"(?:记录|对话|采集)\s*#?(\d+)", normalized)
         return {"type": "ignore_broadcast", "filters": {"capture_id": int(capture_id.group(1)) if capture_id else None}}
-    if any(token in normalized for token in ("比较岗位", "对比岗位", "比较职位", "对比职位", "哪个更适合", "哪个值得优先", "优先沟通哪个")):
-        job_ids = []
-        for raw_id in re.findall(r"(?:岗位|职位)?\s*#\s*(\d+)", normalized):
-            job_id = int(raw_id)
-            if job_id not in job_ids:
-                job_ids.append(job_id)
+    if any(token in normalized for token in ("比较", "对比", "哪个更适合", "哪个值得优先", "优先沟通哪个")):
+        job_ids = explicit_control_job_ids(normalized)
         return {"type": "compare_jobs", "filters": {"job_ids": job_ids[:2]}}
     company_research = any(token in normalized for token in ("公司风险", "查公司", "公司尽调", "公司背调", "公司怎么样"))
     if company_research:

@@ -552,6 +552,42 @@ def test_control_compares_two_jobs_without_model_or_workflow_side_effects(tmp_pa
     assert draft_count == 0
 
 
+def test_control_compares_current_job_with_explicit_other_job(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-compare-current.sqlite3"))
+    from app import main
+    from app.db import connect, init_db, utc_now
+
+    init_db()
+    monkeypatch.setattr(main, "client_for_task", lambda _task_type: None)
+    with connect() as conn:
+        active_job_id = create_memory_test_job(conn, utc_now())
+        resume_id = conn.execute("SELECT selected_resume_id FROM job_postings WHERE id = ?", (active_job_id,)).fetchone()["selected_resume_id"]
+        other_job_id = conn.execute(
+            """
+            INSERT INTO job_postings (
+                platform, title, company, city, jd_text, selected_resume_id,
+                match_score, match_level, risk_level, recommendation, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "Boss 直聘", "AI 应用开发实习生", "当前比较测试", "杭州", "参与 RAG 应用开发。", resume_id,
+                76, "中匹配", "低", "可冲", "待确认", utc_now(), utc_now(),
+            ),
+        ).lastrowid
+
+    client = TestClient(main.app)
+    client.post("/api/control/messages", json={"message": f"选择岗位 #{active_job_id}"})
+    conversation = client.post(
+        "/api/control/messages", json={"message": f"比较当前岗位和岗位 #{other_job_id}"}
+    ).json()["conversation"]
+
+    assert conversation["intent_type"] == "compare_jobs"
+    assert conversation["evidence"]["parser"] == "local_rules"
+    assert conversation["evidence"]["execution"]["result"]["preferred_job_id"] == active_job_id
+    assert f"建议优先处理岗位 #{active_job_id}" in conversation["response_text"]
+    assert conversation["memory"]["active_job"]["id"] == active_job_id
+
+
 def test_control_comparison_reports_missing_job_without_model_or_browser(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-compare-missing.sqlite3"))
     from app import main
