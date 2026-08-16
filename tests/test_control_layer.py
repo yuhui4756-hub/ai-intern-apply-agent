@@ -227,6 +227,37 @@ def test_control_message_api_rejects_model_selected_company_research(tmp_path, m
     assert calls == []
 
 
+def test_control_message_api_rejects_model_selected_match_review(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-model-match-review.sqlite3"))
+    from app import main
+    from app.db import connect, init_db, utc_now
+
+    class FakeClient:
+        configured = True
+        profile = {"name": "不合规模型"}
+        model = "unsafe-model"
+
+        def complete_json(self, _messages):
+            return {"type": "job_match_review", "filters": {"job_id": 1}, "reason": "不应选择岗位"}
+
+        def log_error(self, _message):
+            pass
+
+    calls = []
+    init_db()
+    with connect() as conn:
+        create_memory_test_job(conn, utc_now())
+    monkeypatch.setattr(main, "client_for_task", lambda task_type: FakeClient() if task_type == "control_intent" else None)
+    monkeypatch.setattr(main, "run_job_match_review", lambda job_id: calls.append(job_id) or {})
+    conversation = TestClient(main.app).post(
+        "/api/control/messages", json={"message": "帮我判断这个机会是否合适"}
+    ).json()["conversation"]
+
+    assert conversation["intent_type"] == "help"
+    assert conversation["evidence"]["parser"] == "local_rules"
+    assert calls == []
+
+
 def test_control_memory_requires_explicit_job_selection_and_resolves_current_job(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-memory.sqlite3"))
     from app import main
@@ -358,6 +389,78 @@ def test_control_company_research_blocks_missing_company_without_network_call(tm
     assert conversation["intent_type"] == "company_research"
     assert "公司名称为空" in conversation["response_text"]
     assert called == []
+
+
+def test_control_match_review_requires_an_explicit_current_job(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-match-review-missing.sqlite3"))
+    from app import main
+    from app.db import init_db
+
+    called = []
+    monkeypatch.setattr(main, "client_for_task", lambda _task_type: None)
+    monkeypatch.setattr(main, "run_job_match_review", lambda job_id: called.append(job_id) or {})
+    init_db()
+    conversation = TestClient(main.app).post(
+        "/api/control/messages", json={"message": "为当前岗位做深度匹配复核"}
+    ).json()["conversation"]
+
+    assert conversation["intent_type"] == "help"
+    assert "还没有当前岗位" in conversation["response_text"]
+    assert called == []
+
+
+def test_control_match_review_runs_for_selected_job_without_browser_actions(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-match-review.sqlite3"))
+    from app import main
+    from app.db import connect, init_db, loads, utc_now
+
+    calls = []
+
+    def fake_review(job_id):
+        calls.append(job_id)
+        return {
+            "status": "已完成",
+            "note": "已生成补充性深度匹配复核，本地评分和岗位状态未改变。",
+            "model_called": True,
+            "model_profile": "复核模型",
+            "model_name": "review-model",
+            "content": {
+                "conclusion": "岗位方向与已确认的 RAG 项目实践存在交集。",
+                "gaps": ["FastAPI 项目经历需要如实确认。"],
+                "questions_to_confirm": ["团队当前 Agent 工作流主要解决什么问题？"],
+                "model_fields": ["conclusion", "gaps", "questions_to_confirm"],
+            },
+        }
+
+    monkeypatch.setattr(main, "client_for_task", lambda _task_type: None)
+    monkeypatch.setattr(main, "run_job_match_review", fake_review)
+    init_db()
+    with connect() as conn:
+        job_id = create_memory_test_job(conn, utc_now())
+    client = TestClient(main.app)
+    client.post("/api/control/messages", json={"message": f"选择岗位 #{job_id}"})
+    conversation = client.post(
+        "/api/control/messages", json={"message": "为当前岗位做深度匹配复核"}
+    ).json()["conversation"]
+    with connect() as conn:
+        job = conn.execute(
+            "SELECT match_score, recommendation, risk_level, status FROM job_postings WHERE id = ?", (job_id,)
+        ).fetchone()
+        action = conn.execute(
+            "SELECT decision_json FROM agent_action_logs WHERE action_type = 'control_request' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        draft_count = conn.execute("SELECT COUNT(*) AS count FROM message_drafts").fetchone()["count"]
+
+    assert conversation["intent_type"] == "job_match_review"
+    assert conversation["evidence"]["execution"]["mode"] == "chat_direct_model_review"
+    assert calls == [job_id]
+    assert "岗位方向与已确认的 RAG 项目实践存在交集" in conversation["response_text"]
+    assert tuple(job) == (86, "必投", "低", "待确认")
+    decision = loads(action["decision_json"], {})
+    assert decision["browser_accessed"] is False
+    assert decision["job_score_changed"] is False
+    assert decision["job_status_changed"] is False
+    assert draft_count == 0
 
 
 def test_control_communication_preparation_requires_an_explicit_current_job(tmp_path, monkeypatch):

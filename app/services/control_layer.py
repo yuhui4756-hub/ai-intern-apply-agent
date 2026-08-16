@@ -10,6 +10,7 @@ ALLOWED_CONTROL_INTENTS = (
     "search_draft",
     "stats",
     "explain_job",
+    "job_match_review",
     "company_research",
     "prepare_application",
     "prepare_communication",
@@ -132,6 +133,10 @@ def parse_control_intent(text: str) -> dict[str, Any]:
         if job_id:
             search_depth = "deep" if any(token in normalized for token in ("深度", "详细")) else "quick" if "快速" in normalized else "standard" if "标准" in normalized else "auto"
             return {"type": "company_research", "filters": {"job_id": int(job_id.group(1)), "search_depth": search_depth}}
+    if any(token in normalized for token in ("深度匹配复核", "深度复核", "匹配复核", "匹配解释")):
+        job_id = re.search(r"(?:岗位|职位)\s*#?(\d+)", normalized)
+        if job_id:
+            return {"type": "job_match_review", "filters": {"job_id": int(job_id.group(1))}}
     if any(token in normalized for token in ("准备沟通", "沟通准备", "准备打招呼", "开始沟通", "去沟通")):
         job_id = re.search(r"(?:岗位|职位)\s*#?(\d+)", normalized)
         if job_id:

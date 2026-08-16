@@ -4386,6 +4386,8 @@ def control_suggestions(intent_type: str, filters: dict[str, Any]) -> list[dict[
         return [{"label": "查看岗位列表", "url": "/jobs"}, {"label": "查看投递准备", "url": "/applications"}]
     if intent_type == "explain_job" and filters.get("job_id"):
         return [{"label": "打开岗位", "url": f"/jobs/{filters['job_id']}"}]
+    if intent_type == "job_match_review" and filters.get("job_id"):
+        return [{"label": "查看深度复核", "url": f"/jobs/{filters['job_id']}"}]
     if intent_type == "company_research" and filters.get("job_id"):
         return [{"label": "查看公司来源", "url": f"/jobs/{filters['job_id']}"}]
     if intent_type == "select_job" and filters.get("job_id"):
@@ -4508,6 +4510,8 @@ def control_active_reference_intent(message: str, fallback: dict[str, Any]) -> t
     if not active_job:
         return {"type": "help", "filters": {"missing_active_job": True}}, "当前没有已选择的岗位。"
     job_id = int(active_job["id"])
+    if any(token in normalized for token in ("深度匹配复核", "深度复核", "匹配复核", "匹配解释")):
+        return {"type": "job_match_review", "filters": {"job_id": job_id}}, ""
     if any(token in normalized for token in ("公司风险", "查公司", "公司尽调", "公司背调", "公司怎么样")):
         search_depth = "deep" if any(token in normalized for token in ("深度", "详细")) else "quick" if "快速" in normalized else "standard" if "标准" in normalized else "auto"
         return {"type": "company_research", "filters": {"job_id": job_id, "search_depth": search_depth}}, ""
@@ -4552,7 +4556,7 @@ def control_intent_messages(message: str, history: list[dict[str, str]]) -> list
                 f" {role_options} 或空字符串；city 只能是 {city_options} 或空字符串；薪资为整数或 null。"
                 "explain_job 只能返回正整数 job_id；ignore_broadcast 只能返回正整数 capture_id。"
                 "stats、show_plan、help 的 filters 必须为空对象。"
-                "公司查询、沟通准备和投递准备必须返回 help，不能猜测目标；它们只由本地规则在用户明确编号或已选择当前岗位后处理。"
+                "深度匹配复核、公司查询、沟通准备和投递准备必须返回 help，不能猜测目标；它们只由本地规则在用户明确编号或已选择当前岗位后处理。"
                 "reason 只写一句不超过 40 个字的可公开判断摘要，不能写思维链、隐私信息或工具参数。"
             ),
         },
@@ -4754,6 +4758,95 @@ async def process_control_message(message: str) -> dict[str, Any]:
                     "auto_apply": False,
                     "auto_message": False,
                     "message_text_saved": False,
+                },
+                error_message=str(result.get("error") or "")[:300],
+            )
+        return control_message_response(conversation_id)
+    if intent_type == "job_match_review" and filters.get("job_id"):
+        summary = f"为岗位 #{filters['job_id']} 进行深度匹配复核。"
+        with connect() as conn:
+            conversation_cursor = conn.execute(
+                "INSERT INTO control_conversations (user_text, intent_type, response_text, evidence_json, created_at) VALUES (?, ?, '', '{}', ?)",
+                (redact_control_text(message), intent_type, utc_now()),
+            )
+            conversation_id = int(conversation_cursor.lastrowid)
+        events.append(control_event("工具调用", "执行中", f"调用岗位匹配解释模型复核岗位 #{filters['job_id']}。"))
+        try:
+            result = await run_in_threadpool(run_job_match_review, int(filters["job_id"]))
+            execution_status = str(result.get("status") or "未完成")
+            content = result.get("content") if isinstance(result.get("content"), dict) else {}
+            conclusion = str(content.get("conclusion") or "").strip()
+            gaps = [str(item).strip() for item in content.get("gaps") or [] if str(item).strip()]
+            questions = [str(item).strip() for item in content.get("questions_to_confirm") or [] if str(item).strip()]
+            if execution_status == "已完成":
+                parts = [str(result.get("note") or "深度匹配复核已完成。")]
+                if conclusion:
+                    parts.append(f"结论：{conclusion[:360]}")
+                if gaps:
+                    parts.append("待补强/确认：" + "；".join(gaps[:3]))
+                if questions:
+                    parts.append("沟通前问题：" + "；".join(questions[:2]))
+                response_text = " ".join(parts)
+            else:
+                response_text = str(result.get("note") or "深度匹配复核未完成。")
+        except Exception as exc:
+            result = {"status": "未完成", "error": str(exc)[:300], "model_called": False}
+            execution_status = "未完成"
+            response_text = f"深度匹配复核未完成：{result['error']}。"
+            content = {}
+        model_called = bool(result.get("model_called"))
+        model_status = "完成" if execution_status == "已完成" else "未配置" if execution_status == "未配置" else "未完成"
+        events.append(control_event("模型调用", model_status, str(result.get("note") or response_text)[:500]))
+        events.append(control_event("工具结果", execution_status, response_text[:500]))
+        events.append(control_event("安全结论", "仅补充证据", "未修改本地评分、风险、建议或岗位状态；未访问浏览器、未发送消息、未投递。"))
+        result_summary = {
+            "status": execution_status,
+            "note": str(result.get("note") or "")[:500],
+            "model_called": model_called,
+            "model_profile": str(result.get("model_profile") or ""),
+            "model_name": str(result.get("model_name") or ""),
+            "review_stored": bool(content),
+            "model_fields": list(content.get("model_fields") or []),
+        }
+        evidence["execution"] = {
+            "mode": "chat_direct_model_review",
+            "action_type": "job_match_review",
+            "status": execution_status,
+            "result": result_summary,
+        }
+        with connect() as conn:
+            execution_id = create_completed_control_execution(
+                conn,
+                conversation_id,
+                "job_match_review",
+                summary,
+                {"job_id": int(filters["job_id"])},
+                result_summary,
+                execution_status,
+            )
+            evidence["execution_id"] = execution_id
+            conn.execute(
+                "UPDATE control_conversations SET response_text = ?, evidence_json = ? WHERE id = ?",
+                (response_text, dumps(evidence), conversation_id),
+            )
+            log_agent_action(
+                conn,
+                action_type="control_request",
+                status=execution_status,
+                summary=response_text,
+                job_id=int(filters["job_id"]),
+                decision={
+                    "intent": intent_type,
+                    "filters": {"job_id": int(filters["job_id"])},
+                    "execution_mode": "chat_direct_model_review",
+                    "message_saved_redacted": True,
+                    "model_called": model_called,
+                    "model_task_type": "job_match" if model_called else "",
+                    "browser_accessed": False,
+                    "auto_apply": False,
+                    "auto_message": False,
+                    "job_score_changed": False,
+                    "job_status_changed": False,
                 },
                 error_message=str(result.get("error") or "")[:300],
             )
