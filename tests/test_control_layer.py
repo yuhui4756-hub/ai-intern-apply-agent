@@ -336,6 +336,32 @@ def test_control_message_api_rejects_model_selected_interview_preparation(tmp_pa
     assert conversation["evidence"]["parser"] == "local_rules"
 
 
+def test_control_message_api_rejects_model_selected_job_status_update(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-model-status.sqlite3"))
+    from app import main
+    from app.db import init_db
+
+    class FakeClient:
+        configured = True
+        profile = {"name": "不合规模型"}
+        model = "unsafe-model"
+
+        def complete_json(self, _messages):
+            return {"type": "update_job_status", "filters": {"job_id": 1, "status": "待投递"}, "reason": "不应选择岗位"}
+
+        def log_error(self, _message):
+            pass
+
+    init_db()
+    monkeypatch.setattr(main, "client_for_task", lambda task_type: FakeClient() if task_type == "control_intent" else None)
+    conversation = TestClient(main.app).post(
+        "/api/control/messages", json={"message": "帮我改一下求职流程"}
+    ).json()["conversation"]
+
+    assert conversation["intent_type"] == "help"
+    assert conversation["evidence"]["parser"] == "local_rules"
+
+
 def test_control_memory_requires_explicit_job_selection_and_resolves_current_job(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-memory.sqlite3"))
     from app import main
@@ -812,6 +838,86 @@ def test_control_interview_preparation_creates_once_for_confirmed_current_job(tm
     assert decision["browser_accessed"] is False
     assert decision["job_status_changed"] is False
     assert decision["interview_time_confirmed"] is False
+
+
+def test_control_status_update_waits_for_confirmation_then_creates_interview_prep(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-status-confirm.sqlite3"))
+    from app import main
+    from app.db import connect, init_db, loads, utc_now
+
+    init_db()
+    monkeypatch.setattr(main, "client_for_task", lambda _task_type: None)
+    with connect() as conn:
+        job_id = create_memory_test_job(conn, utc_now())
+        conn.execute("UPDATE job_postings SET status = ? WHERE id = ?", ("面试邀请", job_id))
+
+    client = TestClient(main.app)
+    client.post("/api/control/messages", json={"message": f"选择岗位 #{job_id}"})
+    conversation = client.post(
+        "/api/control/messages", json={"message": "将当前岗位标记为待面试"}
+    ).json()["conversation"]
+    with connect() as conn:
+        before_job = conn.execute("SELECT status FROM job_postings WHERE id = ?", (job_id,)).fetchone()
+        plan = conn.execute("SELECT * FROM control_plans ORDER BY id DESC LIMIT 1").fetchone()
+        prep_count = conn.execute("SELECT COUNT(*) AS count FROM interview_preparations WHERE job_id = ?", (job_id,)).fetchone()["count"]
+
+    assert conversation["intent_type"] == "update_job_status"
+    assert conversation["evidence"]["plan_id"] == plan["id"]
+    assert before_job["status"] == "面试邀请"
+    assert prep_count == 0
+    assert plan["status"] == "待确认"
+    assert loads(plan["payload_json"], {}) == {"job_id": job_id, "source_status": "面试邀请", "target_status": "待面试"}
+
+    confirmed = client.post(f"/control/plans/{plan['id']}/confirm", follow_redirects=False)
+    assert confirmed.status_code == 303
+    with connect() as conn:
+        after_job = conn.execute("SELECT status FROM job_postings WHERE id = ?", (job_id,)).fetchone()
+        completed_plan = conn.execute("SELECT * FROM control_plans WHERE id = ?", (plan["id"],)).fetchone()
+        preps = conn.execute("SELECT id FROM interview_preparations WHERE job_id = ?", (job_id,)).fetchall()
+        action = conn.execute(
+            "SELECT decision_json FROM agent_action_logs WHERE action_type = 'job_status_update' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+
+    assert after_job["status"] == "待面试"
+    assert completed_plan["status"] == "已完成"
+    assert len(preps) == 1
+    result = loads(completed_plan["result_json"], {})
+    assert result["previous_status"] == "面试邀请"
+    assert result["status"] == "待面试"
+    assert result["interview_preparation"]["created"] is True
+    decision = loads(action["decision_json"], {})
+    assert decision["user_confirmed"] is True
+    assert decision["model_called"] is False
+    assert decision["browser_accessed"] is False
+    assert decision["external_effect"] is False
+
+
+def test_control_status_update_rejects_stale_plan_without_overwriting_job(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-status-stale.sqlite3"))
+    from app import main
+    from app.db import connect, init_db, loads, utc_now
+
+    init_db()
+    monkeypatch.setattr(main, "client_for_task", lambda _task_type: None)
+    with connect() as conn:
+        job_id = create_memory_test_job(conn, utc_now())
+
+    client = TestClient(main.app)
+    client.post("/api/control/messages", json={"message": f"选择岗位 #{job_id}"})
+    client.post("/api/control/messages", json={"message": "将当前岗位标记为已沟通"})
+    with connect() as conn:
+        plan = conn.execute("SELECT * FROM control_plans ORDER BY id DESC LIMIT 1").fetchone()
+        conn.execute("UPDATE job_postings SET status = ? WHERE id = ?", ("待投递", job_id))
+
+    response = client.post(f"/control/plans/{plan['id']}/confirm", follow_redirects=False)
+    assert response.status_code == 303
+    with connect() as conn:
+        job = conn.execute("SELECT status FROM job_postings WHERE id = ?", (job_id,)).fetchone()
+        failed_plan = conn.execute("SELECT * FROM control_plans WHERE id = ?", (plan["id"],)).fetchone()
+
+    assert job["status"] == "待投递"
+    assert failed_plan["status"] == "失败"
+    assert "未覆盖" in loads(failed_plan["result_json"], {})["error"]
 
 
 def test_control_communication_preparation_requires_an_explicit_current_job(tmp_path, monkeypatch):

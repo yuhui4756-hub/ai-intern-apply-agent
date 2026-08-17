@@ -6,6 +6,18 @@ from typing import Any
 
 CITY_NAMES = ("北京", "上海", "广州", "深圳", "杭州", "重庆", "成都", "南京")
 ROLE_NAMES = ("AI 应用开发实习", "Agent 开发实习", "AI 后端实习", "RAG 开发实习")
+CONTROL_STATUS_UPDATE_TARGETS = (
+    "待投递",
+    "已投递",
+    "已沟通",
+    "面试邀请",
+    "待笔试",
+    "待面试",
+    "面试准备中",
+    "已面试",
+    "已拒绝",
+    "已通过",
+)
 ALLOWED_CONTROL_INTENTS = (
     "search_draft",
     "stats",
@@ -14,6 +26,7 @@ ALLOWED_CONTROL_INTENTS = (
     "compare_jobs",
     "job_match_review",
     "prepare_interview",
+    "update_job_status",
     "company_research",
     "prepare_application",
     "prepare_communication",
@@ -168,6 +181,14 @@ def parse_control_intent(text: str) -> dict[str, Any]:
     if any(token in normalized for token in ("比较", "对比", "哪个更适合", "哪个值得优先", "优先沟通哪个")):
         job_ids = explicit_control_job_ids(normalized)
         return {"type": "compare_jobs", "filters": {"job_ids": job_ids[:2]}}
+    status_target = next((item for item in CONTROL_STATUS_UPDATE_TARGETS if item in normalized), "")
+    status_action = any(token in normalized for token in ("标记", "改为", "改成", "设为", "更新状态", "变更状态"))
+    if status_target and status_action:
+        job_id = re.search(r"(?:岗位|职位)\s*#?(\d+)", normalized)
+        return {
+            "type": "update_job_status",
+            "filters": {"job_id": int(job_id.group(1)) if job_id else None, "status": status_target},
+        }
     if any(token in normalized for token in ("准备面试", "面试准备", "开始备面", "开始准备面试")):
         job_id = re.search(r"(?:岗位|职位)\s*#?(\d+)", normalized)
         return {"type": "prepare_interview", "filters": {"job_id": int(job_id.group(1)) if job_id else None}}

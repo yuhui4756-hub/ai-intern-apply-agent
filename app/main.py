@@ -47,6 +47,7 @@ from .services.communication_browser import (
 from .services.conversation import classify_conversation, prepare_conversation_text
 from .services.control_layer import (
     CITY_NAMES,
+    CONTROL_STATUS_UPDATE_TARGETS,
     ROLE_NAMES,
     control_memory_contains_sensitive_text,
     explicit_control_job_ids,
@@ -4395,6 +4396,8 @@ def control_suggestions(intent_type: str, filters: dict[str, Any]) -> list[dict[
         return [{"label": f"打开岗位 #{job_id}", "url": f"/jobs/{job_id}"} for job_id in job_ids]
     if intent_type == "prepare_interview":
         return [{"label": "查看面试准备", "url": "/interviews"}]
+    if intent_type == "update_job_status" and filters.get("job_id"):
+        return [{"label": "打开岗位", "url": f"/jobs/{filters['job_id']}"}]
     if intent_type == "job_match_review" and filters.get("job_id"):
         return [{"label": "查看深度复核", "url": f"/jobs/{filters['job_id']}"}]
     if intent_type == "company_research" and filters.get("job_id"):
@@ -4651,7 +4654,7 @@ def add_control_preference(conn: Any, content: str, conversation_id: int | None 
 def control_active_reference_intent(message: str, fallback: dict[str, Any]) -> tuple[dict[str, Any], str]:
     normalized = " ".join(message.strip().split())
     active_reference = any(token in normalized for token in ("当前岗位", "这个岗位", "该岗位", "当前公司", "这家公司", "该公司"))
-    active_memory_intents = {"compare_jobs", "prepare_interview"}
+    active_memory_intents = {"compare_jobs", "prepare_interview", "update_job_status"}
     if fallback["type"] in active_memory_intents and not active_reference:
         return fallback, ""
     if fallback["type"] != "help" and not (fallback["type"] in active_memory_intents and active_reference):
@@ -4670,6 +4673,8 @@ def control_active_reference_intent(message: str, fallback: dict[str, Any]) -> t
         return {"type": "compare_jobs", "filters": {"job_ids": [job_id]}}, ""
     if any(token in normalized for token in ("准备面试", "面试准备", "开始备面", "开始准备面试")):
         return {"type": "prepare_interview", "filters": {"job_id": job_id}}, ""
+    if fallback["type"] == "update_job_status" and fallback["filters"].get("status") in CONTROL_STATUS_UPDATE_TARGETS:
+        return {"type": "update_job_status", "filters": {"job_id": job_id, "status": fallback["filters"]["status"]}}, ""
     if any(token in normalized for token in ("深度匹配复核", "深度复核", "匹配复核", "匹配解释")):
         return {"type": "job_match_review", "filters": {"job_id": job_id}}, ""
     if any(token in normalized for token in ("公司风险", "查公司", "公司尽调", "公司背调", "公司怎么样")):
@@ -4716,7 +4721,7 @@ def control_intent_messages(message: str, history: list[dict[str, str]]) -> list
                 f" {role_options} 或空字符串；city 只能是 {city_options} 或空字符串；薪资为整数或 null。"
                 "explain_job 只能返回正整数 job_id；ignore_broadcast 只能返回正整数 capture_id。"
                 "stats、show_plan、help 的 filters 必须为空对象。"
-                "岗位短名单、岗位比较、深度匹配复核、面试准备、公司查询、沟通准备和投递准备必须返回 help，不能猜测目标；它们只由本地规则在用户明确编号或已选择当前岗位后处理。"
+                "岗位短名单、岗位比较、深度匹配复核、面试准备、状态变更、公司查询、沟通准备和投递准备必须返回 help，不能猜测目标；它们只由本地规则在用户明确编号或已选择当前岗位后处理。"
                 "reason 只写一句不超过 40 个字的可公开判断摘要，不能写思维链、隐私信息或工具参数。"
             ),
         },
@@ -5434,6 +5439,36 @@ async def process_control_message(message: str) -> dict[str, Any]:
             else:
                 response_text = f"暂未生成岗位 #{filters['job_id']} 的沟通准备：{result.get('reason') or '岗位不满足本地准入条件'}"
                 events.append(control_event("工具调用", "未执行", str(result.get("reason") or "岗位不满足本地准入条件。")))
+        elif intent_type == "update_job_status":
+            job_id = filters.get("job_id")
+            target_status = str(filters.get("status") or "")
+            if not isinstance(job_id, int) or job_id <= 0 or target_status not in CONTROL_STATUS_UPDATE_TARGETS:
+                response_text = "请指定岗位和目标状态，例如“将岗位 #12 标记为待投递”。"
+                events.append(control_event("工具调用", "未执行", "状态变更需要明确岗位编号或当前岗位，以及受支持的目标状态。"))
+            else:
+                job = conn.execute("SELECT id, company, title, status FROM job_postings WHERE id = ?", (job_id,)).fetchone()
+                if not job:
+                    response_text = f"没有找到岗位 #{job_id}，未创建状态变更计划。"
+                    events.append(control_event("工具调用", "未找到", "岗位记录不存在。"))
+                elif str(job["status"] or "") == target_status:
+                    response_text = f"岗位 #{job_id} 当前已经是“{target_status}”，无需更新。"
+                    events.append(control_event("工具调用", "无需更新", "目标状态与当前状态相同。"))
+                else:
+                    source_status = str(job["status"] or "待确认")
+                    summary = f"将岗位 #{job_id} 从“{source_status}”更新为“{target_status}”。"
+                    plan_id = create_control_plan(
+                        conn,
+                        conversation_id,
+                        "job_status_update",
+                        summary,
+                        {"job_id": job_id, "source_status": source_status, "target_status": target_status},
+                    )
+                    evidence["plan_id"] = plan_id
+                    response_text = (
+                        f"已生成本地状态变更计划 #{plan_id}：{summary}"
+                        "确认后只更新本地记录；不会访问招聘平台、发送消息或上传简历。"
+                    )
+                    events.append(control_event("安全结论", "等待确认", "状态变更需要在右侧待确认动作中确认；确认时会重新检查当前状态。"))
         elif intent_type == "ignore_broadcast":
             capture_id = filters.get("capture_id")
             if capture_id:
@@ -5445,11 +5480,11 @@ async def process_control_message(message: str) -> dict[str, Any]:
             else:
                 response_text = "请指定对话采集编号，例如“将对话 #12 的群发消息标为忽略”。"
         elif intent_type == "show_plan":
-            response_text = "可直接说“找杭州 Agent 实习，日薪至少 200”执行受控发现，也可以说“列出高匹配低风险岗位”查看本地短名单。岗位手动确认到“待面试”后，可说“为当前岗位准备面试”；投递、发简历和敏感信息仍需人工确认。"
+            response_text = "可直接说“找杭州 Agent 实习，日薪至少 200”执行受控发现，也可以说“列出高匹配低风险岗位”查看本地短名单。可说“将当前岗位标记为待投递”创建确认计划；岗位确认到“待面试”后可准备面试。投递、发简历和敏感信息仍需人工确认。"
         elif filters.get("missing_active_job"):
             response_text = "还没有当前岗位。请先在岗位列表确认编号，再说“选择岗位 #编号”。"
         else:
-            response_text = "我目前可直接执行：受控岗位搜索、本地岗位短名单、JD 读取和评分，并可解释或比较岗位、维护待面试后的本地准备、查看统计和计划。投递、发简历、敏感信息和沟通发送仍会保留人工确认。"
+            response_text = "我目前可直接执行：受控岗位搜索、本地岗位短名单、JD 读取和评分，并可解释或比较岗位、创建本地状态确认计划、维护待面试后的本地准备、查看统计和计划。投递、发简历、敏感信息和沟通发送仍会保留人工确认。"
         conn.execute(
             "UPDATE control_conversations SET response_text = ?, evidence_json = ? WHERE id = ?",
             (response_text, dumps(evidence), conversation_id),
@@ -5561,6 +5596,58 @@ async def confirm_control_plan(plan_id: int) -> RedirectResponse:
     try:
         if plan["action_type"] == "job_discovery":
             result = await run_in_threadpool(run_controlled_job_discovery, payload)
+        elif plan["action_type"] == "job_status_update":
+            job_id = int(payload["job_id"])
+            source_status = str(payload.get("source_status") or "")
+            target_status = str(payload.get("target_status") or "")
+            if target_status not in CONTROL_STATUS_UPDATE_TARGETS:
+                raise ValueError("计划中的目标状态无效。")
+            with connect() as conn:
+                job = conn.execute("SELECT id, company, title, status FROM job_postings WHERE id = ?", (job_id,)).fetchone()
+                if not job:
+                    raise ValueError("没有找到待更新的岗位。")
+                current_status = str(job["status"] or "")
+                if current_status != source_status:
+                    raise ValueError(f"岗位状态已从“{source_status}”变为“{current_status}”，未覆盖，请重新确认。")
+                now = utc_now()
+                conn.execute("UPDATE job_postings SET status = ?, updated_at = ? WHERE id = ?", (target_status, now, job_id))
+                conn.execute(
+                    "INSERT INTO application_events (job_id, event_type, content, created_at) VALUES (?, ?, ?, ?)",
+                    (job_id, "状态更新", f"控制层确认：{source_status} -> {target_status}", now),
+                )
+                prep_result = None
+                if target_status in INTERVIEW_PREP_TRIGGER_STATUSES:
+                    prep_result = ensure_interview_preparation_for_job(
+                        conn,
+                        job_id,
+                        trigger_type="control_plan_confirmation",
+                        source_text=f"用户确认将岗位状态更新为“{target_status}”。",
+                    )
+                result = {
+                    "job_id": job_id,
+                    "previous_status": source_status,
+                    "status": target_status,
+                    "interview_preparation": prep_result or {},
+                    "model_called": False,
+                    "browser_accessed": False,
+                    "external_effect": False,
+                }
+                log_agent_action(
+                    conn,
+                    action_type="job_status_update",
+                    status=target_status,
+                    summary=f"控制层确认将岗位状态从“{source_status}”更新为“{target_status}”。",
+                    job_id=job_id,
+                    decision={
+                        "plan_id": plan_id,
+                        "source_status": source_status,
+                        "target_status": target_status,
+                        "user_confirmed": True,
+                        "model_called": False,
+                        "browser_accessed": False,
+                        "external_effect": False,
+                    },
+                )
         elif plan["action_type"] == "ignore_broadcast":
             capture_id = int(payload["capture_id"])
             with connect() as conn:
