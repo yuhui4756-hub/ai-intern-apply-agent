@@ -4405,6 +4405,8 @@ def control_suggestions(intent_type: str, filters: dict[str, Any]) -> list[dict[
         if filters.get("job_id"):
             suggestions.append({"label": "打开岗位", "url": f"/jobs/{filters['job_id']}"})
         return suggestions
+    if intent_type == "scan_unread_conversations":
+        return [{"label": "查看沟通草稿", "url": "/communications"}]
     if intent_type == "job_match_review" and filters.get("job_id"):
         return [{"label": "查看深度复核", "url": f"/jobs/{filters['job_id']}"}]
     if intent_type == "company_research" and filters.get("job_id"):
@@ -4960,7 +4962,7 @@ def control_intent_messages(message: str, history: list[dict[str, str]]) -> list
                 f" {role_options} 或空字符串；city 只能是 {city_options} 或空字符串；薪资为整数或 null。"
                 "explain_job 只能返回正整数 job_id；ignore_broadcast 只能返回正整数 capture_id。"
                 "stats、show_plan、help 的 filters 必须为空对象。"
-                "岗位短名单、岗位比较、下一步建议、简历就绪检查、深度匹配复核、面试准备、状态变更、公司查询、沟通准备和投递准备必须返回 help，不能猜测目标；它们只由本地规则在用户明确编号或已选择当前岗位后处理。"
+                "岗位短名单、岗位比较、下一步建议、简历就绪检查、未读扫描、深度匹配复核、面试准备、状态变更、公司查询、沟通准备和投递准备必须返回 help，不能猜测目标；它们只由本地规则在用户明确编号或已选择当前岗位后处理。"
                 "reason 只写一句不超过 40 个字的可公开判断摘要，不能写思维链、隐私信息或工具参数。"
             ),
         },
@@ -5162,6 +5164,84 @@ async def process_control_message(message: str) -> dict[str, Any]:
                     "auto_apply": False,
                     "auto_message": False,
                     "message_text_saved": False,
+                },
+                error_message=str(result.get("error") or "")[:300],
+            )
+        return control_message_response(conversation_id)
+    if intent_type == "scan_unread_conversations":
+        with connect() as conn:
+            conversation_cursor = conn.execute(
+                "INSERT INTO control_conversations (user_text, intent_type, response_text, evidence_json, created_at) VALUES (?, ?, '', '{}', ?)",
+                (redact_control_text(message), intent_type, utc_now()),
+            )
+            conversation_id = int(conversation_cursor.lastrowid)
+        events.append(control_event("工具调用", "执行中", "只读检查已打开受控 Edge 消息列表的未读结构标记。"))
+        try:
+            result = await run_in_threadpool(run_unread_conversation_scan, "control_chat")
+            execution_status = str(result.get("status") or "未完成")
+            response_text = (
+                f"未读会话只读扫描：{execution_status}。{str(result.get('note') or '')}"
+                "结果仅表示页面未读标记候选，不读取会话正文、不打开会话、不生成回复。"
+            )
+        except Exception as exc:
+            result = {"status": "失败", "error": str(exc)[:300]}
+            execution_status = "失败"
+            response_text = f"未读会话只读扫描失败：{result['error']}。未读取或发送任何消息。"
+        result_summary = {
+            "status": execution_status,
+            "note": str(result.get("note") or "")[:500],
+            "checked_page_count": int(result.get("checked_page_count") or 0),
+            "message_list_page_count": int(result.get("message_list_page_count") or 0),
+            "unread_count": int(result.get("unread_count") or 0),
+            "error_count": int(result.get("error_count") or 0),
+            "detector_version": str(result.get("detector_version") or ""),
+            "model_called": False,
+            "page_text_saved": False,
+            "conversation_opened": False,
+            "browser_clicked": False,
+            "message_sent": False,
+        }
+        events.append(control_event("工具结果", execution_status, response_text[:500]))
+        events.append(control_event("安全结论", "只读未读标记", "未读取或保存会话正文、名称、标题或链接；未打开会话、未点击、未填入或发送消息。"))
+        evidence["execution"] = {
+            "mode": "chat_direct_read_only_unread_scan",
+            "action_type": "scan_unread_conversations",
+            "status": execution_status,
+            "result": result_summary,
+        }
+        with connect() as conn:
+            execution_id = create_completed_control_execution(
+                conn,
+                conversation_id,
+                "scan_unread_conversations",
+                "通过聊天触发受控 Edge 消息列表的只读未读扫描。",
+                {},
+                result_summary,
+                execution_status,
+            )
+            evidence["execution_id"] = execution_id
+            conn.execute(
+                "UPDATE control_conversations SET response_text = ?, evidence_json = ? WHERE id = ?",
+                (response_text, dumps(evidence), conversation_id),
+            )
+            log_agent_action(
+                conn,
+                action_type="control_request",
+                status=execution_status,
+                summary=response_text,
+                decision={
+                    "intent": intent_type,
+                    "filters": {},
+                    "execution_mode": "chat_direct_read_only_unread_scan",
+                    "message_saved_redacted": True,
+                    "model_called": False,
+                    "page_text_saved": False,
+                    "page_url_saved": False,
+                    "page_title_saved": False,
+                    "conversation_opened": False,
+                    "browser_clicked": False,
+                    "message_filled": False,
+                    "message_sent": False,
                 },
                 error_message=str(result.get("error") or "")[:300],
             )
@@ -5868,11 +5948,11 @@ async def process_control_message(message: str) -> dict[str, Any]:
             else:
                 response_text = "请指定对话采集编号，例如“将对话 #12 的群发消息标为忽略”。"
         elif intent_type == "show_plan":
-            response_text = "可直接说“找杭州 Agent 实习，日薪至少 200”执行受控发现，也可以说“检查简历准备情况”或“列出高匹配低风险岗位”。选择岗位后可问“当前岗位下一步怎么做”，或创建状态确认计划；岗位确认到“待面试”后可准备面试。投递、发简历和敏感信息仍需人工确认。"
+            response_text = "可直接说“找杭州 Agent 实习，日薪至少 200”执行受控发现，也可以说“检查简历准备情况”“列出高匹配低风险岗位”或“检查未读消息”。选择岗位后可问“当前岗位下一步怎么做”，或创建状态确认计划；岗位确认到“待面试”后可准备面试。投递、发简历和敏感信息仍需人工确认。"
         elif filters.get("missing_active_job"):
             response_text = "还没有当前岗位。请先在岗位列表确认编号，再说“选择岗位 #编号”。"
         else:
-            response_text = "我目前可直接执行：受控岗位搜索、本地岗位短名单、隐私保护的简历就绪检查、JD 读取和评分，并可解释、比较或给出岗位下一步建议，创建本地状态确认计划，维护待面试后的本地准备，查看统计和计划。投递、发简历、敏感信息和沟通发送仍会保留人工确认。"
+            response_text = "我目前可直接执行：受控岗位搜索、本地岗位短名单、隐私保护的简历就绪检查、用户明确触发的未读标记扫描、JD 读取和评分，并可解释、比较或给出岗位下一步建议，创建本地状态确认计划，维护待面试后的本地准备，查看统计和计划。投递、发简历、敏感信息和沟通发送仍会保留人工确认。"
         conn.execute(
             "UPDATE control_conversations SET response_text = ?, evidence_json = ? WHERE id = ?",
             (response_text, dumps(evidence), conversation_id),

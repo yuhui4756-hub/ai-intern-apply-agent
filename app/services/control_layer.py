@@ -29,6 +29,7 @@ ALLOWED_CONTROL_INTENTS = (
     "update_job_status",
     "next_job_action",
     "resume_readiness",
+    "scan_unread_conversations",
     "company_research",
     "prepare_application",
     "prepare_communication",
@@ -172,6 +173,8 @@ def parse_control_intent(text: str) -> dict[str, Any]:
         return {"type": "remember_preference", "filters": {"content": remembered.group(1).strip()[:300]}}
     if any(token in normalized for token in ("查看记忆", "当前记忆", "我的偏好", "我的记忆")):
         return {"type": "show_memory", "filters": {}}
+    if any(token in normalized for token in ("检查未读消息", "扫描未读消息", "检查未读会话", "扫描未读会话")):
+        return {"type": "scan_unread_conversations", "filters": {}}
     if any(token in normalized for token in ("检查简历", "简历准备情况", "简历还缺什么", "简历是否完整", "简历就绪")):
         job_id = re.search(r"(?:岗位|职位)\s*#?(\d+)", normalized)
         return {"type": "resume_readiness", "filters": {"job_id": int(job_id.group(1)) if job_id else None}}

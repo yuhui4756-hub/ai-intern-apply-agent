@@ -414,6 +414,32 @@ def test_control_message_api_rejects_model_selected_resume_readiness(tmp_path, m
     assert conversation["evidence"]["parser"] == "local_rules"
 
 
+def test_control_message_api_rejects_model_selected_unread_scan(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-model-unread-scan.sqlite3"))
+    from app import main
+    from app.db import init_db
+
+    class FakeClient:
+        configured = True
+        profile = {"name": "不合规模型"}
+        model = "unsafe-model"
+
+        def complete_json(self, _messages):
+            return {"type": "scan_unread_conversations", "filters": {}, "reason": "不应扫描页面"}
+
+        def log_error(self, _message):
+            pass
+
+    init_db()
+    monkeypatch.setattr(main, "client_for_task", lambda task_type: FakeClient() if task_type == "control_intent" else None)
+    conversation = TestClient(main.app).post(
+        "/api/control/messages", json={"message": "帮我看看现在有没有消息"}
+    ).json()["conversation"]
+
+    assert conversation["intent_type"] == "help"
+    assert conversation["evidence"]["parser"] == "local_rules"
+
+
 def test_control_memory_requires_explicit_job_selection_and_resolves_current_job(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-memory.sqlite3"))
     from app import main
@@ -1130,6 +1156,64 @@ def test_control_resume_readiness_uses_current_job_without_exposing_resume_text(
     assert decision["browser_accessed"] is False
     assert decision["resume_text_exposed"] is False
     assert decision["contact_information_exposed"] is False
+
+
+def test_control_unread_scan_runs_only_from_explicit_chat_request_and_keeps_message_data_empty(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-unread-scan.sqlite3"))
+    from app import main
+    from app.db import connect, init_db, loads
+
+    calls = []
+
+    def fake_scan(trigger_type):
+        calls.append(trigger_type)
+        return {
+            "status": "发现未读",
+            "note": "已只读检查 1 个消息列表页面，发现 2 个未读会话标记。",
+            "checked_page_count": 1,
+            "message_list_page_count": 1,
+            "unread_count": 2,
+            "error_count": 0,
+            "detector_version": "message-list-v2",
+        }
+
+    init_db()
+    monkeypatch.setattr(main, "client_for_task", lambda _task_type: None)
+    monkeypatch.setattr(main, "run_unread_conversation_scan", fake_scan)
+    conversation = TestClient(main.app).post(
+        "/api/control/messages", json={"message": "检查未读消息"}
+    ).json()["conversation"]
+    with connect() as conn:
+        plan = conn.execute("SELECT * FROM control_plans ORDER BY id DESC LIMIT 1").fetchone()
+        action = conn.execute(
+            "SELECT decision_json FROM agent_action_logs WHERE action_type = 'control_request' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        capture_count = conn.execute("SELECT COUNT(*) AS count FROM conversation_captures").fetchone()["count"]
+        draft_count = conn.execute("SELECT COUNT(*) AS count FROM message_drafts").fetchone()["count"]
+        model_count = conn.execute("SELECT COUNT(*) AS count FROM model_call_logs").fetchone()["count"]
+
+    assert calls == ["control_chat"]
+    assert conversation["intent_type"] == "scan_unread_conversations"
+    assert conversation["evidence"]["execution"]["mode"] == "chat_direct_read_only_unread_scan"
+    result = conversation["evidence"]["execution"]["result"]
+    assert result["unread_count"] == 2
+    assert result["page_text_saved"] is False
+    assert result["conversation_opened"] is False
+    assert result["browser_clicked"] is False
+    assert result["message_sent"] is False
+    assert "不读取会话正文" in conversation["response_text"]
+    assert plan["action_type"] == "scan_unread_conversations"
+    assert plan["status"] == "发现未读"
+    decision = loads(action["decision_json"], {})
+    assert decision["model_called"] is False
+    assert decision["page_text_saved"] is False
+    assert decision["conversation_opened"] is False
+    assert decision["browser_clicked"] is False
+    assert decision["message_filled"] is False
+    assert decision["message_sent"] is False
+    assert capture_count == 0
+    assert draft_count == 0
+    assert model_count == 0
 
 
 def test_control_communication_preparation_requires_an_explicit_current_job(tmp_path, monkeypatch):
