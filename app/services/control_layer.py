@@ -13,6 +13,7 @@ ALLOWED_CONTROL_INTENTS = (
     "explain_job",
     "compare_jobs",
     "job_match_review",
+    "prepare_interview",
     "company_research",
     "prepare_application",
     "prepare_communication",
@@ -167,6 +168,9 @@ def parse_control_intent(text: str) -> dict[str, Any]:
     if any(token in normalized for token in ("比较", "对比", "哪个更适合", "哪个值得优先", "优先沟通哪个")):
         job_ids = explicit_control_job_ids(normalized)
         return {"type": "compare_jobs", "filters": {"job_ids": job_ids[:2]}}
+    if any(token in normalized for token in ("准备面试", "面试准备", "开始备面", "开始准备面试")):
+        job_id = re.search(r"(?:岗位|职位)\s*#?(\d+)", normalized)
+        return {"type": "prepare_interview", "filters": {"job_id": int(job_id.group(1)) if job_id else None}}
     company_research = any(token in normalized for token in ("公司风险", "查公司", "公司尽调", "公司背调", "公司怎么样"))
     if company_research:
         job_id = re.search(r"(?:岗位|职位)\s*#?(\d+)", normalized)

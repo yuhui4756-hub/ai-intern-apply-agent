@@ -310,6 +310,32 @@ def test_control_message_api_rejects_model_selected_job_list(tmp_path, monkeypat
     assert conversation["evidence"]["parser"] == "local_rules"
 
 
+def test_control_message_api_rejects_model_selected_interview_preparation(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-model-interview.sqlite3"))
+    from app import main
+    from app.db import init_db
+
+    class FakeClient:
+        configured = True
+        profile = {"name": "不合规模型"}
+        model = "unsafe-model"
+
+        def complete_json(self, _messages):
+            return {"type": "prepare_interview", "filters": {"job_id": 1}, "reason": "不应选择岗位"}
+
+        def log_error(self, _message):
+            pass
+
+    init_db()
+    monkeypatch.setattr(main, "client_for_task", lambda task_type: FakeClient() if task_type == "control_intent" else None)
+    conversation = TestClient(main.app).post(
+        "/api/control/messages", json={"message": "帮我开始准备一下"}
+    ).json()["conversation"]
+
+    assert conversation["intent_type"] == "help"
+    assert conversation["evidence"]["parser"] == "local_rules"
+
+
 def test_control_memory_requires_explicit_job_selection_and_resolves_current_job(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-memory.sqlite3"))
     from app import main
@@ -709,6 +735,83 @@ def test_control_job_list_reports_empty_result_and_keeps_explicit_job_explanatio
     assert conversation["evidence"]["execution"]["result"]["returned_count"] == 0
     assert "本地没有符合" in conversation["response_text"]
     assert parse_control_intent("查看岗位 #12") == {"type": "explain_job", "filters": {"job_id": 12}}
+
+
+def test_control_interview_preparation_waits_for_manual_interview_confirmation(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-interview-wait.sqlite3"))
+    from app import main
+    from app.db import connect, init_db, loads, utc_now
+
+    init_db()
+    monkeypatch.setattr(main, "client_for_task", lambda _task_type: None)
+    with connect() as conn:
+        job_id = create_memory_test_job(conn, utc_now())
+        conn.execute("UPDATE job_postings SET status = ? WHERE id = ?", ("面试邀请", job_id))
+
+    client = TestClient(main.app)
+    client.post("/api/control/messages", json={"message": f"选择岗位 #{job_id}"})
+    conversation = client.post(
+        "/api/control/messages", json={"message": "为当前岗位准备面试"}
+    ).json()["conversation"]
+    with connect() as conn:
+        job = conn.execute("SELECT status FROM job_postings WHERE id = ?", (job_id,)).fetchone()
+        prep_count = conn.execute("SELECT COUNT(*) AS count FROM interview_preparations WHERE job_id = ?", (job_id,)).fetchone()["count"]
+        action = conn.execute(
+            "SELECT decision_json FROM agent_action_logs WHERE action_type = 'control_request' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+
+    assert conversation["intent_type"] == "prepare_interview"
+    assert conversation["evidence"]["execution"]["status"] == "等待人工确认"
+    assert "人工确认面试时间、形式和流程" in conversation["response_text"]
+    assert job["status"] == "面试邀请"
+    assert prep_count == 0
+    decision = loads(action["decision_json"], {})
+    assert decision["model_called"] is False
+    assert decision["browser_accessed"] is False
+    assert decision["job_status_changed"] is False
+    assert decision["interview_time_confirmed"] is False
+
+
+def test_control_interview_preparation_creates_once_for_confirmed_current_job(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-interview-ready.sqlite3"))
+    from app import main
+    from app.db import connect, init_db, loads, utc_now
+
+    init_db()
+    monkeypatch.setattr(main, "client_for_task", lambda _task_type: None)
+    with connect() as conn:
+        job_id = create_memory_test_job(conn, utc_now())
+        conn.execute("UPDATE job_postings SET status = ? WHERE id = ?", ("待面试", job_id))
+
+    client = TestClient(main.app)
+    client.post("/api/control/messages", json={"message": f"选择岗位 #{job_id}"})
+    created = client.post(
+        "/api/control/messages", json={"message": "为当前岗位准备面试"}
+    ).json()["conversation"]
+    existing = client.post(
+        "/api/control/messages", json={"message": "为当前岗位准备面试"}
+    ).json()["conversation"]
+    with connect() as conn:
+        job = conn.execute("SELECT status FROM job_postings WHERE id = ?", (job_id,)).fetchone()
+        preps = conn.execute("SELECT id, job_id FROM interview_preparations WHERE job_id = ?", (job_id,)).fetchall()
+        action = conn.execute(
+            "SELECT decision_json FROM agent_action_logs WHERE action_type = 'control_request' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+
+    created_result = created["evidence"]["execution"]["result"]
+    existing_result = existing["evidence"]["execution"]["result"]
+    assert created["intent_type"] == "prepare_interview"
+    assert created_result["created"] is True
+    assert created_result["interview_id"] == preps[0]["id"]
+    assert existing_result["created"] is False
+    assert existing_result["interview_id"] == preps[0]["id"]
+    assert len(preps) == 1
+    assert job["status"] == "待面试"
+    decision = loads(action["decision_json"], {})
+    assert decision["model_called"] is False
+    assert decision["browser_accessed"] is False
+    assert decision["job_status_changed"] is False
+    assert decision["interview_time_confirmed"] is False
 
 
 def test_control_communication_preparation_requires_an_explicit_current_job(tmp_path, monkeypatch):
