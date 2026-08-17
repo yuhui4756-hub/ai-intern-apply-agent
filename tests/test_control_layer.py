@@ -362,6 +362,32 @@ def test_control_message_api_rejects_model_selected_job_status_update(tmp_path, 
     assert conversation["evidence"]["parser"] == "local_rules"
 
 
+def test_control_message_api_rejects_model_selected_next_job_action(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-model-next-action.sqlite3"))
+    from app import main
+    from app.db import init_db
+
+    class FakeClient:
+        configured = True
+        profile = {"name": "不合规模型"}
+        model = "unsafe-model"
+
+        def complete_json(self, _messages):
+            return {"type": "next_job_action", "filters": {"job_id": 1}, "reason": "不应选择岗位"}
+
+        def log_error(self, _message):
+            pass
+
+    init_db()
+    monkeypatch.setattr(main, "client_for_task", lambda task_type: FakeClient() if task_type == "control_intent" else None)
+    conversation = TestClient(main.app).post(
+        "/api/control/messages", json={"message": "帮我安排一下接下来要做什么"}
+    ).json()["conversation"]
+
+    assert conversation["intent_type"] == "help"
+    assert conversation["evidence"]["parser"] == "local_rules"
+
+
 def test_control_memory_requires_explicit_job_selection_and_resolves_current_job(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-memory.sqlite3"))
     from app import main
@@ -918,6 +944,76 @@ def test_control_status_update_rejects_stale_plan_without_overwriting_job(tmp_pa
     assert job["status"] == "待投递"
     assert failed_plan["status"] == "失败"
     assert "未覆盖" in loads(failed_plan["result_json"], {})["error"]
+
+
+def test_control_next_job_action_requires_current_job_and_reads_pending_job_without_side_effects(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-next-action.sqlite3"))
+    from app import main
+    from app.db import connect, init_db, loads, utc_now
+
+    init_db()
+    monkeypatch.setattr(main, "client_for_task", lambda _task_type: None)
+    client = TestClient(main.app)
+    missing = client.post(
+        "/api/control/messages", json={"message": "当前岗位下一步怎么做"}
+    ).json()["conversation"]
+    with connect() as conn:
+        job_id = create_memory_test_job(conn, utc_now())
+    client.post("/api/control/messages", json={"message": f"选择岗位 #{job_id}"})
+    conversation = client.post(
+        "/api/control/messages", json={"message": "当前岗位下一步怎么做"}
+    ).json()["conversation"]
+    with connect() as conn:
+        job = conn.execute("SELECT status, match_score, recommendation, risk_level FROM job_postings WHERE id = ?", (job_id,)).fetchone()
+        draft_count = conn.execute("SELECT COUNT(*) AS count FROM message_drafts").fetchone()["count"]
+        application_count = conn.execute("SELECT COUNT(*) AS count FROM application_preparations").fetchone()["count"]
+        action = conn.execute(
+            "SELECT decision_json FROM agent_action_logs WHERE action_type = 'control_request' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+
+    assert missing["intent_type"] == "help"
+    assert "还没有当前岗位" in missing["response_text"]
+    assert conversation["intent_type"] == "next_job_action"
+    assert conversation["evidence"]["execution"]["mode"] == "chat_direct_local_next_action"
+    result = conversation["evidence"]["execution"]["result"]
+    assert result["advice_code"] == "review_before_outreach"
+    assert result["next_command"] == "为当前岗位做深度匹配复核"
+    assert "先复核匹配证据和岗位风险" in conversation["response_text"]
+    assert tuple(job) == ("待确认", 86, "必投", "低")
+    assert draft_count == 0
+    assert application_count == 0
+    decision = loads(action["decision_json"], {})
+    assert decision["model_called"] is False
+    assert decision["browser_accessed"] is False
+    assert decision["job_status_changed"] is False
+
+
+def test_control_next_job_action_guides_interview_invite_to_manual_confirmation(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-next-action-interview.sqlite3"))
+    from app import main
+    from app.db import connect, init_db, utc_now
+
+    init_db()
+    monkeypatch.setattr(main, "client_for_task", lambda _task_type: None)
+    with connect() as conn:
+        job_id = create_memory_test_job(conn, utc_now())
+        conn.execute("UPDATE job_postings SET status = ? WHERE id = ?", ("面试邀请", job_id))
+
+    client = TestClient(main.app)
+    client.post("/api/control/messages", json={"message": f"选择岗位 #{job_id}"})
+    conversation = client.post(
+        "/api/control/messages", json={"message": "当前岗位下一步怎么做"}
+    ).json()["conversation"]
+    with connect() as conn:
+        job = conn.execute("SELECT status FROM job_postings WHERE id = ?", (job_id,)).fetchone()
+        prep_count = conn.execute("SELECT COUNT(*) AS count FROM interview_preparations WHERE job_id = ?", (job_id,)).fetchone()["count"]
+
+    result = conversation["evidence"]["execution"]["result"]
+    assert result["advice_code"] == "confirm_interview_details"
+    assert result["next_command"] == "将当前岗位标记为待面试"
+    assert "人工确认面试时间、形式和流程" in conversation["response_text"]
+    assert job["status"] == "面试邀请"
+    assert prep_count == 0
 
 
 def test_control_communication_preparation_requires_an_explicit_current_job(tmp_path, monkeypatch):

@@ -4398,6 +4398,8 @@ def control_suggestions(intent_type: str, filters: dict[str, Any]) -> list[dict[
         return [{"label": "查看面试准备", "url": "/interviews"}]
     if intent_type == "update_job_status" and filters.get("job_id"):
         return [{"label": "打开岗位", "url": f"/jobs/{filters['job_id']}"}]
+    if intent_type == "next_job_action" and filters.get("job_id"):
+        return [{"label": "打开岗位", "url": f"/jobs/{filters['job_id']}"}]
     if intent_type == "job_match_review" and filters.get("job_id"):
         return [{"label": "查看深度复核", "url": f"/jobs/{filters['job_id']}"}]
     if intent_type == "company_research" and filters.get("job_id"):
@@ -4590,6 +4592,130 @@ def local_job_list_response(jobs: list[dict[str, Any]], filters: dict[str, Any])
     )
 
 
+def local_next_job_action(conn: Any, job_id: int) -> dict[str, Any]:
+    job = conn.execute(
+        "SELECT id, company, title, match_score, recommendation, risk_level, status FROM job_postings WHERE id = ?",
+        (job_id,),
+    ).fetchone()
+    if not job:
+        return {"status": "未找到", "job_id": job_id}
+
+    job_data = {key: job[key] for key in job.keys()}
+    status = str(job_data["status"] or "待确认")
+    recommendation = str(job_data["recommendation"] or "待确认")
+    risk_level = str(job_data["risk_level"] or "待确认")
+    application = conn.execute(
+        "SELECT id, status FROM application_preparations WHERE job_id = ? ORDER BY id DESC LIMIT 1",
+        (job_id,),
+    ).fetchone()
+    interview = conn.execute(
+        "SELECT id FROM interview_preparations WHERE job_id = ? ORDER BY id DESC LIMIT 1",
+        (job_id,),
+    ).fetchone()
+    company_research_count = conn.execute(
+        "SELECT COUNT(*) AS count FROM company_research WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()["count"]
+
+    result: dict[str, Any] = {
+        "status": "已完成",
+        "job_id": job_id,
+        "job_status": status,
+        "recommendation": recommendation,
+        "risk_level": risk_level,
+        "match_score": int(job_data["match_score"] or 0),
+        "application_preparation_id": int(application["id"]) if application else None,
+        "interview_preparation_id": int(interview["id"]) if interview else None,
+        "company_research_count": int(company_research_count or 0),
+        "model_called": False,
+        "browser_accessed": False,
+        "job_status_changed": False,
+    }
+    if risk_level in {"高", "高风险"} or recommendation == "跳过":
+        result.update({
+            "advice_code": "manual_risk_review",
+            "summary": "当前本地规则标记为高风险或建议跳过，不建议自动推进沟通或投递。",
+            "next_command": "为当前岗位做深度匹配复核",
+            "next_url": f"/jobs/{job_id}",
+        })
+    elif status == "待确认":
+        result.update({
+            "advice_code": "review_before_outreach",
+            "summary": "先复核匹配证据和岗位风险，再决定是否准备沟通或投递。",
+            "next_command": "为当前岗位做深度匹配复核",
+            "next_url": f"/jobs/{job_id}",
+        })
+    elif status == "待投递":
+        result.update({
+            "advice_code": "review_application_preparation",
+            "summary": "本地状态已进入待投递，请核对简历版本、附言和页面演练结果后再进行实际投递。",
+            "next_command": "为当前岗位准备投递",
+            "next_url": "/applications",
+        })
+    elif status == "已投递":
+        result.update({
+            "advice_code": "await_or_review_reply",
+            "summary": "本地已记录投递，下一步是留意 HR 回复；没有新消息时不需要重复投递。",
+            "next_command": "",
+            "next_instruction": "请在沟通草稿页查看巡检与待处理回复。",
+            "next_url": "/communications",
+        })
+    elif status == "已沟通":
+        result.update({
+            "advice_code": "await_or_review_reply",
+            "summary": "等待或采集 HR 的后续回复；涉及面试时间、简历或敏感信息时继续人工处理。",
+            "next_command": "",
+            "next_instruction": "请在沟通草稿页查看巡检与待处理回复。",
+            "next_url": "/communications",
+        })
+    elif status == "面试邀请":
+        result.update({
+            "advice_code": "confirm_interview_details",
+            "summary": "先与 HR 人工确认面试时间、形式和流程；确认后再将本地状态更新为待面试。",
+            "next_command": "将当前岗位标记为待面试",
+            "next_url": f"/jobs/{job_id}",
+        })
+    elif status in INTERVIEW_PREP_TRIGGER_STATUSES:
+        result.update({
+            "advice_code": "work_on_interview_preparation",
+            "summary": "本地状态已允许面试准备，优先查看计划、题库和待练习薄弱点。",
+            "next_command": "为当前岗位准备面试",
+            "next_url": f"/interviews/{result['interview_preparation_id']}" if result["interview_preparation_id"] else "/interviews",
+        })
+    elif status == "已面试":
+        result.update({
+            "advice_code": "record_interview_review",
+            "summary": "建议尽快记录没答好的问题和复盘材料，再补强后续模拟面试。",
+            "next_command": "",
+            "next_instruction": "请在面试准备页记录复盘与薄弱点。",
+            "next_url": "/interviews",
+        })
+    else:
+        result.update({
+            "advice_code": "review_job_record",
+            "summary": "当前状态没有可自动推进的动作，请先查看岗位记录和已保存的审计信息。",
+            "next_command": "解释当前岗位",
+            "next_url": f"/jobs/{job_id}",
+        })
+    return result
+
+
+def local_next_job_action_response(advice: dict[str, Any]) -> str:
+    if advice.get("status") != "已完成":
+        return f"没有找到岗位 #{advice.get('job_id')}。"
+    continuation = (
+        f" 可继续说“{advice['next_command']}”。"
+        if advice.get("next_command")
+        else f" {advice.get('next_instruction') or '请查看对应页面。'}"
+    )
+    return (
+        f"岗位 #{advice['job_id']} 当前状态为“{advice['job_status']}”，匹配 {advice['match_score']} 分，"
+        f"建议“{advice['recommendation']}”，风险“{advice['risk_level']}”。"
+        f"下一步：{advice['summary']}{continuation}"
+        "本轮只读取本地记录，未调用模型、浏览器或外部平台。"
+    )
+
+
 def control_memory_overview(conn: Any) -> dict[str, Any]:
     active_row = conn.execute(
         "SELECT * FROM control_memories WHERE memory_type = 'active_job' ORDER BY updated_at DESC, id DESC LIMIT 1"
@@ -4654,7 +4780,7 @@ def add_control_preference(conn: Any, content: str, conversation_id: int | None 
 def control_active_reference_intent(message: str, fallback: dict[str, Any]) -> tuple[dict[str, Any], str]:
     normalized = " ".join(message.strip().split())
     active_reference = any(token in normalized for token in ("当前岗位", "这个岗位", "该岗位", "当前公司", "这家公司", "该公司"))
-    active_memory_intents = {"compare_jobs", "prepare_interview", "update_job_status"}
+    active_memory_intents = {"compare_jobs", "prepare_interview", "update_job_status", "next_job_action"}
     if fallback["type"] in active_memory_intents and not active_reference:
         return fallback, ""
     if fallback["type"] != "help" and not (fallback["type"] in active_memory_intents and active_reference):
@@ -4675,6 +4801,8 @@ def control_active_reference_intent(message: str, fallback: dict[str, Any]) -> t
         return {"type": "prepare_interview", "filters": {"job_id": job_id}}, ""
     if fallback["type"] == "update_job_status" and fallback["filters"].get("status") in CONTROL_STATUS_UPDATE_TARGETS:
         return {"type": "update_job_status", "filters": {"job_id": job_id, "status": fallback["filters"]["status"]}}, ""
+    if fallback["type"] == "next_job_action":
+        return {"type": "next_job_action", "filters": {"job_id": job_id}}, ""
     if any(token in normalized for token in ("深度匹配复核", "深度复核", "匹配复核", "匹配解释")):
         return {"type": "job_match_review", "filters": {"job_id": job_id}}, ""
     if any(token in normalized for token in ("公司风险", "查公司", "公司尽调", "公司背调", "公司怎么样")):
@@ -4721,7 +4849,7 @@ def control_intent_messages(message: str, history: list[dict[str, str]]) -> list
                 f" {role_options} 或空字符串；city 只能是 {city_options} 或空字符串；薪资为整数或 null。"
                 "explain_job 只能返回正整数 job_id；ignore_broadcast 只能返回正整数 capture_id。"
                 "stats、show_plan、help 的 filters 必须为空对象。"
-                "岗位短名单、岗位比较、深度匹配复核、面试准备、状态变更、公司查询、沟通准备和投递准备必须返回 help，不能猜测目标；它们只由本地规则在用户明确编号或已选择当前岗位后处理。"
+                "岗位短名单、岗位比较、下一步建议、深度匹配复核、面试准备、状态变更、公司查询、沟通准备和投递准备必须返回 help，不能猜测目标；它们只由本地规则在用户明确编号或已选择当前岗位后处理。"
                 "reason 只写一句不超过 40 个字的可公开判断摘要，不能写思维链、隐私信息或工具参数。"
             ),
         },
@@ -4985,6 +5113,88 @@ async def process_control_message(message: str) -> dict[str, Any]:
                     "auto_apply": False,
                     "auto_message": False,
                     "job_score_changed": False,
+                    "job_status_changed": False,
+                },
+            )
+        return control_message_response(conversation_id)
+    if intent_type == "next_job_action":
+        job_id = filters.get("job_id")
+        if not isinstance(job_id, int) or job_id <= 0:
+            response_text = "请指定岗位编号，例如“岗位 #12 下一步怎么做”，或先选择当前岗位后再问“当前岗位下一步怎么做”。"
+            events.append(control_event("工具调用", "未执行", "下一步建议需要明确岗位编号或当前岗位工作记忆。"))
+            with connect() as conn:
+                cursor = conn.execute(
+                    "INSERT INTO control_conversations (user_text, intent_type, response_text, evidence_json, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (redact_control_text(message), intent_type, response_text, dumps(evidence), utc_now()),
+                )
+                conversation_id = int(cursor.lastrowid)
+                log_agent_action(
+                    conn,
+                    action_type="control_request",
+                    status="未执行",
+                    summary=response_text,
+                    decision={"intent": intent_type, "filters": filters, "message_saved_redacted": True, "model_called": False},
+                )
+            return control_message_response(conversation_id)
+        with connect() as conn:
+            conversation_cursor = conn.execute(
+                "INSERT INTO control_conversations (user_text, intent_type, response_text, evidence_json, created_at) VALUES (?, ?, '', '{}', ?)",
+                (redact_control_text(message), intent_type, utc_now()),
+            )
+            conversation_id = int(conversation_cursor.lastrowid)
+            advice = local_next_job_action(conn, job_id)
+            execution_status = str(advice.get("status") or "未完成")
+            response_text = local_next_job_action_response(advice)
+            result_summary = {
+                key: advice.get(key)
+                for key in (
+                    "status", "job_id", "job_status", "recommendation", "risk_level", "match_score",
+                    "application_preparation_id", "interview_preparation_id", "company_research_count",
+                    "advice_code", "next_command", "model_called", "browser_accessed", "job_status_changed",
+                )
+            }
+            suggestions = [{"label": "打开岗位", "url": f"/jobs/{job_id}"}]
+            if advice.get("next_url") and advice["next_url"] != f"/jobs/{job_id}":
+                suggestions.append({"label": "查看下一步材料", "url": str(advice["next_url"])})
+            evidence["suggestions"] = suggestions
+            events.append(control_event("工具调用", "完成" if execution_status == "已完成" else execution_status, "读取本地岗位状态和准备记录，生成下一步建议。"))
+            events.append(control_event("工具结果", execution_status, response_text[:500]))
+            events.append(control_event("安全结论", "仅本地读取", "未调用模型、未访问浏览器、未修改岗位或创建沟通/投递动作。"))
+            evidence["execution"] = {
+                "mode": "chat_direct_local_next_action",
+                "action_type": "next_job_action",
+                "status": execution_status,
+                "result": result_summary,
+            }
+            execution_id = create_completed_control_execution(
+                conn,
+                conversation_id,
+                "next_job_action",
+                f"读取岗位 #{job_id} 的下一步本地建议。",
+                {"job_id": job_id},
+                result_summary,
+                execution_status,
+            )
+            evidence["execution_id"] = execution_id
+            conn.execute(
+                "UPDATE control_conversations SET response_text = ?, evidence_json = ? WHERE id = ?",
+                (response_text, dumps(evidence), conversation_id),
+            )
+            log_agent_action(
+                conn,
+                action_type="control_request",
+                status=execution_status,
+                summary=response_text,
+                job_id=job_id,
+                decision={
+                    "intent": intent_type,
+                    "filters": {"job_id": job_id},
+                    "execution_mode": "chat_direct_local_next_action",
+                    "message_saved_redacted": True,
+                    "model_called": False,
+                    "browser_accessed": False,
+                    "auto_apply": False,
+                    "auto_message": False,
                     "job_status_changed": False,
                 },
             )
@@ -5480,11 +5690,11 @@ async def process_control_message(message: str) -> dict[str, Any]:
             else:
                 response_text = "请指定对话采集编号，例如“将对话 #12 的群发消息标为忽略”。"
         elif intent_type == "show_plan":
-            response_text = "可直接说“找杭州 Agent 实习，日薪至少 200”执行受控发现，也可以说“列出高匹配低风险岗位”查看本地短名单。可说“将当前岗位标记为待投递”创建确认计划；岗位确认到“待面试”后可准备面试。投递、发简历和敏感信息仍需人工确认。"
+            response_text = "可直接说“找杭州 Agent 实习，日薪至少 200”执行受控发现，也可以说“列出高匹配低风险岗位”查看本地短名单。选择岗位后可问“当前岗位下一步怎么做”，或创建状态确认计划；岗位确认到“待面试”后可准备面试。投递、发简历和敏感信息仍需人工确认。"
         elif filters.get("missing_active_job"):
             response_text = "还没有当前岗位。请先在岗位列表确认编号，再说“选择岗位 #编号”。"
         else:
-            response_text = "我目前可直接执行：受控岗位搜索、本地岗位短名单、JD 读取和评分，并可解释或比较岗位、创建本地状态确认计划、维护待面试后的本地准备、查看统计和计划。投递、发简历、敏感信息和沟通发送仍会保留人工确认。"
+            response_text = "我目前可直接执行：受控岗位搜索、本地岗位短名单、JD 读取和评分，并可解释、比较或给出岗位下一步建议，创建本地状态确认计划，维护待面试后的本地准备，查看统计和计划。投递、发简历、敏感信息和沟通发送仍会保留人工确认。"
         conn.execute(
             "UPDATE control_conversations SET response_text = ?, evidence_json = ? WHERE id = ?",
             (response_text, dumps(evidence), conversation_id),
