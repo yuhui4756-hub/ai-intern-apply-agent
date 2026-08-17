@@ -388,6 +388,32 @@ def test_control_message_api_rejects_model_selected_next_job_action(tmp_path, mo
     assert conversation["evidence"]["parser"] == "local_rules"
 
 
+def test_control_message_api_rejects_model_selected_resume_readiness(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-model-resume-readiness.sqlite3"))
+    from app import main
+    from app.db import init_db
+
+    class FakeClient:
+        configured = True
+        profile = {"name": "不合规模型"}
+        model = "unsafe-model"
+
+        def complete_json(self, _messages):
+            return {"type": "resume_readiness", "filters": {"job_id": 1}, "reason": "不应选择岗位"}
+
+        def log_error(self, _message):
+            pass
+
+    init_db()
+    monkeypatch.setattr(main, "client_for_task", lambda task_type: FakeClient() if task_type == "control_intent" else None)
+    conversation = TestClient(main.app).post(
+        "/api/control/messages", json={"message": "帮我看看资料还行不行"}
+    ).json()["conversation"]
+
+    assert conversation["intent_type"] == "help"
+    assert conversation["evidence"]["parser"] == "local_rules"
+
+
 def test_control_memory_requires_explicit_job_selection_and_resolves_current_job(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-memory.sqlite3"))
     from app import main
@@ -1014,6 +1040,96 @@ def test_control_next_job_action_guides_interview_invite_to_manual_confirmation(
     assert "人工确认面试时间、形式和流程" in conversation["response_text"]
     assert job["status"] == "面试邀请"
     assert prep_count == 0
+
+
+def test_control_resume_readiness_reports_missing_local_profile_and_resume(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-resume-empty.sqlite3"))
+    from app import main
+    from app.db import connect, init_db, loads
+
+    init_db()
+    monkeypatch.setattr(main, "client_for_task", lambda _task_type: None)
+    conversation = TestClient(main.app).post(
+        "/api/control/messages", json={"message": "检查简历准备情况"}
+    ).json()["conversation"]
+    with connect() as conn:
+        plan = conn.execute("SELECT * FROM control_plans ORDER BY id DESC LIMIT 1").fetchone()
+        action = conn.execute(
+            "SELECT decision_json FROM agent_action_logs WHERE action_type = 'control_request' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+
+    result = conversation["evidence"]["execution"]["result"]
+    assert conversation["intent_type"] == "resume_readiness"
+    assert result["profile_present"] is True
+    assert result["resume_count"] == 4
+    assert "候选人画像缺少候选人名称" in result["critical_gaps"]
+    assert "尚未导入包含有效正文的简历版本" in result["critical_gaps"]
+    assert "联系方式" in conversation["response_text"]
+    assert plan["action_type"] == "resume_readiness"
+    decision = loads(action["decision_json"], {})
+    assert decision["model_called"] is False
+    assert decision["browser_accessed"] is False
+    assert decision["resume_text_exposed"] is False
+    assert decision["contact_information_exposed"] is False
+
+
+def test_control_resume_readiness_uses_current_job_without_exposing_resume_text(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-resume-current.sqlite3"))
+    from app import main
+    from app.db import connect, dumps, init_db, loads, utc_now
+
+    init_db()
+    monkeypatch.setattr(main, "client_for_task", lambda _task_type: None)
+    with connect() as conn:
+        job_id = create_memory_test_job(conn, utc_now())
+        resume_id = conn.execute("SELECT selected_resume_id FROM job_postings WHERE id = ?", (job_id,)).fetchone()["selected_resume_id"]
+        profile_id = conn.execute("SELECT id FROM candidate_profile ORDER BY id LIMIT 1").fetchone()["id"]
+        conn.execute(
+            """
+            UPDATE candidate_profile
+            SET name = ?, education = ?, github_url = ?, target_roles = ?, skills_json = ?, projects_json = ?, preferences_json = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                "测试候选人", "智能科学与技术本科在读", "https://github.com/example", dumps(["Agent 开发实习"]),
+                dumps(["Python", "FastAPI", "RAG"]), dumps([{"name": "本地 RAG 项目"}]), dumps({}), utc_now(), profile_id,
+            ),
+        )
+        conn.execute(
+            "UPDATE resume_versions SET profile_id = ?, parsed_text = ? WHERE id = ?",
+            (profile_id, "Python FastAPI RAG 项目实践。" * 30, resume_id),
+        )
+        conn.execute(
+            "UPDATE job_postings SET extracted_json = ? WHERE id = ?",
+            (dumps({"scoring": {"missing_skills": ["Docker"]}}), job_id),
+        )
+
+    client = TestClient(main.app)
+    client.post("/api/control/messages", json={"message": f"选择岗位 #{job_id}"})
+    conversation = client.post(
+        "/api/control/messages", json={"message": "检查当前岗位简历准备情况"}
+    ).json()["conversation"]
+    with connect() as conn:
+        job = conn.execute("SELECT status, selected_resume_id FROM job_postings WHERE id = ?", (job_id,)).fetchone()
+        draft_count = conn.execute("SELECT COUNT(*) AS count FROM message_drafts").fetchone()["count"]
+        action = conn.execute(
+            "SELECT decision_json FROM agent_action_logs WHERE action_type = 'control_request' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+
+    result = conversation["evidence"]["execution"]["result"]
+    assert conversation["intent_type"] == "resume_readiness"
+    assert result["job"]["id"] == job_id
+    assert result["ready_for_preparation"] is True
+    assert "岗位能力缺口待确认：Docker" in result["advisory_gaps"]
+    assert "Python FastAPI RAG 项目实践" not in conversation["response_text"]
+    assert job["status"] == "待确认"
+    assert job["selected_resume_id"] == resume_id
+    assert draft_count == 0
+    decision = loads(action["decision_json"], {})
+    assert decision["model_called"] is False
+    assert decision["browser_accessed"] is False
+    assert decision["resume_text_exposed"] is False
+    assert decision["contact_information_exposed"] is False
 
 
 def test_control_communication_preparation_requires_an_explicit_current_job(tmp_path, monkeypatch):

@@ -4400,6 +4400,11 @@ def control_suggestions(intent_type: str, filters: dict[str, Any]) -> list[dict[
         return [{"label": "打开岗位", "url": f"/jobs/{filters['job_id']}"}]
     if intent_type == "next_job_action" and filters.get("job_id"):
         return [{"label": "打开岗位", "url": f"/jobs/{filters['job_id']}"}]
+    if intent_type == "resume_readiness":
+        suggestions = [{"label": "候选人画像", "url": "/resumes"}]
+        if filters.get("job_id"):
+            suggestions.append({"label": "打开岗位", "url": f"/jobs/{filters['job_id']}"})
+        return suggestions
     if intent_type == "job_match_review" and filters.get("job_id"):
         return [{"label": "查看深度复核", "url": f"/jobs/{filters['job_id']}"}]
     if intent_type == "company_research" and filters.get("job_id"):
@@ -4716,6 +4721,110 @@ def local_next_job_action_response(advice: dict[str, Any]) -> str:
     )
 
 
+def local_resume_readiness(conn: Any, job_id: int | None = None) -> dict[str, Any]:
+    profile = conn.execute("SELECT * FROM candidate_profile ORDER BY id LIMIT 1").fetchone()
+    resumes = conn.execute(
+        "SELECT id, profile_id, name, target_role, file_type, parsed_text, is_default FROM resume_versions ORDER BY is_default DESC, id"
+    ).fetchall()
+    critical_gaps: list[str] = []
+    advisory_gaps: list[str] = []
+    if not profile:
+        critical_gaps.append("候选人画像尚未创建")
+    else:
+        profile_data = {key: profile[key] for key in profile.keys()}
+        for field, label in (
+            ("name", "候选人名称"),
+            ("education", "教育背景"),
+            ("target_roles", "目标岗位方向"),
+            ("skills_json", "明确技能"),
+            ("projects_json", "项目事实"),
+        ):
+            raw_value = profile_data.get(field)
+            parsed_value = loads(raw_value, []) if field.endswith("_json") or field == "target_roles" else raw_value
+            if not parsed_value:
+                critical_gaps.append(f"候选人画像缺少{label}")
+        if not str(profile_data.get("github_url") or "").strip():
+            advisory_gaps.append("可补充公开 GitHub 链接作为项目佐证")
+
+    resume_data = [{key: row[key] for key in row.keys()} for row in resumes]
+    default_resume = next((item for item in resume_data if item["is_default"]), None)
+    imported_resumes = [item for item in resume_data if len(str(item.get("parsed_text") or "").strip()) >= 160]
+    if not resume_data:
+        critical_gaps.append("尚未登记任何简历版本")
+    elif not imported_resumes:
+        critical_gaps.append("尚未导入包含有效正文的简历版本")
+    elif not default_resume:
+        advisory_gaps.append("尚未设置默认简历版本")
+    elif len(str(default_resume.get("parsed_text") or "").strip()) < 160:
+        advisory_gaps.append("默认简历正文未导入或过短，可改设已导入的版本为默认")
+
+    job_summary: dict[str, Any] | None = None
+    if job_id:
+        job = conn.execute("SELECT * FROM job_postings WHERE id = ?", (job_id,)).fetchone()
+        if not job:
+            return {
+                "status": "未找到岗位",
+                "job_id": job_id,
+                "critical_gaps": critical_gaps,
+                "advisory_gaps": advisory_gaps,
+                "model_called": False,
+                "browser_accessed": False,
+            }
+        job_data = parse_json_fields({key: job[key] for key in job.keys()})
+        selected_resume_id = int(job_data["selected_resume_id"]) if job_data.get("selected_resume_id") else None
+        selected_resume = next((item for item in resume_data if item["id"] == selected_resume_id), None)
+        if not selected_resume_id:
+            critical_gaps.append("当前岗位尚未绑定简历版本")
+        elif not selected_resume:
+            critical_gaps.append("当前岗位绑定的简历版本不存在")
+        elif len(str(selected_resume.get("parsed_text") or "").strip()) < 160:
+            critical_gaps.append("当前岗位绑定的简历正文未导入或过短")
+        scoring = (job_data.get("extracted") or {}).get("scoring") or {}
+        missing_skills = compact_interview_items(scoring.get("missing_skills"), limit=5, item_limit=80)
+        if missing_skills:
+            advisory_gaps.append("岗位能力缺口待确认：" + "、".join(missing_skills))
+        job_summary = {
+            "id": job_id,
+            "has_selected_resume": bool(selected_resume),
+            "selected_resume_id": selected_resume_id,
+            "missing_skills": missing_skills,
+        }
+
+    for resume in resume_data:
+        if len(str(resume.get("parsed_text") or "").strip()) < 160:
+            advisory_gaps.append(f"简历版本“{resume['name'] or '未命名'}”的正文未导入或过短")
+    return {
+        "status": "已完成",
+        "job_id": job_id,
+        "profile_present": bool(profile),
+        "resume_count": len(resume_data),
+        "default_resume_id": int(default_resume["id"]) if default_resume else None,
+        "job": job_summary,
+        "critical_gaps": list(dict.fromkeys(critical_gaps)),
+        "advisory_gaps": list(dict.fromkeys(advisory_gaps)),
+        "ready_for_preparation": not critical_gaps,
+        "model_called": False,
+        "browser_accessed": False,
+        "job_status_changed": False,
+    }
+
+
+def local_resume_readiness_response(result: dict[str, Any]) -> str:
+    if result.get("status") == "未找到岗位":
+        return f"没有找到岗位 #{result.get('job_id')}。可以先在岗位列表确认编号，再检查简历准备情况。"
+    scope = f"岗位 #{result['job_id']} 的简历就绪情况" if result.get("job_id") else "全局简历就绪情况"
+    critical = result.get("critical_gaps") or []
+    advisory = result.get("advisory_gaps") or []
+    if critical:
+        base = f"{scope}：当前尚未达到可准备投递的最低资料完整度。需要补充：" + "；".join(critical) + "。"
+    else:
+        base = f"{scope}：基础资料已满足本地检查。"
+    if advisory:
+        base += " 建议继续处理：" + "；".join(advisory[:5]) + "。"
+    base += "请在候选人画像页补全；本轮未读取或展示联系方式、文件路径或简历正文。"
+    return base
+
+
 def control_memory_overview(conn: Any) -> dict[str, Any]:
     active_row = conn.execute(
         "SELECT * FROM control_memories WHERE memory_type = 'active_job' ORDER BY updated_at DESC, id DESC LIMIT 1"
@@ -4780,7 +4889,7 @@ def add_control_preference(conn: Any, content: str, conversation_id: int | None 
 def control_active_reference_intent(message: str, fallback: dict[str, Any]) -> tuple[dict[str, Any], str]:
     normalized = " ".join(message.strip().split())
     active_reference = any(token in normalized for token in ("当前岗位", "这个岗位", "该岗位", "当前公司", "这家公司", "该公司"))
-    active_memory_intents = {"compare_jobs", "prepare_interview", "update_job_status", "next_job_action"}
+    active_memory_intents = {"compare_jobs", "prepare_interview", "update_job_status", "next_job_action", "resume_readiness"}
     if fallback["type"] in active_memory_intents and not active_reference:
         return fallback, ""
     if fallback["type"] != "help" and not (fallback["type"] in active_memory_intents and active_reference):
@@ -4803,6 +4912,8 @@ def control_active_reference_intent(message: str, fallback: dict[str, Any]) -> t
         return {"type": "update_job_status", "filters": {"job_id": job_id, "status": fallback["filters"]["status"]}}, ""
     if fallback["type"] == "next_job_action":
         return {"type": "next_job_action", "filters": {"job_id": job_id}}, ""
+    if fallback["type"] == "resume_readiness":
+        return {"type": "resume_readiness", "filters": {"job_id": job_id}}, ""
     if any(token in normalized for token in ("深度匹配复核", "深度复核", "匹配复核", "匹配解释")):
         return {"type": "job_match_review", "filters": {"job_id": job_id}}, ""
     if any(token in normalized for token in ("公司风险", "查公司", "公司尽调", "公司背调", "公司怎么样")):
@@ -4849,7 +4960,7 @@ def control_intent_messages(message: str, history: list[dict[str, str]]) -> list
                 f" {role_options} 或空字符串；city 只能是 {city_options} 或空字符串；薪资为整数或 null。"
                 "explain_job 只能返回正整数 job_id；ignore_broadcast 只能返回正整数 capture_id。"
                 "stats、show_plan、help 的 filters 必须为空对象。"
-                "岗位短名单、岗位比较、下一步建议、深度匹配复核、面试准备、状态变更、公司查询、沟通准备和投递准备必须返回 help，不能猜测目标；它们只由本地规则在用户明确编号或已选择当前岗位后处理。"
+                "岗位短名单、岗位比较、下一步建议、简历就绪检查、深度匹配复核、面试准备、状态变更、公司查询、沟通准备和投递准备必须返回 help，不能猜测目标；它们只由本地规则在用户明确编号或已选择当前岗位后处理。"
                 "reason 只写一句不超过 40 个字的可公开判断摘要，不能写思维链、隐私信息或工具参数。"
             ),
         },
@@ -5196,6 +5307,73 @@ async def process_control_message(message: str) -> dict[str, Any]:
                     "auto_apply": False,
                     "auto_message": False,
                     "job_status_changed": False,
+                },
+            )
+        return control_message_response(conversation_id)
+    if intent_type == "resume_readiness":
+        job_id = filters.get("job_id")
+        safe_job_id = job_id if isinstance(job_id, int) and job_id > 0 else None
+        with connect() as conn:
+            conversation_cursor = conn.execute(
+                "INSERT INTO control_conversations (user_text, intent_type, response_text, evidence_json, created_at) VALUES (?, ?, '', '{}', ?)",
+                (redact_control_text(message), intent_type, utc_now()),
+            )
+            conversation_id = int(conversation_cursor.lastrowid)
+            readiness = local_resume_readiness(conn, safe_job_id)
+            execution_status = str(readiness.get("status") or "未完成")
+            response_text = local_resume_readiness_response(readiness)
+            result_summary = {
+                key: readiness.get(key)
+                for key in (
+                    "status", "job_id", "profile_present", "resume_count", "default_resume_id", "job",
+                    "critical_gaps", "advisory_gaps", "ready_for_preparation", "model_called", "browser_accessed", "job_status_changed",
+                )
+            }
+            suggestions = [{"label": "候选人画像", "url": "/resumes"}]
+            if safe_job_id:
+                suggestions.append({"label": "打开岗位", "url": f"/jobs/{safe_job_id}"})
+            evidence["suggestions"] = suggestions
+            events.append(control_event("工具调用", "完成" if execution_status == "已完成" else execution_status, "检查本地候选人画像和简历版本完整度。"))
+            events.append(control_event("工具结果", execution_status, response_text[:500]))
+            events.append(control_event("安全结论", "仅本地读取", "未展示联系方式、文件路径或简历正文；未调用模型、浏览器或外部平台。"))
+            evidence["execution"] = {
+                "mode": "chat_direct_local_resume_readiness",
+                "action_type": "resume_readiness",
+                "status": execution_status,
+                "result": result_summary,
+            }
+            execution_id = create_completed_control_execution(
+                conn,
+                conversation_id,
+                "resume_readiness",
+                "检查候选人画像和简历版本的本地就绪情况。",
+                {"job_id": safe_job_id},
+                result_summary,
+                execution_status,
+            )
+            evidence["execution_id"] = execution_id
+            conn.execute(
+                "UPDATE control_conversations SET response_text = ?, evidence_json = ? WHERE id = ?",
+                (response_text, dumps(evidence), conversation_id),
+            )
+            log_agent_action(
+                conn,
+                action_type="control_request",
+                status=execution_status,
+                summary=response_text,
+                job_id=safe_job_id,
+                decision={
+                    "intent": intent_type,
+                    "filters": {"job_id": safe_job_id},
+                    "execution_mode": "chat_direct_local_resume_readiness",
+                    "message_saved_redacted": True,
+                    "model_called": False,
+                    "browser_accessed": False,
+                    "auto_apply": False,
+                    "auto_message": False,
+                    "job_status_changed": False,
+                    "resume_text_exposed": False,
+                    "contact_information_exposed": False,
                 },
             )
         return control_message_response(conversation_id)
@@ -5690,11 +5868,11 @@ async def process_control_message(message: str) -> dict[str, Any]:
             else:
                 response_text = "请指定对话采集编号，例如“将对话 #12 的群发消息标为忽略”。"
         elif intent_type == "show_plan":
-            response_text = "可直接说“找杭州 Agent 实习，日薪至少 200”执行受控发现，也可以说“列出高匹配低风险岗位”查看本地短名单。选择岗位后可问“当前岗位下一步怎么做”，或创建状态确认计划；岗位确认到“待面试”后可准备面试。投递、发简历和敏感信息仍需人工确认。"
+            response_text = "可直接说“找杭州 Agent 实习，日薪至少 200”执行受控发现，也可以说“检查简历准备情况”或“列出高匹配低风险岗位”。选择岗位后可问“当前岗位下一步怎么做”，或创建状态确认计划；岗位确认到“待面试”后可准备面试。投递、发简历和敏感信息仍需人工确认。"
         elif filters.get("missing_active_job"):
             response_text = "还没有当前岗位。请先在岗位列表确认编号，再说“选择岗位 #编号”。"
         else:
-            response_text = "我目前可直接执行：受控岗位搜索、本地岗位短名单、JD 读取和评分，并可解释、比较或给出岗位下一步建议，创建本地状态确认计划，维护待面试后的本地准备，查看统计和计划。投递、发简历、敏感信息和沟通发送仍会保留人工确认。"
+            response_text = "我目前可直接执行：受控岗位搜索、本地岗位短名单、隐私保护的简历就绪检查、JD 读取和评分，并可解释、比较或给出岗位下一步建议，创建本地状态确认计划，维护待面试后的本地准备，查看统计和计划。投递、发简历、敏感信息和沟通发送仍会保留人工确认。"
         conn.execute(
             "UPDATE control_conversations SET response_text = ?, evidence_json = ? WHERE id = ?",
             (response_text, dumps(evidence), conversation_id),
