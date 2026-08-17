@@ -9,6 +9,7 @@ ROLE_NAMES = ("AI 应用开发实习", "Agent 开发实习", "AI 后端实习", 
 ALLOWED_CONTROL_INTENTS = (
     "search_draft",
     "stats",
+    "list_jobs",
     "explain_job",
     "compare_jobs",
     "job_match_review",
@@ -37,6 +38,29 @@ def explicit_control_job_ids(text: str) -> list[int]:
         if job_id not in job_ids:
             job_ids.append(job_id)
     return job_ids
+
+
+def parse_control_job_list_filters(text: str) -> dict[str, Any]:
+    match_level = next((item for item in ("高匹配", "中匹配", "低匹配") if item in text), "")
+    recommendation = next((item for item in ("必投", "可冲", "跳过") if item in text), "")
+    risk_level = "低" if "低风险" in text else "中" if "中风险" in text else "高" if "高风险" in text else ""
+    status = next(
+        (
+            item for item in ("待确认", "待投递", "已沟通", "面试邀请", "待面试", "面试准备中", "已归档")
+            if item in text
+        ),
+        "",
+    )
+    limit_match = re.search(r"(?:前|最多|列出)\s*(\d{1,2})\s*(?:个|条)?", text)
+    limit = int(limit_match.group(1)) if limit_match else 6
+    return {
+        "match_level": match_level,
+        "recommendation": recommendation,
+        "risk_level": risk_level,
+        "status": status,
+        "sort": "recent" if any(token in text for token in ("最近", "最新")) else "priority",
+        "limit": max(1, min(limit, 10)),
+    }
 
 
 def normalize_model_control_intent(value: Any) -> dict[str, Any] | None:
@@ -137,6 +161,9 @@ def parse_control_intent(text: str) -> dict[str, Any]:
     if any(token in normalized for token in ("群发", "忽略", "无需回复")):
         capture_id = re.search(r"(?:记录|对话|采集)\s*#?(\d+)", normalized)
         return {"type": "ignore_broadcast", "filters": {"capture_id": int(capture_id.group(1)) if capture_id else None}}
+    job_list_requested = any(token in normalized for token in ("列出", "清单", "列表", "有哪些", "推荐", "看看", "查看", "最近", "最新"))
+    if job_list_requested and any(token in normalized for token in ("岗位", "职位", "机会")) and not explicit_control_job_ids(normalized):
+        return {"type": "list_jobs", "filters": parse_control_job_list_filters(normalized)}
     if any(token in normalized for token in ("比较", "对比", "哪个更适合", "哪个值得优先", "优先沟通哪个")):
         job_ids = explicit_control_job_ids(normalized)
         return {"type": "compare_jobs", "filters": {"job_ids": job_ids[:2]}}

@@ -51,6 +51,7 @@ from .services.control_layer import (
     control_memory_contains_sensitive_text,
     explicit_control_job_ids,
     normalize_model_control_intent,
+    parse_control_job_list_filters,
     parse_control_intent,
     redact_control_text,
 )
@@ -4385,6 +4386,8 @@ def control_suggestions(intent_type: str, filters: dict[str, Any]) -> list[dict[
         return [{"label": "查看岗位搜索", "url": "/searches"}]
     if intent_type == "stats":
         return [{"label": "查看岗位列表", "url": "/jobs"}, {"label": "查看投递准备", "url": "/applications"}]
+    if intent_type == "list_jobs":
+        return [{"label": "查看岗位列表", "url": "/jobs"}]
     if intent_type == "explain_job" and filters.get("job_id"):
         return [{"label": "打开岗位", "url": f"/jobs/{filters['job_id']}"}]
     if intent_type == "compare_jobs":
@@ -4518,6 +4521,70 @@ def local_job_comparison_response(comparison: dict[str, Any]) -> str:
     return " ".join(lines)
 
 
+def local_job_list_label(filters: dict[str, Any]) -> str:
+    labels = [
+        str(filters.get("match_level") or ""),
+        str(filters.get("recommendation") or ""),
+        f"{filters['risk_level']}风险" if filters.get("risk_level") else "",
+        str(filters.get("status") or ""),
+    ]
+    return "、".join(item for item in labels if item) or "全部已保存岗位"
+
+
+def list_local_jobs(conn: Any, filters: dict[str, Any]) -> list[dict[str, Any]]:
+    conditions = []
+    params: list[Any] = []
+    for column in ("match_level", "recommendation", "status"):
+        value = str(filters.get(column) or "")
+        if value:
+            conditions.append(f"{column} = ?")
+            params.append(value)
+    risk_level = str(filters.get("risk_level") or "")
+    if risk_level:
+        if risk_level == "低":
+            conditions.append("risk_level IN ('低', '低风险')")
+        else:
+            conditions.append("risk_level = ?")
+            params.append(risk_level)
+    where_clause = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+    order_clause = (
+        "updated_at DESC, id DESC"
+        if filters.get("sort") == "recent"
+        else "CASE risk_level WHEN '低' THEN 3 WHEN '低风险' THEN 3 WHEN '中' THEN 2 WHEN '中风险' THEN 2 ELSE 1 END DESC, "
+        "CASE recommendation WHEN '必投' THEN 3 WHEN '可冲' THEN 2 ELSE 1 END DESC, match_score DESC, updated_at DESC, id DESC"
+    )
+    params.append(int(filters.get("limit") or 6))
+    rows = conn.execute(
+        f"""
+        SELECT id, platform, title, company, city, salary_text, match_score, match_level, risk_level, recommendation, status
+        FROM job_postings{where_clause}
+        ORDER BY {order_clause}
+        LIMIT ?
+        """,
+        params,
+    ).fetchall()
+    return [{key: row[key] for key in row.keys()} for row in rows]
+
+
+def local_job_list_response(jobs: list[dict[str, Any]], filters: dict[str, Any]) -> str:
+    label = local_job_list_label(filters)
+    if not jobs:
+        return f"本地没有符合“{label}”的岗位。可调整条件，或先执行岗位发现。"
+    items = []
+    for job in jobs:
+        location = str(job.get("city") or "地点未披露")
+        salary = str(job.get("salary_text") or "薪资未披露")
+        items.append(
+            f"#{job['id']} {job['company'] or '未填写公司'} - {job['title'] or '未填写岗位'}"
+            f"（{location}，{salary}，{job['match_score']} 分，{job['recommendation'] or '待确认'}，{job['risk_level'] or '待确认'}，{job['status'] or '待分析'}）"
+        )
+    return (
+        f"本地找到 {len(jobs)} 条“{label}”岗位，按当前本地优先级排序："
+        + "；".join(items)
+        + "。可继续说“选择岗位 #编号”进入后续复核或沟通准备。"
+    )
+
+
 def control_memory_overview(conn: Any) -> dict[str, Any]:
     active_row = conn.execute(
         "SELECT * FROM control_memories WHERE memory_type = 'active_job' ORDER BY updated_at DESC, id DESC LIMIT 1"
@@ -4644,7 +4711,7 @@ def control_intent_messages(message: str, history: list[dict[str, str]]) -> list
                 f" {role_options} 或空字符串；city 只能是 {city_options} 或空字符串；薪资为整数或 null。"
                 "explain_job 只能返回正整数 job_id；ignore_broadcast 只能返回正整数 capture_id。"
                 "stats、show_plan、help 的 filters 必须为空对象。"
-                "岗位比较、深度匹配复核、公司查询、沟通准备和投递准备必须返回 help，不能猜测目标；它们只由本地规则在用户明确编号或已选择当前岗位后处理。"
+                "岗位短名单、岗位比较、深度匹配复核、公司查询、沟通准备和投递准备必须返回 help，不能猜测目标；它们只由本地规则在用户明确编号或已选择当前岗位后处理。"
                 "reason 只写一句不超过 40 个字的可公开判断摘要，不能写思维链、隐私信息或工具参数。"
             ),
         },
@@ -4848,6 +4915,68 @@ async def process_control_message(message: str) -> dict[str, Any]:
                     "message_text_saved": False,
                 },
                 error_message=str(result.get("error") or "")[:300],
+            )
+        return control_message_response(conversation_id)
+    if intent_type == "list_jobs":
+        normalized_filters = parse_control_job_list_filters("")
+        normalized_filters.update({key: value for key, value in filters.items() if key in normalized_filters})
+        summary = f"读取{local_job_list_label(normalized_filters)}短名单。"
+        with connect() as conn:
+            conversation_cursor = conn.execute(
+                "INSERT INTO control_conversations (user_text, intent_type, response_text, evidence_json, created_at) VALUES (?, ?, '', '{}', ?)",
+                (redact_control_text(message), intent_type, utc_now()),
+            )
+            conversation_id = int(conversation_cursor.lastrowid)
+            jobs = list_local_jobs(conn, normalized_filters)
+            result_summary = {
+                "status": "已完成",
+                "filters": normalized_filters,
+                "returned_job_ids": [int(job["id"]) for job in jobs],
+                "returned_count": len(jobs),
+                "model_called": False,
+                "browser_accessed": False,
+            }
+            response_text = local_job_list_response(jobs, normalized_filters)
+            events.append(control_event("工具调用", "完成", "读取本地岗位短名单，不访问浏览器或模型。"))
+            events.append(control_event("工具结果", "已完成", response_text[:500]))
+            events.append(control_event("安全结论", "仅本地读取", "未调用模型、未访问浏览器、未修改岗位或创建沟通/投递动作。"))
+            evidence["execution"] = {
+                "mode": "chat_direct_local_job_list",
+                "action_type": "list_jobs",
+                "status": "已完成",
+                "result": result_summary,
+            }
+            execution_id = create_completed_control_execution(
+                conn,
+                conversation_id,
+                "list_jobs",
+                summary,
+                normalized_filters,
+                result_summary,
+                "已完成",
+            )
+            evidence["execution_id"] = execution_id
+            conn.execute(
+                "UPDATE control_conversations SET response_text = ?, evidence_json = ? WHERE id = ?",
+                (response_text, dumps(evidence), conversation_id),
+            )
+            log_agent_action(
+                conn,
+                action_type="control_request",
+                status="已完成",
+                summary=response_text,
+                decision={
+                    "intent": intent_type,
+                    "filters": normalized_filters,
+                    "execution_mode": "chat_direct_local_job_list",
+                    "message_saved_redacted": True,
+                    "model_called": False,
+                    "browser_accessed": False,
+                    "auto_apply": False,
+                    "auto_message": False,
+                    "job_score_changed": False,
+                    "job_status_changed": False,
+                },
             )
         return control_message_response(conversation_id)
     if intent_type == "compare_jobs":
@@ -5202,11 +5331,11 @@ async def process_control_message(message: str) -> dict[str, Any]:
             else:
                 response_text = "请指定对话采集编号，例如“将对话 #12 的群发消息标为忽略”。"
         elif intent_type == "show_plan":
-            response_text = "可直接说“找杭州 Agent 实习，日薪至少 200”，我会执行受控岗位发现并返回评分摘要；投递、发简历和敏感信息仍需人工确认。"
+            response_text = "可直接说“找杭州 Agent 实习，日薪至少 200”执行受控发现，也可以说“列出高匹配低风险岗位”查看本地短名单；投递、发简历和敏感信息仍需人工确认。"
         elif filters.get("missing_active_job"):
             response_text = "还没有当前岗位。请先在岗位列表确认编号，再说“选择岗位 #编号”。"
         else:
-            response_text = "我目前可直接执行：受控岗位搜索、JD 读取和评分，并可解释“岗位 #编号”、查看统计或查看计划。投递、发简历、敏感信息和沟通发送仍会保留人工确认。"
+            response_text = "我目前可直接执行：受控岗位搜索、本地岗位短名单、JD 读取和评分，并可解释或比较岗位、查看统计和计划。投递、发简历、敏感信息和沟通发送仍会保留人工确认。"
         conn.execute(
             "UPDATE control_conversations SET response_text = ?, evidence_json = ? WHERE id = ?",
             (response_text, dumps(evidence), conversation_id),
