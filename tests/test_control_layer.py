@@ -440,6 +440,32 @@ def test_control_message_api_rejects_model_selected_unread_scan(tmp_path, monkey
     assert conversation["evidence"]["parser"] == "local_rules"
 
 
+def test_control_message_api_rejects_model_selected_visual_page_review(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-model-visual.sqlite3"))
+    from app import main
+    from app.db import init_db
+
+    class FakeClient:
+        configured = True
+        profile = {"name": "不合规模型"}
+        model = "unsafe-model"
+
+        def complete_json(self, _messages):
+            return {"type": "review_visual_page", "filters": {"mode": "full_page"}, "reason": "不应截图"}
+
+        def log_error(self, _message):
+            pass
+
+    init_db()
+    monkeypatch.setattr(main, "client_for_task", lambda task_type: FakeClient() if task_type == "control_intent" else None)
+    conversation = TestClient(main.app).post(
+        "/api/control/messages", json={"message": "帮我看一下当前页面"}
+    ).json()["conversation"]
+
+    assert conversation["intent_type"] == "help"
+    assert conversation["evidence"]["parser"] == "local_rules"
+
+
 def test_control_memory_requires_explicit_job_selection_and_resolves_current_job(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-memory.sqlite3"))
     from app import main
@@ -1214,6 +1240,78 @@ def test_control_unread_scan_runs_only_from_explicit_chat_request_and_keeps_mess
     assert capture_count == 0
     assert draft_count == 0
     assert model_count == 0
+
+
+def test_control_visual_page_review_requires_explicit_request_and_does_not_store_image(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "control-visual-page.sqlite3"))
+    from app import main
+    from app.db import connect, init_db, loads
+
+    calls = []
+
+    def fake_review(mode, user_message):
+        calls.append((mode, user_message))
+        return {
+            "status": "已完成",
+            "note": "页面视觉复核已完成；截图未保存，仅保留结构化摘要。",
+            "review": {
+                "page_type": "job_detail",
+                "company": "视觉测试科技",
+                "title": "AI 应用开发实习生",
+                "city": "杭州",
+                "salary_text": "200-300 元/天",
+                "summary": "岗位要求 Python、FastAPI 和 RAG 实践。",
+                "candidate_jobs": [],
+                "confidence": 0.82,
+                "uncertainties": ["实习周期未显示"],
+            },
+            "capture": {
+                "mode": mode,
+                "platform": "Boss 直聘",
+                "image_bytes": 12345,
+                "image_sha256": "safe-hash",
+                "image_persisted": False,
+                "page_text_saved": False,
+            },
+            "model_called": True,
+            "model_profile": "视觉模型",
+            "model_name": "vision-model",
+            "image_sent_to_model": True,
+        }
+
+    init_db()
+    monkeypatch.setattr(main, "client_for_task", lambda _task_type: None)
+    monkeypatch.setattr(main, "run_visual_page_review", fake_review)
+    conversation = TestClient(main.app).post(
+        "/api/control/messages", json={"message": "截图分析当前页面 整页"}
+    ).json()["conversation"]
+    with connect() as conn:
+        plan = conn.execute("SELECT * FROM control_plans ORDER BY id DESC LIMIT 1").fetchone()
+        action = conn.execute(
+            "SELECT decision_json FROM agent_action_logs WHERE action_type = 'control_request' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        capture_count = conn.execute("SELECT COUNT(*) AS count FROM conversation_captures").fetchone()["count"]
+        draft_count = conn.execute("SELECT COUNT(*) AS count FROM message_drafts").fetchone()["count"]
+
+    assert calls == [("full_page", "截图分析当前页面 整页")]
+    assert conversation["intent_type"] == "review_visual_page"
+    assert conversation["evidence"]["execution"]["mode"] == "chat_direct_visual_page_review"
+    assert "视觉测试科技" in conversation["response_text"]
+    assert "截图未保存" in conversation["response_text"]
+    evidence_text = str(conversation["evidence"])
+    assert "data:image" not in evidence_text
+    assert plan["action_type"] == "review_visual_page"
+    assert plan["status"] == "已完成"
+    decision = loads(action["decision_json"], {})
+    assert decision["model_called"] is True
+    assert decision["image_sent_to_model"] is True
+    assert decision["image_persisted"] is False
+    assert decision["page_text_saved"] is False
+    assert decision["conversation_opened"] is False
+    assert decision["browser_clicked"] is False
+    assert decision["message_sent"] is False
+    assert capture_count == 0
+    assert draft_count == 0
 
 
 def test_control_communication_preparation_requires_an_explicit_current_job(tmp_path, monkeypatch):

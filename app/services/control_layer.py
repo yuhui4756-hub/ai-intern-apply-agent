@@ -30,6 +30,7 @@ ALLOWED_CONTROL_INTENTS = (
     "next_job_action",
     "resume_readiness",
     "scan_unread_conversations",
+    "review_visual_page",
     "company_research",
     "prepare_application",
     "prepare_communication",
@@ -175,6 +176,8 @@ def parse_control_intent(text: str) -> dict[str, Any]:
         return {"type": "show_memory", "filters": {}}
     if any(token in normalized for token in ("检查未读消息", "扫描未读消息", "检查未读会话", "扫描未读会话")):
         return {"type": "scan_unread_conversations", "filters": {}}
+    if any(token in normalized for token in ("识图分析当前页面", "截图分析当前页面", "视觉复核当前页面", "识图看当前页面")):
+        return {"type": "review_visual_page", "filters": {"mode": "full_page" if "整页" in normalized or "完整页面" in normalized else "viewport"}}
     if any(token in normalized for token in ("检查简历", "简历准备情况", "简历还缺什么", "简历是否完整", "简历就绪")):
         job_id = re.search(r"(?:岗位|职位)\s*#?(\d+)", normalized)
         return {"type": "resume_readiness", "filters": {"job_id": int(job_id.group(1)) if job_id else None}}

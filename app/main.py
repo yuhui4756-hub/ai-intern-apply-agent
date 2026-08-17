@@ -82,6 +82,7 @@ from .services.llm import OpenAICompatibleClient, client_for_task
 from .services.research import search_company
 from .services.resume import read_resume_text
 from .services.transcription import ALLOWED_RECORDING_EXTENSIONS, TRANSCRIPTION_MODELS, transcribe_recording
+from .services.visual_page import capture_controlled_edge_visual_page
 
 
 @asynccontextmanager
@@ -4407,6 +4408,8 @@ def control_suggestions(intent_type: str, filters: dict[str, Any]) -> list[dict[
         return suggestions
     if intent_type == "scan_unread_conversations":
         return [{"label": "查看沟通草稿", "url": "/communications"}]
+    if intent_type == "review_visual_page":
+        return [{"label": "查看岗位列表", "url": "/jobs"}, {"label": "查看岗位搜索", "url": "/searches"}]
     if intent_type == "job_match_review" and filters.get("job_id"):
         return [{"label": "查看深度复核", "url": f"/jobs/{filters['job_id']}"}]
     if intent_type == "company_research" and filters.get("job_id"):
@@ -4827,6 +4830,137 @@ def local_resume_readiness_response(result: dict[str, Any]) -> str:
     return base
 
 
+def compact_visual_review_text(value: object, limit: int = 500) -> str:
+    return " ".join(redact_control_text(str(value or "")).split())[:limit]
+
+
+def normalize_visual_page_review(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("视觉模型没有返回 JSON 对象。")
+    page_type = str(value.get("page_type") or "unknown").strip()
+    if page_type not in {"job_detail", "search_results", "unknown"}:
+        page_type = "unknown"
+    try:
+        confidence = float(value.get("confidence") or 0)
+    except (TypeError, ValueError):
+        confidence = 0
+    candidate_jobs = []
+    raw_candidates = value.get("candidate_jobs")
+    if isinstance(raw_candidates, list):
+        for raw in raw_candidates[:6]:
+            if not isinstance(raw, dict):
+                continue
+            candidate = {
+                "company": compact_visual_review_text(raw.get("company"), 140),
+                "title": compact_visual_review_text(raw.get("title"), 180),
+                "city": compact_visual_review_text(raw.get("city"), 80),
+                "salary_text": compact_visual_review_text(raw.get("salary_text"), 100),
+            }
+            if candidate["company"] or candidate["title"]:
+                candidate_jobs.append(candidate)
+    uncertainties = []
+    raw_uncertainties = value.get("uncertainties")
+    if isinstance(raw_uncertainties, list):
+        uncertainties = [compact_visual_review_text(item, 180) for item in raw_uncertainties[:6] if compact_visual_review_text(item, 180)]
+    return {
+        "page_type": page_type,
+        "company": compact_visual_review_text(value.get("company"), 140),
+        "title": compact_visual_review_text(value.get("title"), 180),
+        "city": compact_visual_review_text(value.get("city"), 80),
+        "salary_text": compact_visual_review_text(value.get("salary_text"), 100),
+        "summary": compact_visual_review_text(value.get("summary"), 700),
+        "candidate_jobs": candidate_jobs,
+        "confidence": max(0.0, min(confidence, 1.0)),
+        "uncertainties": uncertainties,
+    }
+
+
+def run_visual_page_review(mode: str = "viewport", user_message: str = "") -> dict[str, Any]:
+    # Reuse the task-chat model so screenshot interpretation keeps the same local conversation context.
+    client = client_for_task("control_intent")
+    if not client or not client.configured:
+        return {
+            "status": "未配置",
+            "note": "请先将“控制层意图理解”配置为支持图像输入的 OpenAI-compatible 聊天模型。",
+            "model_called": False,
+            "image_sent_to_model": False,
+        }
+    try:
+        capture = capture_controlled_edge_visual_page(mode)
+        metadata = capture.get("metadata") if isinstance(capture.get("metadata"), dict) else {}
+        history = [item for item in control_history_for_model() if item.get("assistant")][-6:]
+        history_text = "\n".join(
+            f"用户：{item['user']}\nAgent：{item['assistant']}" for item in history
+        ) or "（无）"
+        prompt = (
+            "请只分析这张招聘岗位或搜索结果页面截图，并只输出 JSON 对象。"
+            "禁止转录或输出手机号、邮箱、联系人、聊天正文、验证码或任何联系方式。"
+            "若无法确认字段必须留空并写入 uncertainties，不要猜测。"
+            "JSON 字段：page_type(job_detail/search_results/unknown)、company、title、city、salary_text、"
+            "summary(不超过300字)、candidate_jobs(最多6条，每条仅 company/title/city/salary_text)、"
+            "confidence(0到1)、uncertainties(字符串数组)。"
+            "这只是视觉复核，不判断是否投递，不产生外部动作。"
+        )
+        user_prompt = (
+            f"截图模式：{'整页缩放' if mode == 'full_page' else '当前可视区域'}；"
+            f"招聘平台：{metadata.get('platform') or '未知'}。"
+            f"最近对话：\n{history_text}\n\n当前用户任务：{redact_control_text(user_message)}\n"
+            "请按约定 JSON 返回，并优先保留页面上明确可见的岗位信息。"
+        )
+        raw = client.complete_json_with_image(prompt, user_prompt, str(capture["image_data_url"]))
+        review = normalize_visual_page_review(raw)
+    except Exception as exc:
+        if hasattr(client, "log_error"):
+            client.log_error(str(exc))
+        return {
+            "status": "失败",
+            "note": f"页面视觉复核失败：{str(exc)[:300]}",
+            "error": str(exc)[:300],
+            "model_called": True,
+            "image_sent_to_model": True,
+        }
+    return {
+        "status": "已完成",
+        "note": "页面视觉复核已完成；截图未保存，仅保留结构化摘要。",
+        "review": review,
+        "capture": metadata,
+        "model_called": True,
+        "model_profile": str(getattr(client, "profile", {}).get("name") or ""),
+        "model_name": str(getattr(client, "model", "") or ""),
+        "image_sent_to_model": True,
+    }
+
+
+def visual_page_review_response(result: dict[str, Any]) -> str:
+    if result.get("status") != "已完成":
+        return str(result.get("note") or "页面视觉复核未完成。")
+    review = result.get("review") if isinstance(result.get("review"), dict) else {}
+    parts = ["页面视觉复核已完成。"]
+    overview = " - ".join(item for item in [str(review.get("company") or ""), str(review.get("title") or "")] if item)
+    if overview:
+        parts.append(overview + "。")
+    details = [
+        f"地点：{review['city']}" if review.get("city") else "",
+        f"薪资：{review['salary_text']}" if review.get("salary_text") else "",
+        f"置信度：{int(float(review.get('confidence') or 0) * 100)}%",
+    ]
+    if any(details):
+        parts.append("；".join(item for item in details if item) + "。")
+    if review.get("summary"):
+        parts.append("摘要：" + str(review["summary"]))
+    candidates = review.get("candidate_jobs") if isinstance(review.get("candidate_jobs"), list) else []
+    if candidates:
+        compact_candidates = [
+            " / ".join(item for item in [candidate.get("company"), candidate.get("title"), candidate.get("city"), candidate.get("salary_text")] if item)
+            for candidate in candidates
+        ]
+        parts.append("候选：" + "；".join(item for item in compact_candidates if item))
+    if review.get("uncertainties"):
+        parts.append("待确认：" + "；".join(str(item) for item in review["uncertainties"][:3]))
+    parts.append("截图未保存，视觉结果只作补充证据；不会自动导入岗位、点击、发消息或投递。")
+    return " ".join(parts)
+
+
 def control_memory_overview(conn: Any) -> dict[str, Any]:
     active_row = conn.execute(
         "SELECT * FROM control_memories WHERE memory_type = 'active_job' ORDER BY updated_at DESC, id DESC LIMIT 1"
@@ -5242,6 +5376,82 @@ async def process_control_message(message: str) -> dict[str, Any]:
                     "browser_clicked": False,
                     "message_filled": False,
                     "message_sent": False,
+                },
+                error_message=str(result.get("error") or "")[:300],
+            )
+        return control_message_response(conversation_id)
+    if intent_type == "review_visual_page":
+        mode = str(filters.get("mode") or "viewport")
+        if mode not in {"viewport", "full_page"}:
+            mode = "viewport"
+        with connect() as conn:
+            conversation_cursor = conn.execute(
+                "INSERT INTO control_conversations (user_text, intent_type, response_text, evidence_json, created_at) VALUES (?, ?, '', '{}', ?)",
+                (redact_control_text(message), intent_type, utc_now()),
+            )
+            conversation_id = int(conversation_cursor.lastrowid)
+        events.append(control_event("工具调用", "执行中", f"抓取受控 Edge 当前招聘页的{'整页缩放' if mode == 'full_page' else '可视区域'}截图，交给视觉模型复核。"))
+        result = await run_in_threadpool(run_visual_page_review, mode, message)
+        execution_status = str(result.get("status") or "未完成")
+        response_text = visual_page_review_response(result)
+        review = result.get("review") if isinstance(result.get("review"), dict) else {}
+        capture = result.get("capture") if isinstance(result.get("capture"), dict) else {}
+        result_summary = {
+            "status": execution_status,
+            "note": str(result.get("note") or "")[:500],
+            "review": review,
+            "capture": capture,
+            "model_called": bool(result.get("model_called")),
+            "model_profile": str(result.get("model_profile") or ""),
+            "model_name": str(result.get("model_name") or ""),
+            "image_sent_to_model": bool(result.get("image_sent_to_model")),
+            "image_persisted": False,
+        }
+        events.append(control_event("模型调用", "完成" if execution_status == "已完成" else execution_status, str(result.get("note") or response_text)[:500]))
+        events.append(control_event("工具结果", execution_status, response_text[:500]))
+        events.append(control_event("安全结论", "视觉只读复核", "截图不落库；不保存页面正文，不自动导入岗位，不点击、不打开会话、不填入或发送消息。"))
+        evidence["execution"] = {
+            "mode": "chat_direct_visual_page_review",
+            "action_type": "review_visual_page",
+            "status": execution_status,
+            "result": result_summary,
+        }
+        with connect() as conn:
+            execution_id = create_completed_control_execution(
+                conn,
+                conversation_id,
+                "review_visual_page",
+                f"通过聊天对受控 Edge 当前招聘页执行{'整页' if mode == 'full_page' else '可视区域'}视觉复核。",
+                {"mode": mode},
+                result_summary,
+                execution_status,
+            )
+            evidence["execution_id"] = execution_id
+            conn.execute(
+                "UPDATE control_conversations SET response_text = ?, evidence_json = ? WHERE id = ?",
+                (response_text, dumps(evidence), conversation_id),
+            )
+            log_agent_action(
+                conn,
+                action_type="control_request",
+                status=execution_status,
+                summary=response_text,
+                decision={
+                    "intent": intent_type,
+                    "filters": {"mode": mode},
+                    "execution_mode": "chat_direct_visual_page_review",
+                    "message_saved_redacted": True,
+                    "model_called": bool(result.get("model_called")),
+                    "model_task_type": "control_intent" if result.get("model_called") else "",
+                    "image_sent_to_model": bool(result.get("image_sent_to_model")),
+                    "image_persisted": False,
+                    "page_text_saved": False,
+                    "conversation_opened": False,
+                    "browser_clicked": False,
+                    "message_filled": False,
+                    "message_sent": False,
+                    "auto_apply": False,
+                    "auto_message": False,
                 },
                 error_message=str(result.get("error") or "")[:300],
             )
@@ -5948,11 +6158,11 @@ async def process_control_message(message: str) -> dict[str, Any]:
             else:
                 response_text = "请指定对话采集编号，例如“将对话 #12 的群发消息标为忽略”。"
         elif intent_type == "show_plan":
-            response_text = "可直接说“找杭州 Agent 实习，日薪至少 200”执行受控发现，也可以说“检查简历准备情况”“列出高匹配低风险岗位”或“检查未读消息”。选择岗位后可问“当前岗位下一步怎么做”，或创建状态确认计划；岗位确认到“待面试”后可准备面试。投递、发简历和敏感信息仍需人工确认。"
+            response_text = "可直接说“找杭州 Agent 实习，日薪至少 200”执行受控发现，也可以说“检查简历准备情况”“列出高匹配低风险岗位”“检查未读消息”或“识图分析当前页面”。选择岗位后可问“当前岗位下一步怎么做”，或创建状态确认计划；岗位确认到“待面试”后可准备面试。投递、发简历和敏感信息仍需人工确认。"
         elif filters.get("missing_active_job"):
             response_text = "还没有当前岗位。请先在岗位列表确认编号，再说“选择岗位 #编号”。"
         else:
-            response_text = "我目前可直接执行：受控岗位搜索、本地岗位短名单、隐私保护的简历就绪检查、用户明确触发的未读标记扫描、JD 读取和评分，并可解释、比较或给出岗位下一步建议，创建本地状态确认计划，维护待面试后的本地准备，查看统计和计划。投递、发简历、敏感信息和沟通发送仍会保留人工确认。"
+            response_text = "我目前可直接执行：受控岗位搜索、本地岗位短名单、隐私保护的简历就绪检查、用户明确触发的未读标记扫描和视觉页面复核、JD 读取和评分，并可解释、比较或给出岗位下一步建议，创建本地状态确认计划，维护待面试后的本地准备，查看统计和计划。投递、发简历、敏感信息和沟通发送仍会保留人工确认。"
         conn.execute(
             "UPDATE control_conversations SET response_text = ?, evidence_json = ? WHERE id = ?",
             (response_text, dumps(evidence), conversation_id),

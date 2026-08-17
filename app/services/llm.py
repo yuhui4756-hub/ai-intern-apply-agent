@@ -40,7 +40,7 @@ class OpenAICompatibleClient:
     def configured(self) -> bool:
         return bool(self.base_url and self.model and self.api_key)
 
-    def complete(self, messages: list[dict[str, str]], response_format: dict[str, str] | None = None) -> LLMResult:
+    def complete(self, messages: list[dict[str, Any]], response_format: dict[str, str] | None = None) -> LLMResult:
         if not self.configured:
             raise RuntimeError("OpenAI-compatible profile is not fully configured.")
 
@@ -53,7 +53,7 @@ class OpenAICompatibleClient:
         if response_format:
             payload["response_format"] = response_format
 
-        input_text = "\n".join(message.get("content", "") for message in messages)
+        input_text = "\n".join(message_content_for_estimate(message.get("content")) for message in messages)
         with httpx.Client(timeout=45) as client:
             response = client.post(
                 url,
@@ -63,7 +63,7 @@ class OpenAICompatibleClient:
             if response.is_error:
                 raise RuntimeError(f"HTTP {response.status_code}: {response.text[:500]}")
         data = response.json()
-        content = data["choices"][0]["message"].get("content", "")
+        content = response_content_text(data["choices"][0]["message"].get("content", ""))
         usage = data.get("usage") or {}
         input_tokens = int(usage.get("prompt_tokens") or estimate_tokens(input_text))
         output_tokens = int(usage.get("completion_tokens") or estimate_tokens(content))
@@ -71,6 +71,25 @@ class OpenAICompatibleClient:
         return LLMResult(content=content, input_tokens=input_tokens, output_tokens=output_tokens, usage_source=usage_source)
 
     def complete_json(self, messages: list[dict[str, str]]) -> dict[str, Any]:
+        result = self.complete(messages, response_format={"type": "json_object"})
+        self.log_call(result, "success", "")
+        try:
+            return json.loads(result.content)
+        except json.JSONDecodeError as exc:
+            self.log_error(f"JSON parse failed: {exc}")
+            raise
+
+    def complete_json_with_image(self, system_prompt: str, user_prompt: str, image_data_url: str) -> dict[str, Any]:
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_prompt},
+                    {"type": "image_url", "image_url": {"url": image_data_url}},
+                ],
+            },
+        ]
         result = self.complete(messages, response_format={"type": "json_object"})
         self.log_call(result, "success", "")
         try:
@@ -152,3 +171,31 @@ def client_for_task(task_type: str) -> OpenAICompatibleClient | None:
     if not profile:
         return None
     return OpenAICompatibleClient(profile, task_type)
+
+
+def response_content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") in {"text", "output_text"}:
+                parts.append(str(item.get("text") or ""))
+        return "\n".join(part for part in parts if part)
+    return str(content or "")
+
+
+def message_content_for_estimate(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return str(content or "")
+    parts = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "text":
+            parts.append(str(item.get("text") or ""))
+        elif item.get("type") == "image_url":
+            parts.append("[视觉页面截图，估算 1600 tokens]")
+    return "\n".join(parts)
