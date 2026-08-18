@@ -139,6 +139,7 @@ JOB_DISCOVERY_STRONG_ROLE_SIGNALS = (
     "nlp",
 )
 JOB_DISCOVERY_SECONDARY_ROLE_SIGNALS = ("模型", "算法")
+JOB_DISCOVERY_SENIOR_EXPERIENCE_RE = re.compile(r"(?<!\d)(?:[2-9]|1\d)\s*(?:[-~～至到]\s*(?:[2-9]|1\d))?\s*年(?:经验|工作经验)?")
 JOB_DISCOVERY_NON_ENGINEERING_SIGNALS = (
     "法务",
     "供应链",
@@ -1665,6 +1666,9 @@ def discovery_candidate_screening(
         return False, "搜索结果缺少可识别的岗位名称，未自动读取 JD；可手动导入复核。"
     if any("\ue000" <= char <= "\uf8ff" for char in f"{title}\n{summary}"):
         return False, "搜索结果包含无法识别的字体字符，未自动读取 JD；可手动导入复核。"
+    senior_experience = JOB_DISCOVERY_SENIOR_EXPERIENCE_RE.search(f"{title}\n{summary}")
+    if senior_experience:
+        return False, f"搜索信息显示需要 {senior_experience.group(0)}，不符合在校实习初筛；未读取 JD，可手动导入复核。"
     if any(signal.lower() in text for signal in JOB_DISCOVERY_NON_ENGINEERING_SIGNALS):
         return False, "自动初筛识别为非研发方向，未读取 JD；可手动导入复核。"
     strong_match = any(signal.lower() in text for signal in JOB_DISCOVERY_STRONG_ROLE_SIGNALS)
@@ -1807,6 +1811,9 @@ def run_controlled_job_discovery(filters: dict[str, Any] | None = None) -> dict[
     salary_screened_out_count = 0
     candidate_count = 0
     controlled_edge_retry_count = 0
+    visual_review_count = 0
+    visual_reconciled_count = 0
+    visual_review_failure_count = 0
     seen_urls: set[str] = set()
     for item in plan:
         try:
@@ -1817,6 +1824,24 @@ def run_controlled_job_discovery(filters: dict[str, Any] | None = None) -> dict[
                 limit=JOB_DISCOVERY_CANDIDATE_LIMIT,
             )
             controlled_edge_retry_count += int(getattr(result, "retry_count", 0) or 0)
+            if search_result_needs_visual_review(result):
+                visual_result = run_visual_page_review(
+                    "viewport",
+                    f"受控岗位发现：{item['keyword']}，{item['city']}。请补充当前搜索页中 DOM 未可靠提取的候选字段。",
+                    expected_url=result.search_url,
+                    platform=item["platform"],
+                )
+                if visual_result.get("status") == "已完成":
+                    visual_review_count += 1
+                    review = visual_result.get("review") if isinstance(visual_result.get("review"), dict) else {}
+                    reconciled = reconcile_search_result_with_visual_review(result, review)
+                    visual_reconciled_count += reconciled
+                    if reconciled:
+                        result.note = (result.note + f" 视觉复核补全 {reconciled} 条已匹配候选字段。").strip()
+                    elif not result.candidates and review.get("candidate_jobs"):
+                        result.note = (result.note + " 视觉复核识别到候选信息，但没有稳定岗位链接，未自动导入。").strip()
+                elif visual_result.get("status") not in {"未配置"}:
+                    visual_review_failure_count += 1
             run_id = save_search_result(result)
         except Exception as exc:
             note = str(exc)[:500]
@@ -1883,6 +1908,10 @@ def run_controlled_job_discovery(filters: dict[str, Any] | None = None) -> dict[
         note += f" {len(search_errors)} 个搜索页失败。"
     if controlled_edge_retry_count:
         note += f" 受控 Edge 已自动恢复 {controlled_edge_retry_count} 次短暂连接中断。"
+    if visual_review_count:
+        note += f" 视觉复核 {visual_review_count} 个字段异常搜索页，补全 {visual_reconciled_count} 条候选字段。"
+    if visual_review_failure_count:
+        note += f" {visual_review_failure_count} 个视觉复核失败，已保留 DOM 结果供人工复核。"
 
     with connect() as conn:
         log_agent_action(
@@ -1905,6 +1934,9 @@ def run_controlled_job_discovery(filters: dict[str, Any] | None = None) -> dict[
                 "failed_import_count": failed_count,
                 "failed_search_count": len(search_errors),
                 "controlled_edge_retry_count": controlled_edge_retry_count,
+                "visual_review_count": visual_review_count,
+                "visual_reconciled_count": visual_reconciled_count,
+                "visual_review_failure_count": visual_review_failure_count,
                 "auto_apply": False,
                 "auto_message": False,
                 "message_text_saved": False,
@@ -1923,6 +1955,9 @@ def run_controlled_job_discovery(filters: dict[str, Any] | None = None) -> dict[
         "pending_detail_count": pending_count,
         "failed_import_count": failed_count,
         "failed_search_count": len(search_errors),
+        "visual_review_count": visual_review_count,
+        "visual_reconciled_count": visual_reconciled_count,
+        "visual_review_failure_count": visual_review_failure_count,
         "import_results": import_results,
     }
 
@@ -4855,6 +4890,7 @@ def normalize_visual_page_review(value: object) -> dict[str, Any]:
                 "title": compact_visual_review_text(raw.get("title"), 180),
                 "city": compact_visual_review_text(raw.get("city"), 80),
                 "salary_text": compact_visual_review_text(raw.get("salary_text"), 100),
+                "experience_text": compact_visual_review_text(raw.get("experience_text"), 80),
             }
             if candidate["company"] or candidate["title"]:
                 candidate_jobs.append(candidate)
@@ -4875,7 +4911,13 @@ def normalize_visual_page_review(value: object) -> dict[str, Any]:
     }
 
 
-def run_visual_page_review(mode: str = "viewport", user_message: str = "") -> dict[str, Any]:
+def run_visual_page_review(
+    mode: str = "viewport",
+    user_message: str = "",
+    *,
+    expected_url: str = "",
+    platform: str = "",
+) -> dict[str, Any]:
     # Reuse the task-chat model so screenshot interpretation keeps the same local conversation context.
     client = client_for_task("control_intent")
     if not client or not client.configured:
@@ -4886,7 +4928,7 @@ def run_visual_page_review(mode: str = "viewport", user_message: str = "") -> di
             "image_sent_to_model": False,
         }
     try:
-        capture = capture_controlled_edge_visual_page(mode)
+        capture = capture_controlled_edge_visual_page(mode, expected_url=expected_url, platform=platform)
         metadata = capture.get("metadata") if isinstance(capture.get("metadata"), dict) else {}
         history = [item for item in control_history_for_model() if item.get("assistant")][-6:]
         history_text = "\n".join(
@@ -4897,7 +4939,7 @@ def run_visual_page_review(mode: str = "viewport", user_message: str = "") -> di
             "禁止转录或输出手机号、邮箱、联系人、聊天正文、验证码或任何联系方式。"
             "若无法确认字段必须留空并写入 uncertainties，不要猜测。"
             "JSON 字段：page_type(job_detail/search_results/unknown)、company、title、city、salary_text、"
-            "summary(不超过300字)、candidate_jobs(最多6条，每条仅 company/title/city/salary_text)、"
+            "summary(不超过300字)、candidate_jobs(最多6条，每条仅 company/title/city/salary_text/experience_text)、"
             "confidence(0到1)、uncertainties(字符串数组)。"
             "这只是视觉复核，不判断是否投递，不产生外部动作。"
         )
@@ -4951,7 +4993,7 @@ def visual_page_review_response(result: dict[str, Any]) -> str:
     candidates = review.get("candidate_jobs") if isinstance(review.get("candidate_jobs"), list) else []
     if candidates:
         compact_candidates = [
-            " / ".join(item for item in [candidate.get("company"), candidate.get("title"), candidate.get("city"), candidate.get("salary_text")] if item)
+            " / ".join(item for item in [candidate.get("company"), candidate.get("title"), candidate.get("city"), candidate.get("salary_text"), candidate.get("experience_text")] if item)
             for candidate in candidates
         ]
         parts.append("候选：" + "；".join(item for item in compact_candidates if item))
@@ -4959,6 +5001,59 @@ def visual_page_review_response(result: dict[str, Any]) -> str:
         parts.append("待确认：" + "；".join(str(item) for item in review["uncertainties"][:3]))
     parts.append("截图未保存，视觉结果只作补充证据；不会自动导入岗位、点击、发消息或投递。")
     return " ".join(parts)
+
+
+def visual_candidate_matches_dom(visual_candidate: dict[str, Any], dom_candidate: Any) -> bool:
+    visual_title = re.sub(r"\s+", "", str(visual_candidate.get("title") or "").lower())
+    visual_company = re.sub(r"\s+", "", str(visual_candidate.get("company") or "").lower())
+    dom_title = re.sub(r"\s+", "", str(getattr(dom_candidate, "title", "") or "").lower())
+    dom_company = re.sub(r"\s+", "", str(getattr(dom_candidate, "company", "") or "").lower())
+    title_match = bool(visual_title and dom_title and (visual_title in dom_title or dom_title in visual_title))
+    company_match = bool(visual_company and dom_company and (visual_company in dom_company or dom_company in visual_company))
+    return title_match or (company_match and bool(visual_title or dom_title))
+
+
+def reconcile_search_result_with_visual_review(result: SearchResult, review: dict[str, Any]) -> int:
+    """Merge visual fields only when they map to a DOM candidate with a stable source URL."""
+    visual_candidates = review.get("candidate_jobs") if isinstance(review.get("candidate_jobs"), list) else []
+    reconciled = 0
+    for visual_candidate in visual_candidates:
+        if not isinstance(visual_candidate, dict):
+            continue
+        matches = [candidate for candidate in result.candidates if visual_candidate_matches_dom(visual_candidate, candidate)]
+        if len(matches) != 1:
+            continue
+        candidate = matches[0]
+        changed = False
+        if not candidate.company and visual_candidate.get("company"):
+            candidate.company = compact_visual_review_text(visual_candidate.get("company"), 80)
+            changed = True
+        if not candidate.city and visual_candidate.get("city"):
+            candidate.city = compact_visual_review_text(visual_candidate.get("city"), 80)
+            changed = True
+        details = [
+            f"视觉薪资：{compact_visual_review_text(visual_candidate.get('salary_text'), 100)}" if visual_candidate.get("salary_text") else "",
+            f"视觉经验：{compact_visual_review_text(visual_candidate.get('experience_text'), 80)}" if visual_candidate.get("experience_text") else "",
+        ]
+        details = [item for item in details if item]
+        if details and not all(item in candidate.summary for item in details):
+            candidate.summary = (candidate.summary + "\n" + "\n".join(details)).strip()[:420]
+            changed = True
+        reconciled += int(changed)
+    return reconciled
+
+
+def search_result_needs_visual_review(result: SearchResult) -> bool:
+    if not result.candidates:
+        return True
+    incomplete = sum(
+        not str(candidate.title or "").strip()
+        or candidate.title == "候选岗位"
+        or not str(candidate.company or "").strip()
+        or len(str(candidate.summary or "").strip()) < 18
+        for candidate in result.candidates
+    )
+    return incomplete * 2 >= len(result.candidates)
 
 
 def control_memory_overview(conn: Any) -> dict[str, Any]:

@@ -24,15 +24,24 @@ CHAT_PATH_TOKENS = ("chat", "message", "conversation", "communicate", "talk", "i
 MAX_FULL_PAGE_PIXELS = 7_500_000
 
 
-def capture_controlled_edge_visual_page(mode: str = "viewport") -> dict[str, object]:
+def capture_controlled_edge_visual_page(
+    mode: str = "viewport",
+    *,
+    expected_url: str = "",
+    platform: str = "",
+) -> dict[str, object]:
     """Capture one controlled recruitment page without writing the image to disk."""
     if mode not in {"viewport", "full_page"}:
         raise ValueError("截图模式无效。")
     if not wait_for_debug_endpoint(timeout_seconds=3):
         raise ValueError("没有检测到应用打开的 Edge 调试窗口，请先打开受控 Edge。")
     targets = [target for target in read_controlled_edge_targets() if visual_page_target(target)]
+    if expected_url:
+        targets = [target for target in targets if target_matches_expected_url(target_url(target), expected_url)]
+    elif platform:
+        targets = [target for target in targets if platform_for_url(target_url(target)) == platform]
     if not targets:
-        raise ValueError("受控 Edge 中没有可视觉复核的招聘岗位或搜索页面。消息页请继续使用未读扫描或当前对话采集。")
+        raise ValueError("受控 Edge 中没有匹配当前搜索任务的可视觉复核页面。消息页请继续使用未读扫描或当前对话采集。")
     if len(targets) != 1:
         raise ValueError("受控 Edge 中检测到多个招聘岗位或搜索页面。请暂时只保留需要复核的一个页面后重试。")
 
@@ -87,3 +96,15 @@ def platform_for_url(url: str) -> str:
         if host == domain or host.endswith(f".{domain}"):
             return platform
     return ""
+
+
+def target_matches_expected_url(url: str, expected_url: str) -> bool:
+    current = urlparse(url or "")
+    expected = urlparse(expected_url or "")
+    if not current.hostname or not expected.hostname:
+        return False
+    if current.hostname.lower() != expected.hostname.lower():
+        return False
+    if (current.path or "").rstrip("/") != (expected.path or "").rstrip("/"):
+        return False
+    return current.query == expected.query

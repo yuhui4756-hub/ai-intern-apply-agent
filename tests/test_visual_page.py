@@ -2,6 +2,8 @@ import base64
 
 import pytest
 
+from app import main
+from app.services.job_searcher import SearchCandidate, SearchResult
 from app.services import visual_page
 
 
@@ -100,7 +102,7 @@ def test_visual_review_reuses_task_chat_model_and_history(monkeypatch):
     monkeypatch.setattr(
         main,
         "capture_controlled_edge_visual_page",
-        lambda _mode: {
+        lambda _mode, **_kwargs: {
             "image_data_url": "data:image/jpeg;base64,dGVzdA==",
             "metadata": {"mode": "viewport", "platform": "Boss 直聘", "image_persisted": False},
         },
@@ -116,3 +118,111 @@ def test_visual_review_reuses_task_chat_model_and_history(monkeypatch):
     assert calls[0][2] == "data:image/jpeg;base64,dGVzdA=="
     assert "找杭州 AI 应用开发实习" in calls[0][1]
     assert "识图分析当前页面" in calls[0][1]
+
+
+def test_visual_reconciliation_only_enriches_a_unique_dom_candidate_and_screens_senior_experience():
+    result = SearchResult(
+        platform="Boss 直聘",
+        keyword="AI 应用开发",
+        city="杭州",
+        search_url="https://www.zhipin.com/web/geek/jobs?query=AI",
+        browser_channel="msedge",
+        candidates=[
+            SearchCandidate(
+                title="AI 应用开发工程师",
+                company="",
+                city="",
+                source_url="https://www.zhipin.com/job_detail/visual.html",
+                summary="AI 应用开发岗位，RAG。",
+            )
+        ],
+    )
+    review = {
+        "candidate_jobs": [
+            {
+                "company": "视觉测试科技",
+                "title": "AI 应用开发工程师",
+                "city": "杭州",
+                "salary_text": "200-300 元/天",
+                "experience_text": "5-10 年经验",
+            }
+        ]
+    }
+
+    reconciled = main.reconcile_search_result_with_visual_review(result, review)
+    candidate = result.candidates[0]
+    accepted, reason = main.discovery_candidate_screening(
+        {"title": candidate.title, "summary": candidate.summary}
+    )
+
+    assert reconciled == 1
+    assert candidate.company == "视觉测试科技"
+    assert candidate.city == "杭州"
+    assert "视觉薪资：200-300 元/天" in candidate.summary
+    assert "视觉经验：5-10 年经验" in candidate.summary
+    assert accepted is False
+    assert "5-10 年经验" in reason
+
+
+def test_controlled_discovery_uses_visual_fallback_before_detail_reads(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "visual-discovery.sqlite3"))
+    from app.db import connect, init_db
+
+    init_db()
+    visual_calls = []
+    fetch_calls = []
+
+    def fake_search(platform, keyword, city, limit):
+        suffix = {"Boss 直聘": "boss", "猎聘": "liepin", "实习僧": "shixiseng"}[platform]
+        return SearchResult(
+            platform=platform,
+            keyword=keyword,
+            city=city,
+            search_url=f"https://example.com/{suffix}/search",
+            browser_channel="msedge",
+            candidates=[
+                SearchCandidate(
+                    title="AI 应用开发工程师",
+                    company="",
+                    city=city,
+                    source_url=f"https://example.com/{suffix}/job-detail",
+                    summary="AI 应用开发与 RAG 岗位。",
+                )
+            ],
+        )
+
+    def fake_visual(mode, user_message, **kwargs):
+        visual_calls.append((mode, kwargs["expected_url"], kwargs["platform"]))
+        return {
+            "status": "已完成",
+            "review": {
+                "candidate_jobs": [
+                    {
+                        "company": "视觉补全科技",
+                        "title": "AI 应用开发工程师",
+                        "city": "杭州",
+                        "salary_text": "200-300 元/天",
+                        "experience_text": "5-10 年经验",
+                    }
+                ]
+            },
+        }
+
+    monkeypatch.setattr(main, "search_jobs_in_controlled_edge", fake_search)
+    monkeypatch.setattr(main, "run_visual_page_review", fake_visual)
+    monkeypatch.setattr(main, "fetch_job_from_controlled_edge", lambda url: fetch_calls.append(url))
+
+    result = main.run_controlled_job_discovery()
+    with connect() as conn:
+        candidates = conn.execute("SELECT company, summary, status, error_message FROM job_candidates ORDER BY id").fetchall()
+
+    assert result["status"] == "完成"
+    assert result["visual_review_count"] == 3
+    assert result["visual_reconciled_count"] == 3
+    assert result["screened_out_count"] == 3
+    assert len(visual_calls) == 3
+    assert fetch_calls == []
+    assert all(row["company"] == "视觉补全科技" for row in candidates)
+    assert all("视觉经验：5-10 年经验" in row["summary"] for row in candidates)
+    assert all(row["status"] == "初筛待确认" for row in candidates)
+    assert all("5-10 年经验" in row["error_message"] for row in candidates)
