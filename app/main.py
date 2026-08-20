@@ -140,6 +140,7 @@ JOB_DISCOVERY_STRONG_ROLE_SIGNALS = (
 )
 JOB_DISCOVERY_SECONDARY_ROLE_SIGNALS = ("模型", "算法")
 JOB_DISCOVERY_SENIOR_EXPERIENCE_RE = re.compile(r"(?<!\d)(?:[2-9]|1\d)\s*(?:[-~～至到]\s*(?:[2-9]|1\d))?\s*年(?:经验|工作经验)?")
+JOB_DISCOVERY_INTERNSHIP_SIGNAL_RE = re.compile(r"实习|在校|校招|应届|学生")
 JOB_DISCOVERY_NON_ENGINEERING_SIGNALS = (
     "法务",
     "供应链",
@@ -5053,7 +5054,14 @@ def search_result_needs_visual_review(result: SearchResult) -> bool:
         or len(str(candidate.summary or "").strip()) < 18
         for candidate in result.candidates
     )
-    return incomplete * 2 >= len(result.candidates)
+    if incomplete * 2 >= len(result.candidates):
+        return True
+    candidate_text = "\n".join(
+        f"{candidate.title or ''}\n{candidate.summary or ''}" for candidate in result.candidates
+    )
+    # Search queries target internships. A page with no visible internship signal
+    # is often a social-hiring result list whose experience requirements DOM did not expose.
+    return not bool(JOB_DISCOVERY_INTERNSHIP_SIGNAL_RE.search(candidate_text))
 
 
 def control_memory_overview(conn: Any) -> dict[str, Any]:

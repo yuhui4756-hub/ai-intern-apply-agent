@@ -70,6 +70,20 @@ def test_capture_visual_page_scales_full_page_and_rejects_ambiguous_targets(monk
         visual_page.capture_controlled_edge_visual_page("viewport")
 
 
+def test_visual_page_rejects_recruitment_security_interstitial(monkeypatch):
+    security_target = {
+        "id": "security-page",
+        "type": "page",
+        "url": "https://www.zhipin.com/web/passport/zp/security.html?callbackUrl=jobs",
+        "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/security-page",
+    }
+    monkeypatch.setattr(visual_page, "wait_for_debug_endpoint", lambda **_kwargs: True)
+    monkeypatch.setattr(visual_page, "read_controlled_edge_targets", lambda: [security_target])
+
+    with pytest.raises(ValueError, match="没有匹配当前搜索任务"):
+        visual_page.capture_controlled_edge_visual_page("viewport")
+
+
 def test_visual_review_reuses_task_chat_model_and_history(monkeypatch):
     from app import main
 
@@ -162,6 +176,44 @@ def test_visual_reconciliation_only_enriches_a_unique_dom_candidate_and_screens_
     assert "视觉经验：5-10 年经验" in candidate.summary
     assert accepted is False
     assert "5-10 年经验" in reason
+
+
+def test_visual_review_is_requested_for_complete_results_without_internship_signal():
+    complete_social_result = SearchResult(
+        platform="Boss 直聘",
+        keyword="AI 应用开发实习",
+        city="杭州",
+        search_url="https://www.zhipin.com/web/geek/jobs?query=AI",
+        browser_channel="msedge",
+        candidates=[
+            SearchCandidate(
+                title="AI 应用开发工程师",
+                company="测试科技",
+                city="杭州",
+                source_url="https://www.zhipin.com/job_detail/social.html",
+                summary="负责 Agent 系统和 RAG 应用开发。",
+            )
+        ],
+    )
+    complete_internship_result = SearchResult(
+        platform="Boss 直聘",
+        keyword="AI 应用开发实习",
+        city="杭州",
+        search_url="https://www.zhipin.com/web/geek/jobs?query=AI",
+        browser_channel="msedge",
+        candidates=[
+            SearchCandidate(
+                title="AI 应用开发实习生",
+                company="测试科技",
+                city="杭州",
+                source_url="https://www.zhipin.com/job_detail/intern.html",
+                summary="面向在校生，参与 RAG 应用开发。",
+            )
+        ],
+    )
+
+    assert main.search_result_needs_visual_review(complete_social_result) is True
+    assert main.search_result_needs_visual_review(complete_internship_result) is False
 
 
 def test_controlled_discovery_uses_visual_fallback_before_detail_reads(tmp_path, monkeypatch):

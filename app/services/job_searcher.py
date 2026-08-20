@@ -30,6 +30,7 @@ TIME_WORDS = ["天/周", "周", "个月", "月", "长期", "实习"]
 COMPANY_HINTS = ["公司", "科技", "智能", "网络", "信息", "软件", "数据", "集团", "字节", "华为", "腾讯", "阿里", "百度"]
 CITY_WORDS = ["北京", "上海", "广州", "深圳", "杭州", "重庆", "成都", "南京", "苏州", "厦门", "武汉", "长沙"]
 MASKED_SALARY_RE = re.compile(r"[□�]{2,}\s*(?:-|~|～|至|到|—|–|－)\s*[□�]{2,}\s*元\s*/?\s*[天日]")
+RECRUITMENT_INTERSTITIAL_PATH_TOKENS = ("/passport", "/security", "/captcha", "/verify", "/login", "/signin")
 CITY_CODES = {
     "北京": "101010100",
     "上海": "101020100",
@@ -193,6 +194,9 @@ def capture_current_search_page(
         message = str(exc).strip() or exc.__class__.__name__
         raise ValueError(f"无法连接当前 Edge 页面：{message[:160]}。请先点击“打开 Edge 搜索页”，完成登录或筛选后再采集。") from exc
 
+    if is_recruitment_interstitial_url(final_url):
+        platform_label = platform or "招聘平台"
+        raise ValueError(f"{platform_label} 已跳转到登录或安全验证页，请在受控 Edge 完成验证后重新执行搜索。")
     candidates = extract_candidates_from_anchors(anchors, platform, city, final_url, limit=limit)
     note = "" if candidates else "没有从当前页面识别到岗位候选，可尝试打开搜索结果页或岗位列表页后再采集。"
     if retry_count:
@@ -209,6 +213,12 @@ def capture_current_search_page(
     )
 
 
+def is_recruitment_interstitial_url(url: str) -> bool:
+    parsed = urlparse(url or "")
+    path = (parsed.path or "").lower()
+    return any(token in path for token in RECRUITMENT_INTERSTITIAL_PATH_TOKENS)
+
+
 def _capture_current_search_page_once(platform: str, expected_url: str) -> tuple[str, list[dict]]:
     if not wait_for_debug_endpoint(timeout_seconds=3):
         raise ValueError("没有检测到应用打开的 Edge 调试窗口，请先点击“打开 Edge 搜索页”。")
@@ -218,6 +228,9 @@ def _capture_current_search_page_once(platform: str, expected_url: str) -> tuple
     if not isinstance(snapshot, dict):
         raise ValueError("受控 Edge 搜索页没有返回可读取的页面内容。")
     final_url = ensure_public_http_url(str(snapshot.get("url") or target_url(target)))
+    if is_recruitment_interstitial_url(final_url):
+        platform_label = platform or "招聘平台"
+        raise ValueError(f"{platform_label} 已跳转到登录或安全验证页，请在受控 Edge 完成验证后重新执行搜索。")
     anchors = snapshot.get("anchors")
     if not isinstance(anchors, list):
         raise ValueError("受控 Edge 搜索页没有返回岗位链接。")

@@ -8,6 +8,7 @@ from app.services.job_searcher import (
     extract_candidates_from_anchors,
     fetch_job_from_controlled_edge,
     find_controlled_search_page,
+    is_recruitment_interstitial_url,
     open_manual_search_in_edge,
     pick_search_page,
 )
@@ -199,6 +200,21 @@ def test_capture_controlled_search_reads_cdp_target_without_playwright(monkeypat
 
     assert result.search_url == target["url"]
     assert result.candidates[0].company == "测试智能科技"
+
+
+def test_capture_controlled_search_stops_at_login_or_security_interstitial(monkeypatch):
+    security_url = "https://www.zhipin.com/web/passport/zp/security.html?callbackUrl=https%3A%2F%2Fwww.zhipin.com%2Fweb%2Fgeek%2Fjobs"
+    monkeypatch.setattr(
+        job_searcher,
+        "_capture_current_search_page_once",
+        lambda *_args, **_kwargs: (security_url, []),
+    )
+
+    with pytest.raises(ValueError, match="登录或安全验证页"):
+        capture_current_search_page("Boss 直聘", "AI Agent", "杭州")
+
+    assert is_recruitment_interstitial_url(security_url) is True
+    assert is_recruitment_interstitial_url("https://www.zhipin.com/web/geek/jobs?query=AI&_security_check=1") is False
 
 
 def test_controlled_search_snapshot_prefers_job_card_over_nearest_div():

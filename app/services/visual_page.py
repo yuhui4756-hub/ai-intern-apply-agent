@@ -6,6 +6,7 @@ from math import sqrt
 from urllib.parse import urlparse
 
 from .job_searcher import (
+    is_recruitment_interstitial_url,
     read_controlled_edge_targets,
     send_cdp_command,
     target_url,
@@ -85,6 +86,8 @@ def capture_controlled_edge_visual_page(
 def visual_page_target(target: object) -> bool:
     url = target_url(target)
     if not url.startswith(("http://", "https://")) or not platform_for_url(url):
+        return False
+    if is_recruitment_interstitial_url(url):
         return False
     path = (urlparse(url).path or "").lower()
     return not any(token in path for token in CHAT_PATH_TOKENS)
