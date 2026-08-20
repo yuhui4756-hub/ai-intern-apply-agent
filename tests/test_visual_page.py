@@ -216,6 +216,131 @@ def test_visual_review_is_requested_for_complete_results_without_internship_sign
     assert main.search_result_needs_visual_review(complete_internship_result) is False
 
 
+def test_visual_job_detail_fallback_closes_temporary_target_and_returns_valid_jd(monkeypatch):
+    target = {
+        "id": "temporary-detail",
+        "type": "page",
+        "url": "https://www.zhipin.com/job_detail/visual-detail.html",
+        "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/temporary-detail",
+    }
+    closed = []
+
+    class FakeClient:
+        configured = True
+        profile = {"name": "聊天视觉模型"}
+        model = "vision-chat-model"
+
+        def complete_json_with_image(self, _system_prompt, _user_prompt, image_data_url):
+            assert image_data_url == "data:image/jpeg;base64,dGVzdA=="
+            return {
+                "company": "视觉详情科技",
+                "title": "AI 应用开发实习生",
+                "city": "杭州",
+                "salary_text": "200-300 元/天",
+                "experience_text": "经验不限",
+                "internship_days": "5天/周",
+                "internship_duration": "3个月",
+                "jd_text": "参与 AI 应用和 RAG 检索流程开发，协助实现 FastAPI 接口、文档处理和本地评测脚本。要求具备 Python 基础，了解大模型 API 调用与 SQLite 数据处理，能够每周到岗五天并持续实习三个月。",
+                "confidence": 0.86,
+                "uncertainties": ["具体团队规模未显示"],
+            }
+
+        def log_error(self, _message):
+            raise AssertionError("详情视觉复核不应记录错误")
+
+    monkeypatch.setattr(main, "client_for_task", lambda task_type: FakeClient() if task_type == "control_intent" else None)
+    monkeypatch.setattr(main, "create_controlled_edge_target", lambda _url: target)
+    monkeypatch.setattr(main, "wait_for_cdp_document_ready", lambda _target: None)
+    monkeypatch.setattr(
+        main,
+        "evaluate_cdp_expression",
+        lambda *_args, **_kwargs: {"url": target["url"], "title": "AI 应用开发实习生", "text": "页面文本太短"},
+    )
+    monkeypatch.setattr(
+        main,
+        "capture_visual_page_target",
+        lambda _target, _mode: {
+            "image_data_url": "data:image/jpeg;base64,dGVzdA==",
+            "metadata": {"platform": "Boss 直聘", "image_persisted": False, "page_text_saved": False},
+        },
+    )
+    monkeypatch.setattr(main, "close_controlled_edge_target", lambda item: closed.append(item) or True)
+    monkeypatch.setattr(main, "control_history_for_model", lambda: [])
+
+    result = main.run_visual_job_detail_fallback(
+        target["url"], {"company": "", "title": "AI 应用开发实习生", "city": "杭州"}
+    )
+
+    assert result["status"] == "已完成"
+    assert result["fetched"].fetch_mode == "controlled_edge_visual"
+    assert len(result["fetched"].text) >= 80
+    assert result["review"]["company"] == "视觉详情科技"
+    assert result["capture"]["image_persisted"] is False
+    assert closed == [target]
+
+
+def test_visual_detail_fallback_is_used_for_short_dom_text_but_not_login(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "visual-detail-import.sqlite3"))
+    from app.db import connect, init_db
+
+    init_db()
+    run_id = main.save_search_result(
+        SearchResult(
+            platform="Boss 直聘",
+            keyword="AI 应用开发实习",
+            city="杭州",
+            search_url="https://example.com/search",
+            browser_channel="msedge",
+            candidates=[
+                SearchCandidate(
+                    title="AI 应用开发实习生",
+                    company="候选测试科技",
+                    city="杭州",
+                    source_url="https://example.com/job_detail/visual-fallback",
+                    summary="Python RAG FastAPI 实习岗位。",
+                )
+            ],
+        )
+    )
+    with connect() as conn:
+        candidate_id = conn.execute("SELECT id FROM job_candidates WHERE search_run_id = ?", (run_id,)).fetchone()["id"]
+
+    fallback_calls = []
+    monkeypatch.setattr(main, "fetch_job_from_controlled_edge", lambda _url: (_ for _ in ()).throw(ValueError("页面文本太短，可能需要浏览器渲染。")))
+    monkeypatch.setattr(
+        main,
+        "run_visual_job_detail_fallback",
+        lambda url, candidate: fallback_calls.append((url, candidate["title"])) or {
+            "status": "已完成",
+            "fetched": main.FetchResult(
+                url=url,
+                final_url=url,
+                title="AI 应用开发实习生",
+                text="参与 AI 应用开发和 RAG 流程实现，协助处理文档数据并开发 FastAPI 接口。要求 Python 基础、了解大模型 API 和 SQLite，每周到岗五天并持续实习三个月。",
+                fetch_mode="controlled_edge_visual",
+                note="DOM 岗位详情文本不足，已用临时页面视觉复核补充；截图未保存。",
+            ),
+            "review": {"confidence": 0.84},
+        },
+    )
+    monkeypatch.setattr(main, "try_llm_jd_extract", lambda _text: ({}, ""))
+    monkeypatch.setattr(main, "search_company", lambda *_args, **_kwargs: [])
+
+    result = main.import_discovery_candidate(candidate_id, resume_id=1)
+    with connect() as conn:
+        candidate = conn.execute("SELECT status, job_id FROM job_candidates WHERE id = ?", (candidate_id,)).fetchone()
+        job = conn.execute("SELECT jd_text, analysis_source FROM job_postings WHERE id = ?", (candidate["job_id"],)).fetchone()
+
+    assert result["status"] == "已导入"
+    assert result["visual_detail_fallback"] is True
+    assert fallback_calls == [("https://example.com/job_detail/visual-fallback", "AI 应用开发实习生")]
+    assert candidate["status"] == "已导入"
+    assert "参与 AI 应用开发" in job["jd_text"]
+
+    assert main.visual_detail_fallback_allowed(ValueError("需要登录")) is False
+    assert main.visual_detail_fallback_allowed(ValueError("页面文本太短")) is True
+
+
 def test_controlled_discovery_uses_visual_fallback_before_detail_reads(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "visual-discovery.sqlite3"))
     from app.db import connect, init_db

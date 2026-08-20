@@ -45,8 +45,14 @@ def capture_controlled_edge_visual_page(
         raise ValueError("受控 Edge 中没有匹配当前搜索任务的可视觉复核页面。消息页请继续使用未读扫描或当前对话采集。")
     if len(targets) != 1:
         raise ValueError("受控 Edge 中检测到多个招聘岗位或搜索页面。请暂时只保留需要复核的一个页面后重试。")
+    return capture_visual_page_target(targets[0], mode)
 
-    target = targets[0]
+
+def capture_visual_page_target(target: dict, mode: str = "viewport") -> dict[str, object]:
+    """Capture a known temporary controlled Edge target without persisting pixels."""
+    if mode not in {"viewport", "full_page"}:
+        raise ValueError("截图模式无效。")
+
     params: dict[str, object] = {"format": "jpeg", "quality": 78, "fromSurface": True}
     capture_metadata: dict[str, object] = {"mode": mode, "scaled": False}
     if mode == "full_page":

@@ -67,22 +67,28 @@ from .services.github_projects import (
     repo_key,
 )
 from .services.interview_export import render_interview_review_pdf
-from .services.job_fetcher import ensure_public_http_url, fetch_job_from_url, normalize_visible_text
+from .services.job_fetcher import FetchResult, ensure_public_http_url, fetch_job_from_url, normalize_visible_text, validate_fetched_text
 from .services.job_searcher import (
     SearchResult,
     capture_current_search_page,
+    close_controlled_edge_target,
+    controlled_job_snapshot_expression,
     controlled_edge_status,
+    create_controlled_edge_target,
+    evaluate_cdp_expression,
     extract_candidates_from_anchors,
     fetch_job_from_controlled_edge,
+    is_recruitment_interstitial_url,
     open_manual_search_in_edge,
     search_jobs_in_controlled_edge,
     search_jobs_with_browser,
+    wait_for_cdp_document_ready,
 )
 from .services.llm import OpenAICompatibleClient, client_for_task
 from .services.research import search_company
 from .services.resume import read_resume_text
 from .services.transcription import ALLOWED_RECORDING_EXTENSIONS, TRANSCRIPTION_MODELS, transcribe_recording
-from .services.visual_page import capture_controlled_edge_visual_page
+from .services.visual_page import capture_controlled_edge_visual_page, capture_visual_page_target
 
 
 @asynccontextmanager
@@ -1726,7 +1732,7 @@ def import_discovery_candidate(
         return {"candidate_id": candidate_id, "status": "已存在", "job_id": int(candidate["job_id"]), "note": "候选岗位已有关联分析。"}
 
     try:
-        fetched = fetch_job_from_controlled_edge(str(candidate.get("source_url") or ""))
+        fetched, detail_metadata = fetch_discovery_candidate_detail(candidate)
     except Exception as exc:
         note = str(exc)[:500]
         with connect() as conn:
@@ -1786,6 +1792,7 @@ def import_discovery_candidate(
             "status": "已导入",
             "job_id": job_id,
             "fetch_mode": fetched.fetch_mode,
+            **detail_metadata,
             "note": "岗位详情已读取并完成评分。",
         }
     except Exception as exc:
@@ -1887,6 +1894,7 @@ def run_controlled_job_discovery(filters: dict[str, Any] | None = None) -> dict[
     imported_count = sum(1 for item in import_results if item["status"] == "已导入")
     pending_count = sum(1 for item in import_results if item["status"] == "详情待补充")
     failed_count = sum(1 for item in import_results if item["status"] == "导入失败")
+    visual_detail_fallback_count = sum(1 for item in import_results if item.get("visual_detail_fallback"))
     if search_errors and len(search_errors) == len(plan):
         status = "失败"
     elif search_errors or failed_count:
@@ -1913,6 +1921,8 @@ def run_controlled_job_discovery(filters: dict[str, Any] | None = None) -> dict[
         note += f" 视觉复核 {visual_review_count} 个字段异常搜索页，补全 {visual_reconciled_count} 条候选字段。"
     if visual_review_failure_count:
         note += f" {visual_review_failure_count} 个视觉复核失败，已保留 DOM 结果供人工复核。"
+    if visual_detail_fallback_count:
+        note += f" {visual_detail_fallback_count} 个详情页通过视觉复核补充 JD。"
 
     with connect() as conn:
         log_agent_action(
@@ -1938,6 +1948,7 @@ def run_controlled_job_discovery(filters: dict[str, Any] | None = None) -> dict[
                 "visual_review_count": visual_review_count,
                 "visual_reconciled_count": visual_reconciled_count,
                 "visual_review_failure_count": visual_review_failure_count,
+                "visual_detail_fallback_count": visual_detail_fallback_count,
                 "auto_apply": False,
                 "auto_message": False,
                 "message_text_saved": False,
@@ -1959,6 +1970,7 @@ def run_controlled_job_discovery(filters: dict[str, Any] | None = None) -> dict[
         "visual_review_count": visual_review_count,
         "visual_reconciled_count": visual_reconciled_count,
         "visual_review_failure_count": visual_review_failure_count,
+        "visual_detail_fallback_count": visual_detail_fallback_count,
         "import_results": import_results,
     }
 
@@ -4972,6 +4984,154 @@ def run_visual_page_review(
         "model_name": str(getattr(client, "model", "") or ""),
         "image_sent_to_model": True,
     }
+
+
+def visual_detail_fallback_allowed(error: Exception) -> bool:
+    message = str(error or "")
+    return any(
+        signal in message
+        for signal in (
+            "页面文本太短",
+            "没有返回可读取的页面内容",
+            "页面脚本执行失败",
+            "岗位详情页没有返回可读取",
+        )
+    ) and not any(signal in message for signal in ("登录", "验证码", "安全验证", "passport", "security"))
+
+
+def normalize_visual_job_detail_review(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("视觉模型没有返回 JSON 对象。")
+    jd_text = normalize_visible_text(redact_control_text(str(value.get("jd_text") or value.get("description") or "")))
+    if len(jd_text) < 80:
+        raise ValueError("视觉模型未识别到足够长度的岗位 JD。")
+    try:
+        confidence = float(value.get("confidence") or 0)
+    except (TypeError, ValueError):
+        confidence = 0
+    uncertainties = value.get("uncertainties") if isinstance(value.get("uncertainties"), list) else []
+    return {
+        "company": compact_visual_review_text(value.get("company"), 140),
+        "title": compact_visual_review_text(value.get("title"), 180),
+        "city": compact_visual_review_text(value.get("city"), 80),
+        "salary_text": compact_visual_review_text(value.get("salary_text"), 100),
+        "experience_text": compact_visual_review_text(value.get("experience_text"), 80),
+        "internship_days": compact_visual_review_text(value.get("internship_days"), 80),
+        "internship_duration": compact_visual_review_text(value.get("internship_duration"), 80),
+        "jd_text": validate_fetched_text(jd_text),
+        "confidence": max(0.0, min(confidence, 1.0)),
+        "uncertainties": [compact_visual_review_text(item, 180) for item in uncertainties[:6] if compact_visual_review_text(item, 180)],
+    }
+
+
+def run_visual_job_detail_fallback(url: str, candidate: dict[str, Any]) -> dict[str, Any]:
+    """Recover a short/empty DOM JD through one temporary detail-page screenshot."""
+    client = client_for_task("control_intent")
+    if not client or not client.configured:
+        return {
+            "status": "未配置",
+            "note": "控制层聊天模型未配置，无法执行详情页视觉复核。",
+            "model_called": False,
+            "image_sent_to_model": False,
+        }
+    target: dict[str, Any] | None = None
+    image_sent = False
+    try:
+        safe_url = ensure_public_http_url(url)
+        target = create_controlled_edge_target(safe_url)
+        wait_for_cdp_document_ready(target)
+        snapshot = evaluate_cdp_expression(target, controlled_job_snapshot_expression())
+        if not isinstance(snapshot, dict):
+            raise ValueError("受控 Edge 岗位详情页没有返回可读取的页面内容。")
+        final_url = ensure_public_http_url(str(snapshot.get("url") or safe_url))
+        if is_recruitment_interstitial_url(final_url):
+            raise ValueError("岗位详情页已跳转到登录或安全验证页，请在受控 Edge 完成验证后重试。")
+        capture = capture_visual_page_target(target, "viewport")
+    except Exception as exc:
+        if hasattr(client, "log_error"):
+            client.log_error(str(exc))
+        return {
+            "status": "失败",
+            "note": f"详情页视觉复核未完成：{str(exc)[:300]}",
+            "error": str(exc)[:300],
+            "model_called": False,
+            "image_sent_to_model": False,
+        }
+    finally:
+        if target:
+            close_controlled_edge_target(target)
+
+    metadata = capture.get("metadata") if isinstance(capture.get("metadata"), dict) else {}
+    try:
+        history = [item for item in control_history_for_model() if item.get("assistant")][-6:]
+        history_text = "\n".join(f"用户：{item['user']}\nAgent：{item['assistant']}" for item in history) or "（无）"
+        prompt = (
+            "请只分析这张招聘岗位详情页截图，并只输出 JSON 对象。"
+            "禁止转录或输出手机号、邮箱、联系人、聊天正文、验证码或任何联系方式。"
+            "若字段无法确认必须留空并写入 uncertainties，不要猜测。"
+            "JSON 字段：company、title、city、salary_text、experience_text、internship_days、internship_duration、"
+            "jd_text(仅页面上明确可见的岗位职责和要求，最多5000字)、confidence(0到1)、uncertainties(字符串数组)。"
+            "这只是详情页视觉复核，不判断是否投递，不产生外部动作。"
+        )
+        user_prompt = (
+            f"招聘平台：{metadata.get('platform') or '未知'}。"
+            f"候选链接对应的已知信息（可能不完整）：公司={compact_visual_review_text(candidate.get('company'), 100)}；"
+            f"岗位={compact_visual_review_text(candidate.get('title'), 140)}；城市={compact_visual_review_text(candidate.get('city'), 60)}。"
+            f"最近对话：\n{history_text}\n\n"
+            "请按约定 JSON 返回。"
+        )
+        image_sent = True
+        raw = client.complete_json_with_image(prompt, user_prompt, str(capture["image_data_url"]))
+        review = normalize_visual_job_detail_review(raw)
+    except Exception as exc:
+        if hasattr(client, "log_error"):
+            client.log_error(str(exc))
+        return {
+            "status": "失败",
+            "note": f"详情页视觉复核未完成：{str(exc)[:300]}",
+            "error": str(exc)[:300],
+            "capture": metadata,
+            "model_called": image_sent,
+            "image_sent_to_model": image_sent,
+        }
+
+    fetched = FetchResult(
+        url=safe_url,
+        final_url=final_url,
+        title=review["title"] or str(candidate.get("title") or ""),
+        text=review["jd_text"],
+        fetch_mode="controlled_edge_visual",
+        note="DOM 岗位详情文本不足，已用临时页面视觉复核补充；截图未保存。",
+    )
+    return {
+        "status": "已完成",
+        "note": "详情页视觉复核已完成；截图未保存，已返回可校验 JD 文本。",
+        "fetched": fetched,
+        "review": review,
+        "capture": metadata,
+        "model_called": True,
+        "model_profile": str(getattr(client, "profile", {}).get("name") or ""),
+        "model_name": str(getattr(client, "model", "") or ""),
+        "image_sent_to_model": True,
+    }
+
+
+def fetch_discovery_candidate_detail(candidate: dict[str, Any]) -> tuple[FetchResult, dict[str, Any]]:
+    source_url = str(candidate.get("source_url") or "")
+    try:
+        return fetch_job_from_controlled_edge(source_url), {"visual_detail_fallback": False}
+    except Exception as dom_error:
+        if not visual_detail_fallback_allowed(dom_error):
+            raise
+        visual_result = run_visual_job_detail_fallback(source_url, candidate)
+        fetched = visual_result.get("fetched")
+        if visual_result.get("status") == "已完成" and isinstance(fetched, FetchResult):
+            return fetched, {
+                "visual_detail_fallback": True,
+                "visual_confidence": (visual_result.get("review") or {}).get("confidence") if isinstance(visual_result.get("review"), dict) else None,
+                "image_persisted": False,
+            }
+        raise ValueError(f"DOM 详情读取失败：{str(dom_error)[:180]}；{str(visual_result.get('note') or '视觉复核未完成')[:240]}")
 
 
 def visual_page_review_response(result: dict[str, Any]) -> str:
