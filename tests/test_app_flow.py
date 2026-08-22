@@ -3626,6 +3626,75 @@ def test_search_run_and_candidate_import_flow(tmp_path, monkeypatch):
     assert status == "已导入"
 
 
+def test_manual_candidate_import_uses_controlled_edge_detail_fallback(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "manual-controlled-edge-import.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db
+
+    init_db()
+    run_id = main.save_search_result(
+        SearchResult(
+            platform="Boss 直聘",
+            keyword="AI 应用开发实习",
+            city="杭州",
+            search_url="https://www.zhipin.com/web/geek/jobs?query=AI",
+            browser_channel="msedge",
+            candidates=[
+                SearchCandidate(
+                    title="AI 应用开发实习生",
+                    company="受控导入测试科技",
+                    city="杭州",
+                    source_url="https://www.zhipin.com/job_detail/controlled-import.html",
+                    summary="Python RAG FastAPI 实习岗位。",
+                )
+            ],
+        )
+    )
+    with connect() as conn:
+        candidate_id = conn.execute("SELECT id FROM job_candidates WHERE search_run_id = ?", (run_id,)).fetchone()["id"]
+
+    generic_fetch_calls = []
+    monkeypatch.setattr(main, "search_company", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(main, "try_llm_jd_extract", lambda _text: ({}, ""))
+    monkeypatch.setattr(main, "fetch_job_from_url", lambda *_args, **_kwargs: generic_fetch_calls.append(True))
+    monkeypatch.setattr(
+        main,
+        "fetch_discovery_candidate_detail",
+        lambda candidate: (
+            FetchResult(
+                url=candidate["source_url"],
+                final_url=candidate["source_url"],
+                title="AI 应用开发实习生",
+                text="参与 AI 应用和 RAG 流程开发，协助实现 FastAPI 接口、文档处理和本地评测脚本。要求 Python 基础，了解大模型 API 调用与 SQLite 数据处理，每周到岗五天并持续实习三个月。",
+                fetch_mode="controlled_edge_visual",
+                note="DOM 岗位详情文本不足，已用临时页面视觉复核补充；截图未保存。",
+            ),
+            {"visual_detail_fallback": True, "image_persisted": False},
+        ),
+    )
+    client = TestClient(main.app)
+
+    response = client.post(
+        f"/candidates/{candidate_id}/import",
+        data={"selected_resume_id": "1", "fetch_mode": "controlled_edge", "browser_channel": "msedge"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert generic_fetch_calls == []
+    from urllib.parse import unquote_plus
+
+    assert "视觉复核补充 JD" in unquote_plus(response.headers["location"])
+    with connect() as conn:
+        candidate = conn.execute("SELECT status, job_id FROM job_candidates WHERE id = ?", (candidate_id,)).fetchone()
+        job = conn.execute("SELECT jd_text FROM job_postings WHERE id = ?", (candidate["job_id"],)).fetchone()
+        event = conn.execute("SELECT content FROM application_events WHERE job_id = ? ORDER BY id DESC LIMIT 1", (candidate["job_id"],)).fetchone()
+    assert candidate["status"] == "已导入"
+    assert "参与 AI 应用和 RAG" in job["jd_text"]
+    assert "截图未保存" in event["content"]
+
+
 def test_manual_edge_search_capture_flow(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "manual-search.sqlite3"))
 

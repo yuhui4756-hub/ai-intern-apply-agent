@@ -1156,6 +1156,7 @@ def fetch_mode_label(value: str) -> str:
         "http": "普通网页",
         "browser": "浏览器渲染",
         "controlled_edge": "受控 Edge",
+        "controlled_edge_visual": "受控 Edge 视觉复核",
     }.get(value or "", value or "自动")
 
 
@@ -7762,7 +7763,11 @@ async def import_candidate(candidate_id: int, request: Request) -> RedirectRespo
     run_id = int(candidate["search_run_id"])
     channel = fetch_browser_channel(browser_channel or candidate.get("run_browser_channel") or "msedge")
     try:
-        fetched = await run_in_threadpool(fetch_job_from_url, candidate["source_url"], fetch_mode=fetch_mode, browser_channel=channel)
+        if fetch_mode == "controlled_edge":
+            fetched, detail_metadata = await run_in_threadpool(fetch_discovery_candidate_detail, candidate)
+        else:
+            fetched = await run_in_threadpool(fetch_job_from_url, candidate["source_url"], fetch_mode=fetch_mode, browser_channel=channel)
+            detail_metadata = {"visual_detail_fallback": False}
         with connect() as conn:
             existing_job = find_existing_job_by_source_url(conn, fetched.final_url)
             if existing_job:
@@ -7781,7 +7786,7 @@ async def import_candidate(candidate_id: int, request: Request) -> RedirectRespo
                     generate_messages=candidate.get("run_browser_channel") != "extension",
                 )
                 event_type = "搜索候选刷新"
-                event_content = f"从搜索候选 {candidate.get('source_url')} 刷新已有岗位详情。"
+                event_content = f"从搜索候选 {candidate.get('source_url')} 刷新已有岗位详情。{fetched.note}"
             else:
                 job_id, _analysis = create_job_record(
                     conn,
@@ -7796,7 +7801,7 @@ async def import_candidate(candidate_id: int, request: Request) -> RedirectRespo
                     generate_messages=candidate.get("run_browser_channel") != "extension",
                 )
                 event_type = "搜索候选导入"
-                event_content = f"从搜索候选 {candidate.get('source_url')} 导入岗位详情。"
+                event_content = f"从搜索候选 {candidate.get('source_url')} 导入岗位详情。{fetched.note}"
             now = utc_now()
             conn.execute(
                 "UPDATE job_candidates SET job_id = ?, status = ?, error_message = '', updated_at = ? WHERE id = ?",
@@ -7806,7 +7811,10 @@ async def import_candidate(candidate_id: int, request: Request) -> RedirectRespo
                 "INSERT INTO application_events (job_id, event_type, content, created_at) VALUES (?, ?, ?, ?)",
                 (job_id, event_type, event_content, now),
             )
-        return redirect_with_notice(f"/jobs/{job_id}", f"已从候选岗位导入并通过{fetch_mode_label(fetched.fetch_mode)}完成分析。", "success")
+        notice = f"已从候选岗位导入并通过{fetch_mode_label(fetched.fetch_mode)}完成分析。"
+        if detail_metadata.get("visual_detail_fallback"):
+            notice += " DOM 文本不足，已使用视觉复核补充 JD。"
+        return redirect_with_notice(f"/jobs/{job_id}", notice, "success")
     except Exception as exc:
         fallback_text = candidate_snapshot_jd(candidate)
         if len(fallback_text) >= 40:
