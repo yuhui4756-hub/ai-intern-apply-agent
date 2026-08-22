@@ -125,7 +125,7 @@ def test_visual_review_reuses_task_chat_model_and_history(monkeypatch):
 
     result = main.run_visual_page_review("viewport", "识图分析当前页面")
 
-    assert routed_tasks == ["control_intent"]
+    assert routed_tasks == ["agent_chat"]
     assert result["status"] == "已完成"
     assert result["model_profile"] == "聊天视觉模型"
     assert result["review"]["company"] == "测试科技"
@@ -216,6 +216,68 @@ def test_visual_review_is_requested_for_complete_results_without_internship_sign
     assert main.search_result_needs_visual_review(complete_internship_result) is False
 
 
+def test_visual_salary_review_targets_masked_salary_without_rejecting_the_candidate():
+    result = SearchResult(
+        platform="Boss 直聘",
+        keyword="AI 应用开发实习",
+        city="杭州",
+        search_url="https://www.zhipin.com/web/geek/jobs?query=AI",
+        browser_channel="msedge",
+        candidates=[
+            SearchCandidate(
+                title="AI 应用开发实习生",
+                company="薪资视觉测试科技",
+                city="杭州",
+                source_url="https://www.zhipin.com/job_detail/salary-visual.html",
+                summary="AI 应用开发实习生\n\ue033\ue031\ue031-\ue033\ue036\ue031元/天\n5天/周\n3个月",
+            ),
+            SearchCandidate(
+                title="AI Agent 实习生",
+                company="正常薪资科技",
+                city="杭州",
+                source_url="https://www.zhipin.com/job_detail/salary-normal.html",
+                summary="AI Agent 实习生\n200-300元/天\n5天/周",
+            ),
+        ],
+    )
+
+    targets = main.search_result_salary_visual_targets(result)
+
+    assert main.search_result_needs_visual_review(result) is True
+    assert targets == [{"company": "薪资视觉测试科技", "title": "AI 应用开发实习生", "city": "杭州"}]
+
+
+def test_visual_reconciliation_merges_only_valid_missing_salary():
+    result = SearchResult(
+        platform="Boss 直聘",
+        keyword="AI 应用开发实习",
+        city="杭州",
+        search_url="https://www.zhipin.com/web/geek/jobs?query=AI",
+        browser_channel="msedge",
+        candidates=[
+            SearchCandidate(
+                title="AI 应用开发实习生",
+                company="薪资视觉测试科技",
+                city="杭州",
+                source_url="https://www.zhipin.com/job_detail/salary-visual.html",
+                summary="AI 应用开发实习生\n\ue033\ue031\ue031-\ue033\ue036\ue031元/天\n5天/周",
+            )
+        ],
+    )
+    review = {
+        "candidate_jobs": [
+            {"company": "薪资视觉测试科技", "title": "AI 应用开发实习生", "salary_text": "180-260 元/天"},
+            {"company": "薪资视觉测试科技", "title": "AI 应用开发实习生", "salary_text": "待遇优厚"},
+        ]
+    }
+
+    reconciled = main.reconcile_search_result_with_visual_review(result, review)
+
+    assert reconciled == 1
+    assert "视觉薪资：180-260 元/天" in result.candidates[0].summary
+    assert "待遇优厚" not in result.candidates[0].summary
+
+
 def test_visual_job_detail_fallback_closes_temporary_target_and_returns_valid_jd(monkeypatch):
     target = {
         "id": "temporary-detail",
@@ -248,7 +310,7 @@ def test_visual_job_detail_fallback_closes_temporary_target_and_returns_valid_jd
         def log_error(self, _message):
             raise AssertionError("详情视觉复核不应记录错误")
 
-    monkeypatch.setattr(main, "client_for_task", lambda task_type: FakeClient() if task_type == "control_intent" else None)
+    monkeypatch.setattr(main, "client_for_task", lambda task_type: FakeClient() if task_type == "agent_chat" else None)
     monkeypatch.setattr(main, "create_controlled_edge_target", lambda _url: target)
     monkeypatch.setattr(main, "wait_for_cdp_document_ready", lambda _target: None)
     monkeypatch.setattr(

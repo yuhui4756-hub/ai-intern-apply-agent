@@ -54,7 +54,7 @@ class OpenAICompatibleClient:
             payload["response_format"] = response_format
 
         input_text = "\n".join(message_content_for_estimate(message.get("content")) for message in messages)
-        with httpx.Client(timeout=45) as client:
+        with httpx.Client(timeout=90) as client:
             response = client.post(
                 url,
                 headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},

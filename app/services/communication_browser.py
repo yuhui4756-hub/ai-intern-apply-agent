@@ -760,6 +760,91 @@ def send_message_in_controlled_edge(
     except Exception as exc:
         message_text = str(exc).strip() or exc.__class__.__name__
         raise ValueError(f"无法发送当前 Edge 聊天草稿：{message_text[:180]}。") from exc
+
+
+def click_first_contact_in_controlled_edge(
+    source_url: str,
+    platform: str,
+    *,
+    browser_channel: str = "msedge",
+) -> dict[str, object]:
+    """Click one verified job-page contact control, never an apply or resume action."""
+    if normalize_browser_channel(browser_channel) != "msedge":
+        raise ValueError("当前主动沟通先支持 Microsoft Edge。")
+    if not is_pc_message_automation_platform(platform):
+        raise ValueError(f"{platform or '该平台'} 未启用 PC 主动沟通。")
+    if not wait_for_debug_endpoint(timeout_seconds=3):
+        raise ValueError("没有检测到应用打开的 Edge 调试窗口。")
+    source = urlparse(str(source_url or ""))
+    if not source.hostname or not source.path:
+        raise ValueError("岗位来源链接无效，无法定位主动沟通入口。")
+    targets = [
+        target
+        for target in read_controlled_edge_targets()
+        if first_contact_target_matches(target_url(target), source_url)
+    ]
+    if len(targets) != 1:
+        raise ValueError("未找到唯一的岗位来源页，已停止点击沟通入口。")
+    target = targets[0]
+    try:
+        result = evaluate_cdp_expression(target, first_contact_button_expression())
+        if not isinstance(result, dict) or not result.get("ok"):
+            reason = str(result.get("reason") or "未找到唯一可用沟通按钮。") if isinstance(result, dict) else "页面没有返回沟通按钮信息。"
+            raise ValueError(reason)
+        x, y = float(result["x"]), float(result["y"])
+        for event_type in ("mousePressed", "mouseReleased"):
+            send_cdp_command(
+                target,
+                "Input.dispatchMouseEvent",
+                {"type": event_type, "x": x, "y": y, "button": "left", "clickCount": 1},
+            )
+        return {
+            "status": "已打开沟通入口",
+            "note": "已点击唯一的岗位沟通入口，未选择简历、未上传、未投递。",
+            "platform": platform,
+            "contact_selector": str(result.get("selector") or ""),
+            "browser_clicked": True,
+            "resume_uploaded": False,
+            "application_submitted": False,
+        }
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"无法点击岗位沟通入口：{str(exc)[:180]}。") from exc
+
+
+def first_contact_target_matches(candidate_url: str, source_url: str) -> bool:
+    candidate = urlparse(candidate_url or "")
+    source = urlparse(source_url or "")
+    return bool(
+        candidate.hostname
+        and source.hostname
+        and candidate.hostname.lower() == source.hostname.lower()
+        and (candidate.path or "").rstrip("/") == (source.path or "").rstrip("/")
+    )
+
+
+def first_contact_button_expression() -> str:
+    return """(() => {
+        const labels = ['立即沟通', '聊一聊', '立即聊天', '沟通'];
+        const blocked = ['投递', '简历', '申请', '报名', '收藏', '举报', '分享'];
+        const visible = element => {
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+        };
+        const label = element => (element.getAttribute('aria-label') || element.getAttribute('title') || element.innerText || element.textContent || '').trim().replace(/\\s+/g, '');
+        const matches = new Map();
+        for (const element of document.querySelectorAll('button, [role="button"], a')) {
+            const value = label(element);
+            if (!visible(element) || element.disabled || blocked.some(item => value.includes(item))) continue;
+            if (labels.includes(value)) matches.set(element, value);
+        }
+        if (matches.size !== 1) return {ok: false, reason: matches.size ? '找到多个岗位沟通入口，已停止。' : '未找到唯一岗位沟通入口。'};
+        const [[element, selector]] = matches.entries();
+        const rect = element.getBoundingClientRect();
+        return {ok: true, selector, x: rect.left + rect.width / 2, y: rect.top + rect.height / 2};
+    })()"""
 def find_fill_blocking_signals(snapshot: dict[str, object]) -> list[str]:
     text = str(snapshot.get("normalized_text") or "")
     return [signal for signal in HARD_PAGE_BLOCKING_TEXT if normalize_probe_text(signal) in text]

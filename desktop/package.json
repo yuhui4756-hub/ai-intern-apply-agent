@@ -1,0 +1,36 @@
+{
+  "name": "job-agent-desktop",
+  "productName": "求职agent",
+  "version": "0.1.0",
+  "description": "本地聊天优先的 AI 实习求职 Agent",
+  "author": "yuhui4756-hub",
+  "main": "main.cjs",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win nsis"
+  },
+  "devDependencies": {
+    "electron": "33.4.11",
+    "electron-builder": "^26.15.3"
+  },
+  "build": {
+    "appId": "com.yuhui.jobagent",
+    "productName": "求职agent",
+    "asar": true,
+    "electronDist": "node_modules/electron/dist",
+    "npmRebuild": false,
+    "files": ["main.cjs", "package.json"],
+    "extraResources": [
+      { "from": "../dist/job-agent-backend", "to": "backend" }
+    ],
+    "win": { "target": ["nsis"] },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "求职agent"
+    }
+  }
+}

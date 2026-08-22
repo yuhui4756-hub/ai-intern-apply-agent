@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import os
 import re
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -44,6 +45,7 @@ from .services.application_browser import (
 from .services.communication_browser import (
     build_browser_send_adapter_plan,
     calibrate_controlled_edge_chat_pages,
+    click_first_contact_in_controlled_edge,
     fill_message_in_controlled_edge,
     is_pc_message_automation_platform,
     probe_browser_send_adapter_plan,
@@ -94,6 +96,7 @@ from .services.research import search_company
 from .services.resume import read_resume_text
 from .services.transcription import ALLOWED_RECORDING_EXTENSIONS, TRANSCRIPTION_MODELS, transcribe_recording
 from .services.visual_page import capture_controlled_edge_visual_page, capture_visual_page_target
+from .services import desktop_agent
 
 
 @asynccontextmanager
@@ -134,6 +137,7 @@ MESSAGE_PATROL_OBSERVATION_LIMIT = 20
 COMMUNICATION_EXECUTOR_PLAN_LIMIT = 20
 AUTONOMOUS_DAILY_SEND_LIMIT = 5
 AUTONOMOUS_PLATFORM_DAILY_SEND_LIMIT = 3
+AUTONOMOUS_FIRST_CONTACT_MIN_SCORE = 70
 AUTONOMOUS_MESSAGE_BLOCKING_TEXT = ("简历", "附件", "电话", "微信", "邮箱", "身份证", "银行卡", "押金", "培训费", "贷款", "报价")
 JOB_DISCOVERY_PLATFORMS = ("Boss 直聘", "猎聘", "实习僧")
 JOB_DISCOVERY_SEARCH_PAGE_LIMIT = 3
@@ -1868,6 +1872,7 @@ def run_controlled_job_discovery(filters: dict[str, Any] | None = None) -> dict[
     visual_review_count = 0
     visual_reconciled_count = 0
     visual_review_failure_count = 0
+    visual_review_errors: list[str] = []
     seen_urls: set[str] = set()
     for item in plan:
         try:
@@ -1879,11 +1884,13 @@ def run_controlled_job_discovery(filters: dict[str, Any] | None = None) -> dict[
             )
             controlled_edge_retry_count += int(getattr(result, "retry_count", 0) or 0)
             if search_result_needs_visual_review(result):
+                salary_targets = search_result_salary_visual_targets(result)
                 visual_result = run_visual_page_review(
-                    "viewport",
+                    "full_page" if salary_targets else "viewport",
                     f"受控岗位发现：{item['keyword']}，{item['city']}。请补充当前搜索页中 DOM 未可靠提取的候选字段。",
                     expected_url=result.search_url,
                     platform=item["platform"],
+                    salary_targets=salary_targets,
                 )
                 if visual_result.get("status") == "已完成":
                     visual_review_count += 1
@@ -1896,6 +1903,7 @@ def run_controlled_job_discovery(filters: dict[str, Any] | None = None) -> dict[
                         result.note = (result.note + " 视觉复核识别到候选信息，但没有稳定岗位链接，未自动导入。").strip()
                 elif visual_result.get("status") not in {"未配置"}:
                     visual_review_failure_count += 1
+                    visual_review_errors.append(compact_visual_review_text(visual_result.get("note"), 260))
             run_id = save_search_result(result)
         except Exception as exc:
             note = str(exc)[:500]
@@ -1994,6 +2002,7 @@ def run_controlled_job_discovery(filters: dict[str, Any] | None = None) -> dict[
                 "visual_review_count": visual_review_count,
                 "visual_reconciled_count": visual_reconciled_count,
                 "visual_review_failure_count": visual_review_failure_count,
+                "visual_review_errors": visual_review_errors,
                 "visual_detail_fallback_count": visual_detail_fallback_count,
                 "auto_apply": False,
                 "auto_message": False,
@@ -2250,12 +2259,15 @@ def discovery_task_search_result(
         visual_review_count = 0
         visual_reconciled_count = 0
         visual_review_failed = False
+        visual_review_error = ""
         if search_result_needs_visual_review(result):
+            salary_targets = search_result_salary_visual_targets(result)
             visual_result = run_visual_page_review(
-                "viewport",
+                "full_page" if salary_targets else "viewport",
                 f"受控岗位发现：{step['keyword']}，{step['city']}。请补充当前搜索页中 DOM 未可靠提取的候选字段。",
                 expected_url=result.search_url,
                 platform=str(step["platform"]),
+                salary_targets=salary_targets,
             )
             if visual_result.get("status") == "已完成":
                 visual_review_count = 1
@@ -2267,6 +2279,7 @@ def discovery_task_search_result(
                     result.note = (result.note + " 视觉复核识别到候选信息，但没有稳定岗位链接，未自动导入。").strip()
             elif visual_result.get("status") not in {"未配置"}:
                 visual_review_failed = True
+                visual_review_error = compact_visual_review_text(visual_result.get("note"), 320)
         search_run_id = save_search_result(result, discovery_task_id=task_id)
         finish_discovery_task_step(
             int(step["id"]),
@@ -2278,6 +2291,7 @@ def discovery_task_search_result(
                 "visual_review_count": visual_review_count,
                 "visual_reconciled_count": visual_reconciled_count,
                 "visual_review_failed": visual_review_failed,
+                "visual_review_error": visual_review_error,
             },
         )
     except Exception as exc:
@@ -3274,6 +3288,7 @@ def build_communication_execution_plan(
             j.status AS job_status,
             j.recommendation AS job_recommendation,
             j.match_level AS job_match_level,
+            j.match_score AS job_match_score,
             j.risk_level AS job_risk_level,
             j.analysis_source AS job_analysis_source,
             c.message_type AS capture_message_type,
@@ -3695,6 +3710,7 @@ def load_communication_draft_with_context(conn: Any, draft_id: int) -> Any:
             j.status AS job_status,
             j.recommendation AS job_recommendation,
             j.match_level AS job_match_level,
+            j.match_score AS job_match_score,
             j.risk_level AS job_risk_level,
             j.analysis_source AS job_analysis_source,
             c.message_type AS capture_message_type,
@@ -3708,14 +3724,20 @@ def load_communication_draft_with_context(conn: Any, draft_id: int) -> Any:
     ).fetchone()
 
 
-def evaluate_autonomous_send_gate(conn: Any, draft: Any, message: str) -> dict[str, Any]:
+def evaluate_autonomous_send_gate(
+    conn: Any,
+    draft: Any,
+    message: str,
+    *,
+    agent_authorized: bool = False,
+) -> dict[str, Any]:
     policy = communication_policy()
     gate = dict(evaluate_draft_send_gate(conn, draft, message))
     reasons = list(gate["reasons"])
     job_id = int(draft["job_id"]) if draft["job_id"] else None
     platform = str(draft["platform"] or "")
 
-    if policy["mode"] != "autonomous":
+    if policy["mode"] != "autonomous" and not agent_authorized:
         reasons.append("沟通模式不是自主询问模式")
     if automation_control()["paused"]:
         reasons.append("自动化已暂停")
@@ -3723,12 +3745,17 @@ def evaluate_autonomous_send_gate(conn: Any, draft: Any, message: str) -> dict[s
         reasons.append("草稿不是在自主询问模式下生成")
     if str(draft["draft_type"] or "") != "自主询问候选":
         reasons.append("草稿不是自主询问候选")
-    if str(draft["job_recommendation"] or "") not in APPLICATION_ELIGIBLE_RECOMMENDATIONS:
+    allowed_recommendations = set(APPLICATION_ELIGIBLE_RECOMMENDATIONS)
+    if agent_authorized:
+        allowed_recommendations.add("可冲")
+    if str(draft["job_recommendation"] or "") not in allowed_recommendations:
         reasons.append("岗位当前不属于必投或可投递")
     if str(draft["job_risk_level"] or "") not in APPLICATION_LOW_RISK_LEVELS:
         reasons.append("岗位风险不是低或低风险")
     if str(draft["job_analysis_source"] or "") == "local_demo":
         reasons.append("本地演练数据禁止自动发送")
+    if agent_authorized and int(draft["job_match_score"] or 0) < AUTONOMOUS_FIRST_CONTACT_MIN_SCORE:
+        reasons.append(f"岗位匹配分低于主动沟通阈值 {AUTONOMOUS_FIRST_CONTACT_MIN_SCORE}")
     if int(draft["followup_index"] or 0) <= 0 or int(draft["followup_index"] or 0) > policy["max_auto_followups"]:
         reasons.append("自主询问轮次不在允许范围内")
 
@@ -3774,6 +3801,7 @@ def evaluate_autonomous_send_gate(conn: Any, draft: Any, message: str) -> dict[s
         "sent_today": sent_today,
         "sent_on_platform": sent_on_platform,
         "job_id": job_id,
+        "agent_authorized": agent_authorized,
     }
 
 
@@ -3814,13 +3842,18 @@ def browser_plan_for_communication_draft(draft: Any, message: str, gate: dict[st
     )["browser_plans"][0]
 
 
-def run_autonomous_draft_send(draft_id: int, trigger_type: str) -> dict[str, Any]:
+def run_autonomous_draft_send(
+    draft_id: int,
+    trigger_type: str,
+    *,
+    agent_authorized: bool = False,
+) -> dict[str, Any]:
     with connect() as conn:
         draft = load_communication_draft_with_context(conn, draft_id)
         if not draft:
             return {"status": "已阻止", "note": "没有找到这条自主沟通草稿。", "draft_id": draft_id, "browser_clicked": False}
         message = str(draft["message"] or "").strip()
-        gate = evaluate_autonomous_send_gate(conn, draft, message)
+        gate = evaluate_autonomous_send_gate(conn, draft, message, agent_authorized=agent_authorized)
         browser_plan = browser_plan_for_communication_draft(draft, message, gate, trigger_type=trigger_type)
         if not gate["allowed"]:
             result = {
@@ -3843,6 +3876,7 @@ def run_autonomous_draft_send(draft_id: int, trigger_type: str) -> dict[str, Any
                 draft_id=draft_id,
                 decision={
                     "trigger_type": trigger_type,
+                    "agent_authorized": agent_authorized,
                     "gate": gate,
                     "message_filled": False,
                     "browser_clicked": False,
@@ -3895,6 +3929,7 @@ def run_autonomous_draft_send(draft_id: int, trigger_type: str) -> dict[str, Any
             draft_id=draft_id,
             decision={
                 "trigger_type": trigger_type,
+                "agent_authorized": agent_authorized,
                 "gate": gate,
                 "message_filled": bool(result.get("message_filled")),
                 "browser_clicked": bool(result.get("browser_clicked")),
@@ -5677,7 +5712,7 @@ def normalize_visual_page_review(value: object) -> dict[str, Any]:
     candidate_jobs = []
     raw_candidates = value.get("candidate_jobs")
     if isinstance(raw_candidates, list):
-        for raw in raw_candidates[:6]:
+        for raw in raw_candidates[:18]:
             if not isinstance(raw, dict):
                 continue
             candidate = {
@@ -5712,9 +5747,11 @@ def run_visual_page_review(
     *,
     expected_url: str = "",
     platform: str = "",
+    salary_targets: list[dict[str, str]] | None = None,
+    client_override: OpenAICompatibleClient | None = None,
 ) -> dict[str, Any]:
-    # Reuse the task-chat model so screenshot interpretation keeps the same local conversation context.
-    client = client_for_task("control_intent")
+    # Keep page understanding on the main task-chat model; fall back only for older configurations.
+    client = client_override or client_for_task("agent_chat") or client_for_task("control_intent")
     if not client or not client.configured:
         return {
             "status": "未配置",
@@ -5729,12 +5766,21 @@ def run_visual_page_review(
         history_text = "\n".join(
             f"用户：{item['user']}\nAgent：{item['assistant']}" for item in history
         ) or "（无）"
+        normalized_salary_targets = [
+            {
+                "company": compact_visual_review_text(item.get("company"), 100),
+                "title": compact_visual_review_text(item.get("title"), 140),
+                "city": compact_visual_review_text(item.get("city"), 60),
+            }
+            for item in (salary_targets or [])[:18]
+            if isinstance(item, dict) and (item.get("company") or item.get("title"))
+        ]
         prompt = (
             "请只分析这张招聘岗位或搜索结果页面截图，并只输出 JSON 对象。"
             "禁止转录或输出手机号、邮箱、联系人、聊天正文、验证码或任何联系方式。"
             "若无法确认字段必须留空并写入 uncertainties，不要猜测。"
             "JSON 字段：page_type(job_detail/search_results/unknown)、company、title、city、salary_text、"
-            "summary(不超过300字)、candidate_jobs(最多6条，每条仅 company/title/city/salary_text/experience_text)、"
+            "summary(不超过300字)、candidate_jobs(最多18条，每条仅 company/title/city/salary_text/experience_text)、"
             "confidence(0到1)、uncertainties(字符串数组)。"
             "这只是视觉复核，不判断是否投递，不产生外部动作。"
         )
@@ -5744,6 +5790,12 @@ def run_visual_page_review(
             f"最近对话：\n{history_text}\n\n当前用户任务：{redact_control_text(user_message)}\n"
             "请按约定 JSON 返回，并优先保留页面上明确可见的岗位信息。"
         )
+        if normalized_salary_targets:
+            user_prompt += (
+                "\n本轮只需补充下列 DOM 薪资未解析候选的薪资；每条必须以岗位名称或公司对应，"
+                "看不清则 salary_text 留空，绝不推测：\n"
+                + dumps(normalized_salary_targets)
+            )
         raw = client.complete_json_with_image(prompt, user_prompt, str(capture["image_data_url"]))
         review = normalize_visual_page_review(raw)
     except Exception as exc:
@@ -5808,7 +5860,7 @@ def normalize_visual_job_detail_review(value: object) -> dict[str, Any]:
 
 def run_visual_job_detail_fallback(url: str, candidate: dict[str, Any]) -> dict[str, Any]:
     """Recover a short/empty DOM JD through one temporary detail-page screenshot."""
-    client = client_for_task("control_intent")
+    client = client_for_task("agent_chat") or client_for_task("control_intent")
     if not client or not client.configured:
         return {
             "status": "未配置",
@@ -5974,8 +6026,10 @@ def reconcile_search_result_with_visual_review(result: SearchResult, review: dic
         if not candidate.city and visual_candidate.get("city"):
             candidate.city = compact_visual_review_text(visual_candidate.get("city"), 80)
             changed = True
+        visual_salary = compact_visual_review_text(visual_candidate.get("salary_text"), 100)
+        salary_is_valid = looks_like_salary_text(visual_salary)
         details = [
-            f"视觉薪资：{compact_visual_review_text(visual_candidate.get('salary_text'), 100)}" if visual_candidate.get("salary_text") else "",
+            f"视觉薪资：{visual_salary}" if salary_is_valid and not extract_salary(candidate.summary or "") else "",
             f"视觉经验：{compact_visual_review_text(visual_candidate.get('experience_text'), 80)}" if visual_candidate.get("experience_text") else "",
         ]
         details = [item for item in details if item]
@@ -5984,6 +6038,26 @@ def reconcile_search_result_with_visual_review(result: SearchResult, review: dic
             changed = True
         reconciled += int(changed)
     return reconciled
+
+
+def candidate_salary_needs_visual_review(candidate: Any) -> bool:
+    """Return true only for a visible salary field that DOM failed to decode."""
+    title = str(getattr(candidate, "title", "") or "")
+    summary = str(getattr(candidate, "summary", "") or "")
+    if not title or title == "候选岗位" or extract_salary(summary):
+        return False
+    masked_font = any("\ue000" <= char <= "\uf8ff" for char in summary)
+    masked_label = "薪资数字未能从页面文本读取" in summary
+    salary_context = bool(re.search(r"(?:薪资|薪酬|日薪|补贴|元\s*/?\s*[天日]|/\s*[天日])", summary))
+    return (masked_font and salary_context) or masked_label
+
+
+def search_result_salary_visual_targets(result: SearchResult) -> list[dict[str, str]]:
+    return [
+        {"company": candidate.company, "title": candidate.title, "city": candidate.city}
+        for candidate in result.candidates
+        if candidate_salary_needs_visual_review(candidate)
+    ][:18]
 
 
 def search_result_needs_visual_review(result: SearchResult) -> bool:
@@ -5997,6 +6071,8 @@ def search_result_needs_visual_review(result: SearchResult) -> bool:
         for candidate in result.candidates
     )
     if incomplete * 2 >= len(result.candidates):
+        return True
+    if search_result_salary_visual_targets(result):
         return True
     candidate_text = "\n".join(
         f"{candidate.title or ''}\n{candidate.summary or ''}" for candidate in result.candidates
@@ -7263,6 +7339,147 @@ async def control_message_api(request: Request) -> JSONResponse:
     except ValueError as exc:
         return api_error(str(exc))
     return JSONResponse({"ok": True, "conversation": conversation})
+
+
+@app.get("/agent")
+def desktop_agent_page(request: Request) -> Any:
+    sessions = desktop_agent.list_sessions()
+    if sessions:
+        session_id = int(request.query_params.get("session") or sessions[0]["id"])
+        payload = desktop_agent.conversation_payload(session_id)
+    else:
+        created = desktop_agent.create_session()
+        payload = desktop_agent.conversation_payload(int(created["id"]))
+        sessions = desktop_agent.list_sessions()
+    return templates.TemplateResponse(
+        request,
+        "agent_workspace.html",
+        {
+            "bootstrap": {
+                "sessions": sessions,
+                "conversation": payload,
+                "profiles": desktop_agent.configured_model_profiles(),
+                "canvas": desktop_agent.canvas_items(),
+            },
+        },
+    )
+
+
+@app.get("/api/agent/bootstrap")
+def desktop_agent_bootstrap() -> JSONResponse:
+    sessions = desktop_agent.list_sessions()
+    if sessions:
+        payload = desktop_agent.conversation_payload(int(sessions[0]["id"]))
+    else:
+        created = desktop_agent.create_session()
+        payload = desktop_agent.conversation_payload(int(created["id"]))
+        sessions = desktop_agent.list_sessions()
+    return JSONResponse(
+        {
+            "ok": True,
+            "sessions": sessions,
+            "conversation": payload,
+            "profiles": desktop_agent.configured_model_profiles(),
+            "canvas": desktop_agent.canvas_items(),
+        }
+    )
+
+
+@app.post("/api/agent/sessions")
+async def desktop_agent_create_session(request: Request) -> JSONResponse:
+    try:
+        payload = await request.json()
+    except ValueError:
+        return api_error("请求体必须是 JSON 对象。")
+    if not isinstance(payload, dict):
+        return api_error("请求体必须是 JSON 对象。")
+    profile_id = payload.get("model_profile_id")
+    if profile_id is not None and (isinstance(profile_id, bool) or not str(profile_id).isdigit()):
+        return api_error("模型档案编号无效。")
+    session = desktop_agent.create_session(
+        str(payload.get("title") or ""),
+        int(profile_id) if profile_id is not None else None,
+    )
+    return JSONResponse({"ok": True, "conversation": desktop_agent.conversation_payload(int(session["id"])), "sessions": desktop_agent.list_sessions()})
+
+
+@app.get("/api/agent/sessions/{session_id}")
+def desktop_agent_get_session(session_id: int) -> JSONResponse:
+    try:
+        conversation = desktop_agent.conversation_payload(session_id)
+    except ValueError as exc:
+        return api_error(str(exc), 404)
+    return JSONResponse({"ok": True, "conversation": conversation})
+
+
+@app.post("/api/agent/sessions/{session_id}/messages")
+async def desktop_agent_message(session_id: int, request: Request) -> JSONResponse:
+    try:
+        payload = await request.json()
+    except ValueError:
+        return api_error("请求体必须是 JSON 对象。")
+    if not isinstance(payload, dict):
+        return api_error("请求体必须是 JSON 对象。")
+    profile_id = payload.get("model_profile_id")
+    if profile_id is not None and (isinstance(profile_id, bool) or not str(profile_id).isdigit()):
+        return api_error("模型档案编号无效。")
+    auto = payload.get("auto_communication")
+    if auto is not None and not isinstance(auto, bool):
+        return api_error("自动沟通开关必须是布尔值。")
+    try:
+        conversation = await desktop_agent.process_turn(
+            session_id,
+            str(payload.get("message") or ""),
+            model_profile_id=int(profile_id) if profile_id is not None else None,
+            auto_communication=auto,
+        )
+    except ValueError as exc:
+        return api_error(str(exc), 404 if "会话" in str(exc) else 400)
+    return JSONResponse({"ok": True, "conversation": conversation, "sessions": desktop_agent.list_sessions(), "canvas": desktop_agent.canvas_items()})
+
+
+@app.post("/api/agent/sessions/{session_id}/summary")
+async def desktop_agent_summary(session_id: int, request: Request) -> JSONResponse:
+    try:
+        payload = await request.json()
+    except ValueError:
+        return api_error("请求体必须是 JSON 对象。")
+    if not isinstance(payload, dict):
+        return api_error("请求体必须是 JSON 对象。")
+    session = desktop_agent.update_session_summary(session_id, str(payload.get("summary") or ""))
+    if not session:
+        return api_error("没有找到 Agent 任务会话。", 404)
+    return JSONResponse({"ok": True, "session": session})
+
+
+@app.post("/api/agent/sessions/{session_id}/active-job")
+async def desktop_agent_select_job(session_id: int, request: Request) -> JSONResponse:
+    try:
+        payload = await request.json()
+    except ValueError:
+        return api_error("请求体必须是 JSON 对象。")
+    if not isinstance(payload, dict) or isinstance(payload.get("job_id"), bool) or not str(payload.get("job_id") or "").isdigit():
+        return api_error("岗位编号无效。")
+    job_id = int(payload["job_id"])
+    if job_id == 0:
+        with connect() as conn:
+            changed = conn.execute(
+                "UPDATE agent_sessions SET active_job_id = NULL, updated_at = ? WHERE id = ?",
+                (utc_now(), session_id),
+            )
+        if not changed.rowcount:
+            return api_error("没有找到 Agent 任务会话。", 404)
+        return JSONResponse({"ok": True, "conversation": desktop_agent.conversation_payload(session_id)})
+    if desktop_agent.local_job_detail(job_id).get("status") != "已完成":
+        return api_error("没有找到岗位。", 404)
+    with connect() as conn:
+        changed = conn.execute(
+            "UPDATE agent_sessions SET active_job_id = ?, updated_at = ? WHERE id = ?",
+            (job_id, utc_now(), session_id),
+        )
+    if not changed.rowcount:
+        return api_error("没有找到 Agent 任务会话。", 404)
+    return JSONResponse({"ok": True, "conversation": desktop_agent.conversation_payload(session_id)})
 
 
 @app.post("/control/memories/active/clear")
@@ -9616,6 +9833,149 @@ def ensure_communication_preparation_for_job(conn: Any, job_id: int, *, trigger_
         "message_length": len(message),
         "question_count": len(questions),
     }
+
+
+def ensure_desktop_autonomous_first_contact_draft(conn: Any, job_id: int, *, session_id: int) -> dict[str, Any]:
+    row = conn.execute("SELECT * FROM job_postings WHERE id = ?", (job_id,)).fetchone()
+    if not row:
+        return {"created": False, "draft_id": None, "reason": "岗位不存在。"}
+    job = parse_json_fields({key: row[key] for key in row.keys()})
+    platform = str(job.get("platform") or "")
+    reasons: list[str] = []
+    if not is_pc_message_automation_platform(platform):
+        reasons.append(f"{platform or '该平台'} 未启用 PC 主动沟通")
+    if int(job.get("match_score") or 0) < AUTONOMOUS_FIRST_CONTACT_MIN_SCORE:
+        reasons.append(f"岗位匹配分低于主动沟通阈值 {AUTONOMOUS_FIRST_CONTACT_MIN_SCORE}")
+    if str(job.get("risk_level") or "") not in APPLICATION_LOW_RISK_LEVELS:
+        reasons.append("岗位风险不是低或低风险")
+    if str(job.get("recommendation") or "") == "跳过" or str(job.get("match_level") or "") == "低匹配":
+        reasons.append("岗位当前建议不支持主动沟通")
+    if str(job.get("status") or "") in {"已归档", "已拒绝", "已通过", "面试邀请", "待面试", "面试准备中"}:
+        reasons.append(f"岗位当前状态为“{job.get('status') or '未设置'}”")
+    if str(job.get("analysis_source") or "") == "local_demo":
+        reasons.append("本地演练数据禁止主动沟通")
+    if not str(job.get("source_url") or "").strip():
+        reasons.append("岗位缺少可验证来源链接")
+    policy = communication_policy()
+    if policy["max_auto_followups"] <= 0:
+        reasons.append("自主沟通轮次上限为 0")
+    if reasons:
+        return {"created": False, "draft_id": None, "reason": "；".join(reasons)}
+
+    existing = conn.execute(
+        """
+        SELECT id, status FROM message_drafts
+        WHERE job_id = ? AND draft_type = '自主询问候选' AND status = '待确认'
+        ORDER BY id DESC LIMIT 1
+        """,
+        (job_id,),
+    ).fetchone()
+    if existing:
+        return {"created": False, "draft_id": int(existing["id"]), "status": str(existing["status"]), "reason": "已有待处理的主动沟通草稿。"}
+
+    message, questions = communication_preparation_message(job)
+    now = utc_now()
+    cursor = conn.execute(
+        """
+        INSERT INTO message_drafts (
+            job_id, platform, draft_type, status, communication_mode,
+            followup_index, followup_limit, reason, message, risk_flags_json,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            job_id,
+            platform,
+            "自主询问候选",
+            "待确认",
+            "autonomous",
+            1,
+            policy["max_auto_followups"],
+            "桌面 Agent 自动沟通开关已授权的主动首聊；必须通过页面身份、唯一控件、限额和敏感信号闸门。",
+            message,
+            dumps(["主动首聊；未采集真实 HR 对话。页面无法唯一定位时不发送。"]),
+            now,
+            now,
+        ),
+    )
+    draft_id = int(cursor.lastrowid)
+    label = " - ".join(item for item in [job.get("company"), job.get("title")] if item) or f"岗位 {job_id}"
+    log_agent_action(
+        conn,
+        action_type="desktop_autonomous_first_contact",
+        status="已创建草稿",
+        summary=f"已创建受限主动首聊草稿：{label}",
+        platform=platform,
+        job_id=job_id,
+        draft_id=draft_id,
+        decision={
+            "session_id": session_id,
+            "followup_index": 1,
+            "followup_limit": policy["max_auto_followups"],
+            "question_count": len(questions),
+            "message_sent": False,
+            "resume_uploaded": False,
+            "application_submitted": False,
+        },
+    )
+    return {"created": True, "draft_id": draft_id, "message_length": len(message), "question_count": len(questions), "platform": platform}
+
+
+def run_desktop_autonomous_first_contact(job_id: int, *, session_id: int) -> dict[str, Any]:
+    with connect() as conn:
+        draft_result = ensure_desktop_autonomous_first_contact_draft(conn, job_id, session_id=session_id)
+        if not draft_result.get("draft_id"):
+            return {"status": "已阻止", "note": str(draft_result.get("reason") or "无法创建主动沟通草稿。"), **draft_result}
+        job = conn.execute("SELECT platform, source_url FROM job_postings WHERE id = ?", (job_id,)).fetchone()
+    if not job:
+        return {"status": "已阻止", "note": "岗位已不存在。", **draft_result}
+    try:
+        open_message_patrol_browser(str(job["source_url"] or ""))
+        time.sleep(0.8)
+        contact = click_first_contact_in_controlled_edge(str(job["source_url"] or ""), str(job["platform"] or ""))
+        time.sleep(0.8)
+    except Exception as exc:
+        note = f"主动沟通已保留为草稿，但未点击发送：{str(exc)[:300]}"
+        with connect() as conn:
+            log_agent_action(
+                conn,
+                action_type="desktop_autonomous_first_contact",
+                status="等待人工处理",
+                summary=note,
+                platform=str(job["platform"] or ""),
+                job_id=job_id,
+                draft_id=int(draft_result["draft_id"]),
+                decision={"session_id": session_id, "contact_clicked": False, "message_sent": False, "application_submitted": False},
+                error_message=str(exc),
+            )
+        return {"status": "等待人工处理", "note": note, **draft_result, "contact_clicked": False, "message_sent": False}
+
+    send_result = run_autonomous_draft_send(
+        int(draft_result["draft_id"]),
+        "desktop_agent_first_contact",
+        agent_authorized=True,
+    )
+    final_status = str(send_result.get("status") or "未发送")
+    with connect() as conn:
+        log_agent_action(
+            conn,
+            action_type="desktop_autonomous_first_contact",
+            status=final_status,
+            summary=str(send_result.get("note") or "桌面 Agent 主动沟通已完成。"),
+            platform=str(job["platform"] or ""),
+            job_id=job_id,
+            draft_id=int(draft_result["draft_id"]),
+            decision={
+                "session_id": session_id,
+                "contact_clicked": bool(contact.get("browser_clicked")),
+                "contact_selector": str(contact.get("contact_selector") or ""),
+                "message_sent": final_status in {"已发送", "已发送待核对"},
+                "resume_uploaded": False,
+                "application_submitted": False,
+            },
+            error_message=str(send_result.get("note") or "") if final_status not in {"已发送", "已发送待核对"} else "",
+        )
+    return {"status": final_status, "note": str(send_result.get("note") or ""), **draft_result, "contact_clicked": True, "message_sent": final_status in {"已发送", "已发送待核对"}}
 
 
 def application_browser_item(conn: Any, preparation_id: int) -> dict[str, Any] | None:

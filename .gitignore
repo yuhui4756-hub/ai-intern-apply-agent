@@ -22,6 +22,9 @@ exports/
 logs/
 .playwright-cli/
 output/playwright/
+dist/
+desktop/node_modules/
+desktop/release/
 
 # Resume and interview private artifacts
 private/

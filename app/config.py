@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from pathlib import Path
 
 
-ROOT_DIR = Path(__file__).resolve().parents[1]
-ENV_PATH = ROOT_DIR / ".env"
+RESOURCE_ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[1]))
+ROOT_DIR = RESOURCE_ROOT
+APP_HOME_DIR = Path(os.environ["APP_HOME_DIR"]).expanduser().resolve() if os.environ.get("APP_HOME_DIR") else None
+ENV_PATH = (APP_HOME_DIR / ".env") if APP_HOME_DIR else ROOT_DIR / ".env"
 
 
 def load_local_env(path: Path = ENV_PATH) -> None:
@@ -46,6 +49,7 @@ def set_env_value(key: str, value: str, path: Path = ENV_PATH) -> None:
     if not key:
         raise ValueError("Environment key cannot be empty.")
 
+    path.parent.mkdir(parents=True, exist_ok=True)
     lines: list[str] = []
     found = False
     if path.exists():
@@ -108,14 +112,14 @@ def suggest_api_key_env(name: str = "", base_url: str = "") -> str:
 
 
 def data_dir() -> Path:
-    path = ROOT_DIR / "data"
+    path = (APP_HOME_DIR / "data") if APP_HOME_DIR else ROOT_DIR / "data"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
 def recordings_dir() -> Path:
     configured = os.environ.get("APP_RECORDINGS_DIR")
-    path = Path(configured).expanduser() if configured else ROOT_DIR / "private" / "recordings"
+    path = Path(configured).expanduser() if configured else ((APP_HOME_DIR / "private" / "recordings") if APP_HOME_DIR else ROOT_DIR / "private" / "recordings")
     path.mkdir(parents=True, exist_ok=True)
     return path.resolve()
 
@@ -128,6 +132,7 @@ def database_path() -> Path:
 
 
 TASK_TYPES = [
+    ("agent_chat", "桌面 Agent 规划与总结"),
     ("control_intent", "控制层意图理解"),
     ("jd_extract", "JD 初步抽取"),
     ("job_match", "岗位匹配解释"),

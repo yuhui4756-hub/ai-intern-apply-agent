@@ -480,6 +480,49 @@ def init_db() -> None:
                 completed_at TEXT NOT NULL DEFAULT '',
                 FOREIGN KEY(conversation_id) REFERENCES control_conversations(id) ON DELETE SET NULL
             );
+
+            CREATE TABLE IF NOT EXISTS agent_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL DEFAULT '',
+                model_profile_id INTEGER,
+                auto_communication INTEGER NOT NULL DEFAULT 0,
+                active_job_id INTEGER,
+                summary TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(model_profile_id) REFERENCES model_profiles(id) ON DELETE SET NULL,
+                FOREIGN KEY(active_job_id) REFERENCES job_postings(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS agent_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL,
+                role TEXT NOT NULL DEFAULT '',
+                content TEXT NOT NULL DEFAULT '',
+                events_json TEXT NOT NULL DEFAULT '[]',
+                model_profile_id INTEGER,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES agent_sessions(id) ON DELETE CASCADE,
+                FOREIGN KEY(model_profile_id) REFERENCES model_profiles(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS agent_tool_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL,
+                message_id INTEGER,
+                tool_name TEXT NOT NULL DEFAULT '',
+                permission_level TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT '',
+                arguments_json TEXT NOT NULL DEFAULT '{}',
+                result_json TEXT NOT NULL DEFAULT '{}',
+                error_message TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES agent_sessions(id) ON DELETE CASCADE,
+                FOREIGN KEY(message_id) REFERENCES agent_messages(id) ON DELETE SET NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_agent_messages_session ON agent_messages(session_id, id);
+            CREATE INDEX IF NOT EXISTS idx_agent_tool_runs_session ON agent_tool_runs(session_id, id);
             """
         )
         ensure_columns(conn)

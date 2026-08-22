@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:,">
+  <title>求职agent</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='styles.css') }}">
+</head>
+<body class="agent-app-body">
+  <div class="agent-shell" data-agent-workspace data-bootstrap='{{ bootstrap | tojson }}'>
+    <aside class="agent-sidebar">
+      <div class="agent-wordmark">求职agent</div>
+      <button class="agent-nav-button primary" type="button" data-new-session>新任务</button>
+      <button class="agent-nav-button" type="button" data-view-switch="chat">任务对话</button>
+      <button class="agent-nav-button" type="button" data-view-switch="canvas">岗位画布</button>
+      <div class="agent-sidebar-label">最近任务</div>
+      <div class="agent-session-list" data-session-list></div>
+      <div class="agent-sidebar-footer">
+        <button class="agent-nav-button compact" type="button" data-open-manual>备用工具</button>
+        <a class="agent-nav-button compact" href="/settings" target="_blank">设置</a>
+      </div>
+    </aside>
+
+    <main class="agent-main">
+      <header class="agent-header">
+        <div>
+          <h1 data-session-title>新任务</h1>
+          <p data-session-summary>用自然语言安排搜索、分析和准备工作。</p>
+        </div>
+        <div class="agent-header-actions">
+          <span class="agent-edge-status" data-edge-status>受控 Edge 未检查</span>
+          <button class="agent-icon-button" type="button" data-toggle-context title="显示或隐藏上下文面板">面板</button>
+        </div>
+      </header>
+
+      <section class="agent-chat-view" data-chat-view>
+        <div class="agent-transcript" data-transcript aria-live="polite"></div>
+      </section>
+
+      <section class="agent-canvas-view" data-canvas-view hidden>
+        <div class="agent-canvas-toolbar">
+          <div class="agent-canvas-filters" data-canvas-filters>
+            <button type="button" class="active" data-canvas-filter="all">全部</button>
+            <button type="button" data-canvas-filter="待确认">待确认</button>
+            <button type="button" data-canvas-filter="待投递">待投递</button>
+            <button type="button" data-canvas-filter="已沟通">已沟通</button>
+            <button type="button" data-canvas-filter="面试邀请">面试邀请</button>
+          </div>
+          <span data-canvas-count></span>
+        </div>
+        <div class="agent-canvas" data-canvas></div>
+      </section>
+
+      <form class="agent-composer" data-composer>
+        <div class="agent-manual-menu" data-manual-menu hidden>
+          <a href="/jobs/new" target="_blank">粘贴 JD 分析</a>
+          <a href="/searches" target="_blank">高级岗位搜索</a>
+          <a href="/resumes" target="_blank">候选人画像与简历</a>
+          <a href="/applications" target="_blank">投递准备</a>
+          <a href="/communications" target="_blank">沟通草稿</a>
+          <a href="/interviews" target="_blank">面试准备</a>
+        </div>
+        <textarea data-composer-input rows="3" placeholder="例如：根据我的简历搜索杭州的 AI 应用开发实习，优先每周 5 天的岗位"></textarea>
+        <div class="agent-composer-controls">
+          <button class="agent-add-button" type="button" data-toggle-manual title="打开备用手动工具">+</button>
+          <label class="agent-model-select">模型
+            <select data-model-select></select>
+          </label>
+          <label class="agent-toggle">
+            <input type="checkbox" data-auto-communication>
+            <span>自动沟通</span>
+          </label>
+          <span class="agent-policy-note" data-policy-note>关闭时仅生成草稿</span>
+          <button class="agent-send-button" type="submit" data-send>发送</button>
+        </div>
+      </form>
+    </main>
+
+    <aside class="agent-context" data-context-panel>
+      <section class="agent-context-section">
+        <div class="agent-context-heading"><h2>当前任务</h2><span data-model-label>未选择模型</span></div>
+        <dl data-task-context></dl>
+      </section>
+      <section class="agent-context-section">
+        <div class="agent-context-heading"><h2>当前岗位</h2><button type="button" data-clear-job>清除</button></div>
+        <div data-active-job class="agent-empty">尚未选择岗位。</div>
+      </section>
+      <section class="agent-context-section">
+        <div class="agent-context-heading"><h2>最近观察</h2></div>
+        <div data-observations class="agent-empty">等待 Agent 调用工具。</div>
+      </section>
+    </aside>
+  </div>
+  <script src="{{ url_for('static', path='agent_workspace.js') }}"></script>
+</body>
+</html>

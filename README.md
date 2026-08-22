@@ -4,6 +4,8 @@
 
 当前阶段：V0.8 受控岗位发现与自主沟通。
 
+桌面版：`desktop/` 提供 Electron Windows 壳，启动后默认进入聊天优先的“求职agent”工作台；岗位画布与原有手动工具仍可使用。开发版运行 `cd desktop; npm install; npm start`。打包前先执行 `./desktop/build_backend.ps1`，再在 `desktop/` 执行 `npm run dist`。安装包、桌面程序和本地用户资料严格分离，真实 `.env`、SQLite、简历和浏览器 profile 均不会进入 Git 或安装包。
+
 核心目标：
 
 - 分析岗位 JD，并在确认有投递意向后手动查询公司公开风险信息。
