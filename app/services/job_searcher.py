@@ -24,6 +24,7 @@ from .job_fetcher import (
 
 
 JOB_KEYWORDS = ["AI", "Agent", "大模型", "RAG", "Python", "开发", "后端", "实习", "算法", "LLM"]
+NON_JOB_ANCHOR_TEXTS = {"查看更多信息", "举报", "职位搜索", "展开", "收起", "分享", "收藏", "返回"}
 SKIP_URL_PARTS = ["login", "passport", "signup", "register", "javascript:", "mailto:", "tel:"]
 DEGREE_WORDS = ["本科", "大专", "硕士", "博士", "学历不限", "不限学历"]
 TIME_WORDS = ["天/周", "周", "个月", "月", "长期", "实习"]
@@ -781,6 +782,9 @@ def looks_like_search_page_url(href: str) -> bool:
 
 
 def has_job_signal(text: str, href: str, platform: str = "") -> bool:
+    normalized = re.sub(r"\s+", "", normalize_text(text))
+    if normalized in NON_JOB_ANCHOR_TEXTS:
+        return False
     if any(keyword.lower() in text.lower() for keyword in JOB_KEYWORDS):
         return True
     return looks_like_job_link(href, platform) and bool(normalize_text(text))

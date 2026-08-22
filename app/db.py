@@ -158,6 +158,7 @@ def init_db() -> None:
 
             CREATE TABLE IF NOT EXISTS job_search_runs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                discovery_task_id INTEGER,
                 platform TEXT NOT NULL DEFAULT '',
                 keyword TEXT NOT NULL DEFAULT '',
                 city TEXT NOT NULL DEFAULT '',
@@ -165,8 +166,58 @@ def init_db() -> None:
                 browser_channel TEXT NOT NULL DEFAULT 'msedge',
                 status TEXT NOT NULL DEFAULT '',
                 note TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(discovery_task_id) REFERENCES job_discovery_tasks(id) ON DELETE SET NULL
             );
+
+            CREATE TABLE IF NOT EXISTS job_discovery_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                replay_of_task_id INTEGER,
+                status TEXT NOT NULL DEFAULT '待执行',
+                current_phase TEXT NOT NULL DEFAULT '待开始',
+                filters_json TEXT NOT NULL DEFAULT '{}',
+                plan_json TEXT NOT NULL DEFAULT '[]',
+                resume_id INTEGER,
+                summary TEXT NOT NULL DEFAULT '',
+                error_message TEXT NOT NULL DEFAULT '',
+                candidate_count INTEGER NOT NULL DEFAULT 0,
+                screened_out_count INTEGER NOT NULL DEFAULT 0,
+                imported_count INTEGER NOT NULL DEFAULT 0,
+                pending_detail_count INTEGER NOT NULL DEFAULT 0,
+                failed_step_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                started_at TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL,
+                finished_at TEXT NOT NULL DEFAULT '',
+                FOREIGN KEY(replay_of_task_id) REFERENCES job_discovery_tasks(id) ON DELETE SET NULL,
+                FOREIGN KEY(resume_id) REFERENCES resume_versions(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS job_discovery_task_steps (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                discovery_task_id INTEGER NOT NULL,
+                phase TEXT NOT NULL DEFAULT '搜索',
+                sequence_no INTEGER NOT NULL DEFAULT 0,
+                platform TEXT NOT NULL DEFAULT '',
+                keyword TEXT NOT NULL DEFAULT '',
+                city TEXT NOT NULL DEFAULT '',
+                candidate_id INTEGER,
+                search_run_id INTEGER,
+                source_url TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT '待执行',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                result_json TEXT NOT NULL DEFAULT '{}',
+                error_message TEXT NOT NULL DEFAULT '',
+                started_at TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL,
+                finished_at TEXT NOT NULL DEFAULT '',
+                FOREIGN KEY(discovery_task_id) REFERENCES job_discovery_tasks(id) ON DELETE CASCADE,
+                FOREIGN KEY(candidate_id) REFERENCES job_candidates(id) ON DELETE SET NULL,
+                FOREIGN KEY(search_run_id) REFERENCES job_search_runs(id) ON DELETE SET NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_job_discovery_task_steps_task
+                ON job_discovery_task_steps(discovery_task_id, phase, sequence_no, id);
 
             CREATE TABLE IF NOT EXISTS job_candidates (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -439,6 +490,10 @@ def ensure_columns(conn: sqlite3.Connection) -> None:
     job_columns = table_column_names(conn, "job_postings")
     if "analysis_source" not in job_columns:
         conn.execute("ALTER TABLE job_postings ADD COLUMN analysis_source TEXT NOT NULL DEFAULT 'local_rules'")
+
+    search_run_columns = table_column_names(conn, "job_search_runs")
+    if "discovery_task_id" not in search_run_columns:
+        conn.execute("ALTER TABLE job_search_runs ADD COLUMN discovery_task_id INTEGER")
 
     application_columns = table_column_names(conn, "application_preparations")
     if "application_message" not in application_columns:

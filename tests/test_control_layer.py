@@ -29,24 +29,25 @@ def test_control_layer_runs_non_destructive_search_from_chat(tmp_path, monkeypat
     from app.db import connect, init_db, loads
 
     init_db()
-    called = []
     monkeypatch.setattr(main, "client_for_task", lambda _task_type: None)
-    monkeypatch.setattr(main, "run_controlled_job_discovery", lambda filters: called.append(filters) or {"status": "完成", "note": "测试"})
+    created = []
+    monkeypatch.setattr(main, "create_controlled_job_discovery_task", lambda filters: created.append(filters) or 31)
+    monkeypatch.setattr(main, "schedule_discovery_task", lambda task_id: task_id == 31)
     client = TestClient(main.app)
 
     response = client.post("/control", data={"message": "找杭州 Agent 实习，日薪至少 200"}, follow_redirects=False)
     assert response.status_code == 303
     page = client.get("/control")
     assert "Agent 对话" in page.text
-    assert "已执行岗位发现" in page.text
+    assert "已启动岗位发现任务 #31" in page.text
     with connect() as conn:
         plan = conn.execute("SELECT * FROM control_plans").fetchone()
         conversation = conn.execute("SELECT * FROM control_conversations").fetchone()
         decision = loads(conn.execute("SELECT decision_json FROM agent_action_logs WHERE action_type = 'control_request'").fetchone()["decision_json"], {})
-    assert plan["status"] == "已完成"
+    assert plan["status"] == "已启动"
     assert loads(plan["payload_json"], {}) == {"role": "Agent 开发实习", "city": "杭州", "min_salary_per_day": 200}
     assert conversation["intent_type"] == "search_draft"
-    assert called == [{"role": "Agent 开发实习", "city": "杭州", "min_salary_per_day": 200}]
+    assert created == [{"role": "Agent 开发实习", "city": "杭州", "min_salary_per_day": 200}]
     assert decision["execution_mode"] == "chat_direct_non_submitting"
     assert decision["auto_apply"] is False
     assert decision["auto_message"] is False
@@ -83,14 +84,15 @@ def test_control_message_api_exposes_non_submitting_search_events(tmp_path, monk
 
     init_db()
     monkeypatch.setattr(main, "client_for_task", lambda _task_type: None)
-    monkeypatch.setattr(main, "run_controlled_job_discovery", lambda filters: {"status": "完成", "note": "测试发现完成"})
+    monkeypatch.setattr(main, "create_controlled_job_discovery_task", lambda filters: 32)
+    monkeypatch.setattr(main, "schedule_discovery_task", lambda task_id: task_id == 32)
     response = TestClient(main.app).post("/api/control/messages", json={"message": "找杭州 Agent 实习"})
 
     assert response.status_code == 200
     conversation = response.json()["conversation"]
     events = conversation["evidence"]["events"]
     assert any(event["kind"] == "工具调用" and event["status"] == "执行中" for event in events)
-    assert any(event["kind"] == "工具结果" and event["status"] == "已完成" for event in events)
+    assert any(event["kind"] == "工具结果" and event["status"] == "已启动" for event in events)
     assert any(event["kind"] == "安全结论" and "未发送消息" in event["summary"] for event in events)
 
 

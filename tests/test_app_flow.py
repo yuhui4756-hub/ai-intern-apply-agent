@@ -3858,13 +3858,13 @@ def test_controlled_job_discovery_is_bounded_and_never_creates_outbound_actions(
     client = TestClient(main.app)
     monkeypatch.setattr(
         main,
-        "run_controlled_job_discovery",
-        lambda *_args: {"status": "完成", "note": "模拟岗位发现完成。"},
+        "schedule_discovery_task",
+        lambda _task_id: True,
     )
     response = client.post("/job-discovery/start", data={"return_to": "/searches"}, follow_redirects=False)
 
     assert response.status_code == 303
-    assert response.headers["location"].startswith("/searches?notice=")
+    assert response.headers["location"].startswith("/job-discovery/tasks/")
 
 
 def test_controlled_job_discovery_marks_detail_fetch_failure_for_manual_followup(tmp_path, monkeypatch):
@@ -4124,6 +4124,11 @@ def test_discovery_candidate_screening_accepts_ascii_signals_and_blocks_non_engi
     )
     assert accepted is False
     assert "无法识别的字体字符" in reason
+    accepted, reason = main.discovery_candidate_screening(
+        {"title": "AI 应用开发实习生", "summary": "\ue033\ue031\ue031-\ue033\ue036\ue031元/天\n5天/周\n3个月\n本科\n测试科技"}
+    )
+    assert accepted is True
+    assert reason == ""
 
 
 def test_controlled_discovery_prioritizes_clear_ai_candidates_and_keeps_corrupted_text_for_review(tmp_path, monkeypatch):

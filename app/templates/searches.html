@@ -4,7 +4,7 @@
 <section class="page-head">
   <div>
     <h1>岗位搜索</h1>
-    <p>岗位发现会使用受控 Edge 的登录状态，轮换搜索并自动导入有限数量的 JD 评分。</p>
+    <p>岗位发现会使用受控 Edge 的登录状态，按持久化任务轮换搜索并自动导入有限数量的 JD 评分。</p>
   </div>
   <div class="form-actions">
     <a class="button" href="/calibration/candidates">候选校准报告</a>
@@ -72,6 +72,33 @@
   <datalist id="discovery-city-options">
     {% for city in discovery_filters.cities %}<option value="{{ city }}">{% endfor %}
   </datalist>
+</section>
+
+<section class="panel">
+  <div class="panel-title">
+    <div>
+      <h2>自动化任务</h2>
+      <p class="muted">任务会在搜索页和 JD 读取之间保存进度。暂停、取消、失败恢复和完整回放都只处理受控读取与本地评分，不发送消息、不创建投递准备、不选择简历或点击投递。</p>
+    </div>
+  </div>
+  {% if discovery_tasks %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>任务</th><th>进度</th><th>状态</th><th>摘要</th><th>更新时间</th></tr></thead>
+      <tbody>
+        {% for task in discovery_tasks %}
+        <tr>
+          <td><a href="/job-discovery/tasks/{{ task.id }}">任务 #{{ task.id }}</a>{% if task.replay_of_task_id %}<div class="muted">回放自 #{{ task.replay_of_task_id }}</div>{% endif %}</td>
+          <td>{{ task.imported_count }}/{{ task.candidate_count }} 已评分 · {{ task.failed_step_count }} 失败</td>
+          <td><span class="badge">{{ task.status }}</span><div class="muted">{{ task.current_phase }}</div></td>
+          <td>{{ task.summary or "等待执行。" }}</td>
+          <td>{{ task.updated_at }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}<p class="empty">还没有岗位发现任务。</p>{% endif %}
 </section>
 
 <section class="panel">

@@ -1,0 +1,77 @@
+{% extends "layout.html" %}
+{% block title %}岗位发现任务 - 简历投递 Agent{% endblock %}
+{% block content %}
+<section class="page-head">
+  <div>
+    <h1>岗位发现任务 #{{ task.id }}</h1>
+    <p>{{ task.status }} · {{ task.current_phase }}{% if active %} · 后台执行中{% endif %}</p>
+  </div>
+  <div class="form-actions">
+    <a class="button" href="/searches">返回岗位搜索</a>
+    {% if task.status in ['待执行', '运行中'] %}
+    <form method="post" action="/job-discovery/tasks/{{ task.id }}/pause"><button class="button" type="submit">暂停</button></form>
+    <form method="post" action="/job-discovery/tasks/{{ task.id }}/cancel"><button class="button danger" type="submit">取消任务</button></form>
+    {% elif task.status in ['已暂停', '待恢复', '失败', '部分完成'] %}
+    <form method="post" action="/job-discovery/tasks/{{ task.id }}/resume"><button class="button primary" type="submit">恢复失败或未完成步骤</button></form>
+    <form method="post" action="/job-discovery/tasks/{{ task.id }}/replay"><button class="button" type="submit">完整回放</button></form>
+    {% else %}
+    <form method="post" action="/job-discovery/tasks/{{ task.id }}/replay"><button class="button" type="submit">完整回放</button></form>
+    {% endif %}
+  </div>
+</section>
+
+{% if notice %}
+<section class="notice {{ notice_type }}">{{ notice }}</section>
+{% endif %}
+
+{% if task.summary %}
+<section class="notice">{{ task.summary }}</section>
+{% endif %}
+
+{% if task.error_message %}
+<section class="notice error">{{ task.error_message }}</section>
+{% endif %}
+
+<section class="metrics">
+  <div class="metric"><span>候选</span><strong>{{ task.candidate_count }}</strong></div>
+  <div class="metric"><span>已评分</span><strong>{{ task.imported_count }}</strong></div>
+  <div class="metric"><span>初筛保留</span><strong>{{ task.screened_out_count }}</strong></div>
+  <div class="metric"><span>待补充</span><strong>{{ task.pending_detail_count }}</strong></div>
+  <div class="metric"><span>失败步骤</span><strong>{{ task.failed_step_count }}</strong></div>
+</section>
+
+<section class="panel">
+  <div class="panel-title"><h2>本轮条件</h2></div>
+  <div class="detail-grid">
+    <div><span>关键词</span><strong>{{ task.filters.roles | join('、') or '-' }}</strong></div>
+    <div><span>城市</span><strong>{{ task.filters.cities | join('、') or '-' }}</strong></div>
+    <div><span>最低日薪</span><strong>{{ task.filters.min_salary_per_day or '未设置' }}</strong></div>
+    <div><span>目标日薪</span><strong>{{ task.filters.target_salary_per_day or '未设置' }}</strong></div>
+  </div>
+</section>
+
+<section class="panel">
+  <div class="panel-title"><h2>执行步骤</h2></div>
+  {% if steps %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>阶段</th><th>目标</th><th>状态</th><th>尝试</th><th>结果</th></tr></thead>
+      <tbody>
+        {% for step in steps %}
+        <tr>
+          <td>{{ step.phase }} #{{ step.sequence_no }}</td>
+          <td>
+            {% if step.phase == '搜索' %}{{ step.platform }} · {{ step.keyword }} · {{ step.city or '不限城市' }}
+            {% else %}{{ step.candidate_company ~ ' - ' if step.candidate_company else '' }}{{ step.candidate_title or '岗位候选' }}{% endif %}
+          </td>
+          <td><span class="badge">{{ step.status }}</span></td>
+          <td>{{ step.attempts }}</td>
+          <td>{{ step.error_message or step.candidate_error or '-' }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}<p class="empty">正在建立步骤。</p>{% endif %}
+</section>
+{% endblock %}

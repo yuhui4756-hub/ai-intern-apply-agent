@@ -99,10 +99,16 @@ from .services.visual_page import capture_controlled_edge_visual_page, capture_v
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    recover_interrupted_discovery_tasks()
     scheduler_task = asyncio.create_task(message_patrol_scheduler_loop())
     try:
         yield
     finally:
+        mark_active_discovery_tasks_for_recovery()
+        for task in list(ACTIVE_DISCOVERY_TASKS.values()):
+            task.cancel()
+        if ACTIVE_DISCOVERY_TASKS:
+            await asyncio.gather(*ACTIVE_DISCOVERY_TASKS.values(), return_exceptions=True)
         scheduler_task.cancel()
         try:
             await scheduler_task
@@ -133,6 +139,18 @@ JOB_DISCOVERY_PLATFORMS = ("Boss 直聘", "猎聘", "实习僧")
 JOB_DISCOVERY_SEARCH_PAGE_LIMIT = 3
 JOB_DISCOVERY_CANDIDATE_LIMIT = 18
 JOB_DISCOVERY_IMPORT_LIMIT = 6
+DISCOVERY_TASK_PENDING = "待执行"
+DISCOVERY_TASK_RUNNING = "运行中"
+DISCOVERY_TASK_PAUSED = "已暂停"
+DISCOVERY_TASK_CANCELLED = "已取消"
+DISCOVERY_TASK_RECOVERABLE = "待恢复"
+DISCOVERY_TASK_COMPLETED = {"完成", "部分完成", "失败", DISCOVERY_TASK_CANCELLED}
+DISCOVERY_STEP_PENDING = "待执行"
+DISCOVERY_STEP_RUNNING = "运行中"
+DISCOVERY_STEP_COMPLETED = "完成"
+DISCOVERY_STEP_FAILED = "失败"
+DISCOVERY_STEP_CANCELLED = "已取消"
+ACTIVE_DISCOVERY_TASKS: dict[int, asyncio.Task[None]] = {}
 DEFAULT_DISCOVERY_ROLES = ("AI 应用开发实习", "Agent 开发实习", "AI 后端实习")
 DEFAULT_DISCOVERY_CITIES = ("北京", "上海", "广州", "深圳", "杭州", "重庆", "成都")
 JOB_DISCOVERY_STRONG_ROLE_SIGNALS = (
@@ -232,6 +250,8 @@ def action_type_label(value: str) -> str:
         "communication_autonomous_executor": "自主沟通执行",
         "workflow_control": "求职流程控制",
         "job_discovery": "岗位发现",
+        "job_discovery_task": "岗位发现任务",
+        "job_discovery_task_control": "岗位发现任务控制",
         "job_candidate_feedback": "候选校准",
         "job_rescore": "本地重新评分",
         "job_match_review": "岗位深度复核",
@@ -1421,6 +1441,12 @@ def same_source_url(left: str, right: str) -> bool:
     return bool(comparable_source_url(left) & comparable_source_url(right))
 
 
+def candidate_is_navigation_anchor(candidate: Any) -> bool:
+    title = re.sub(r"\s+", "", str(candidate["title"] if hasattr(candidate, "keys") else candidate.get("title") or ""))
+    company = re.sub(r"\s+", "", str(candidate["company"] if hasattr(candidate, "keys") else candidate.get("company") or ""))
+    return title in {"查看更多信息", "举报", "职位搜索", "展开", "收起", "分享", "收藏", "返回"} or company in {"举报", "BOSS"}
+
+
 def find_existing_job_by_source_url(conn: Any, source_url: str) -> Any | None:
     for row in conn.execute("SELECT * FROM job_postings WHERE source_url != '' ORDER BY id DESC LIMIT 500").fetchall():
         if same_source_url(row["source_url"], source_url):
@@ -1432,8 +1458,10 @@ def link_candidates_to_job(conn: Any, source_url: str, job_id: int) -> int:
     now = utc_now()
     matched_ids = [
         int(row["id"])
-        for row in conn.execute("SELECT id, source_url FROM job_candidates WHERE source_url != '' ORDER BY id DESC LIMIT 1000").fetchall()
-        if same_source_url(row["source_url"], source_url)
+        for row in conn.execute(
+            "SELECT id, source_url, title, company FROM job_candidates WHERE source_url != '' ORDER BY id DESC LIMIT 1000"
+        ).fetchall()
+        if same_source_url(row["source_url"], source_url) and not candidate_is_navigation_anchor(row)
     ]
     if not matched_ids:
         return 0
@@ -1550,16 +1578,17 @@ def token_stats() -> dict[str, Any]:
     }
 
 
-def save_search_result(result: Any) -> int:
+def save_search_result(result: Any, discovery_task_id: int | None = None) -> int:
     now = utc_now()
     with connect() as conn:
         cursor = conn.execute(
             """
             INSERT INTO job_search_runs (
-                platform, keyword, city, search_url, browser_channel, status, note, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                discovery_task_id, platform, keyword, city, search_url, browser_channel, status, note, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                discovery_task_id,
                 result.platform,
                 result.keyword,
                 result.city,
@@ -1595,16 +1624,24 @@ def save_search_result(result: Any) -> int:
     return int(run_id)
 
 
-def save_search_failure(platform: str, keyword: str, city: str, browser_channel: str, error_message: str) -> int:
+def save_search_failure(
+    platform: str,
+    keyword: str,
+    city: str,
+    browser_channel: str,
+    error_message: str,
+    discovery_task_id: int | None = None,
+) -> int:
     now = utc_now()
     with connect() as conn:
         cursor = conn.execute(
             """
             INSERT INTO job_search_runs (
-                platform, keyword, city, search_url, browser_channel, status, note, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                discovery_task_id, platform, keyword, city, search_url, browser_channel, status, note, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                discovery_task_id,
                 platform,
                 keyword,
                 city,
@@ -1677,8 +1714,11 @@ def discovery_candidate_screening(
     text = f"{title} {summary}".lower()
     if not title or title == "候选岗位":
         return False, "搜索结果缺少可识别的岗位名称，未自动读取 JD；可手动导入复核。"
-    if any("\ue000" <= char <= "\uf8ff" for char in f"{title}\n{summary}"):
-        return False, "搜索结果包含无法识别的字体字符，未自动读取 JD；可手动导入复核。"
+    title_has_masked_font = any("\ue000" <= char <= "\uf8ff" for char in title)
+    summary_has_masked_font = any("\ue000" <= char <= "\uf8ff" for char in summary)
+    readable_summary = re.sub(r"[\ue000-\uf8ff]", "", summary).strip()
+    if title_has_masked_font or (summary_has_masked_font and len(readable_summary) < 12):
+        return False, "搜索结果关键字段包含无法识别的字体字符，未自动读取 JD；可手动导入复核。"
     senior_experience = JOB_DISCOVERY_SENIOR_EXPERIENCE_RE.search(f"{title}\n{summary}")
     if senior_experience:
         return False, f"搜索信息显示需要 {senior_experience.group(0)}，不符合在校实习初筛；未读取 JD，可手动导入复核。"
@@ -1979,6 +2019,742 @@ def run_controlled_job_discovery(filters: dict[str, Any] | None = None) -> dict[
         "visual_detail_fallback_count": visual_detail_fallback_count,
         "import_results": import_results,
     }
+
+
+def discovery_task_row(task_id: int) -> dict[str, Any] | None:
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM job_discovery_tasks WHERE id = ?", (task_id,)).fetchone()
+    return {key: row[key] for key in row.keys()} if row else None
+
+
+def discovery_task_filters(task: dict[str, Any]) -> dict[str, Any]:
+    saved = loads(str(task.get("filters_json") or ""), {})
+    return saved if isinstance(saved, dict) else {}
+
+
+def discovery_task_plan(task: dict[str, Any]) -> list[dict[str, str]]:
+    saved = loads(str(task.get("plan_json") or ""), [])
+    if not isinstance(saved, list):
+        return []
+    return [item for item in saved if isinstance(item, dict)]
+
+
+def create_controlled_job_discovery_task(
+    filters: dict[str, Any] | None = None,
+    *,
+    replay_of_task_id: int | None = None,
+    replay_plan: list[dict[str, str]] | None = None,
+) -> int:
+    now = utc_now()
+    with connect() as conn:
+        profile = conn.execute("SELECT * FROM candidate_profile ORDER BY id LIMIT 1").fetchone()
+        profile_data = {key: profile[key] for key in profile.keys()} if profile else {}
+        effective_filters = discovery_filters_from_profile(profile_data, filters)
+        generated_plan, resume_id = controlled_job_discovery_plan(conn, filters=filters)
+        plan = replay_plan if replay_plan is not None else generated_plan
+        normalized_plan = [
+            {
+                "platform": str(item.get("platform") or "").strip(),
+                "keyword": str(item.get("keyword") or "").strip(),
+                "city": str(item.get("city") or "").strip(),
+            }
+            for item in plan
+            if str(item.get("platform") or "").strip() and str(item.get("keyword") or "").strip()
+        ]
+        if not normalized_plan:
+            raise ValueError("没有可执行的岗位搜索计划。")
+        cursor = conn.execute(
+            """
+            INSERT INTO job_discovery_tasks (
+                replay_of_task_id, status, current_phase, filters_json, plan_json, resume_id,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                replay_of_task_id,
+                DISCOVERY_TASK_PENDING,
+                "等待执行",
+                dumps(effective_filters),
+                dumps(normalized_plan),
+                resume_id,
+                now,
+                now,
+            ),
+        )
+        task_id = int(cursor.lastrowid)
+        for sequence_no, item in enumerate(normalized_plan, start=1):
+            conn.execute(
+                """
+                INSERT INTO job_discovery_task_steps (
+                    discovery_task_id, phase, sequence_no, platform, keyword, city, status, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    "搜索",
+                    sequence_no,
+                    item["platform"],
+                    item["keyword"],
+                    item["city"],
+                    DISCOVERY_STEP_PENDING,
+                    now,
+                ),
+            )
+        log_agent_action(
+            conn,
+            action_type="job_discovery_task",
+            status="已创建",
+            summary="已创建受控岗位发现任务，等待后台执行。",
+            decision={
+                "task_id": task_id,
+                "replay_of_task_id": replay_of_task_id,
+                "search_page_count": len(normalized_plan),
+                "detail_import_limit": JOB_DISCOVERY_IMPORT_LIMIT,
+                "auto_apply": False,
+                "auto_message": False,
+            },
+        )
+    return task_id
+
+
+def discovery_task_control_state(task_id: int) -> str:
+    task = discovery_task_row(task_id)
+    return str(task.get("status") or "") if task else "不存在"
+
+
+def task_step_row(task_id: int, phase: str) -> dict[str, Any] | None:
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM job_discovery_task_steps
+            WHERE discovery_task_id = ? AND phase = ? AND status = ?
+            ORDER BY sequence_no, id
+            LIMIT 1
+            """,
+            (task_id, phase, DISCOVERY_STEP_PENDING),
+        ).fetchone()
+    return {key: row[key] for key in row.keys()} if row else None
+
+
+def begin_discovery_task_step(step_id: int) -> dict[str, Any] | None:
+    now = utc_now()
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM job_discovery_task_steps WHERE id = ?", (step_id,)).fetchone()
+        if not row or row["status"] != DISCOVERY_STEP_PENDING:
+            return None
+        conn.execute(
+            """
+            UPDATE job_discovery_task_steps
+            SET status = ?, attempts = attempts + 1, started_at = ?, updated_at = ?, error_message = ''
+            WHERE id = ?
+            """,
+            (DISCOVERY_STEP_RUNNING, now, now, step_id),
+        )
+        updated = conn.execute("SELECT * FROM job_discovery_task_steps WHERE id = ?", (step_id,)).fetchone()
+    return {key: updated[key] for key in updated.keys()} if updated else None
+
+
+def finish_discovery_task_step(
+    step_id: int,
+    status: str,
+    *,
+    result: dict[str, Any] | None = None,
+    error_message: str = "",
+    search_run_id: int | None = None,
+    candidate_id: int | None = None,
+) -> None:
+    now = utc_now()
+    with connect() as conn:
+        conn.execute(
+            """
+            UPDATE job_discovery_task_steps
+            SET status = ?, result_json = ?, error_message = ?, search_run_id = COALESCE(?, search_run_id),
+                candidate_id = COALESCE(?, candidate_id), updated_at = ?, finished_at = ?
+            WHERE id = ?
+            """,
+            (
+                status,
+                dumps(result or {}),
+                error_message[:500],
+                search_run_id,
+                candidate_id,
+                now,
+                now,
+                step_id,
+            ),
+        )
+
+
+def refresh_discovery_task_metrics(task_id: int, current_phase: str | None = None) -> dict[str, int]:
+    with connect() as conn:
+        candidate_rows = conn.execute(
+            """
+            SELECT c.id, c.status
+            FROM job_candidates c
+            JOIN job_search_runs r ON r.id = c.search_run_id
+            WHERE r.discovery_task_id = ?
+            """,
+            (task_id,),
+        ).fetchall()
+        step_rows = conn.execute(
+            """
+            SELECT phase, status
+            FROM job_discovery_task_steps
+            WHERE discovery_task_id = ?
+            """,
+            (task_id,),
+        ).fetchall()
+        candidate_count = len(candidate_rows)
+        screened_out_count = sum(
+            1 for row in candidate_rows if str(row["status"] or "") in {"初筛跳过", "初筛待确认"}
+        )
+        imported_count = sum(
+            1
+            for row in step_rows
+            if str(row["phase"] or "") == "JD" and str(row["status"] or "") == DISCOVERY_STEP_COMPLETED
+        )
+        pending_detail_count = sum(1 for row in candidate_rows if str(row["status"] or "") == "详情待补充")
+        failed_step_count = sum(1 for row in step_rows if str(row["status"] or "") == DISCOVERY_STEP_FAILED)
+        values = {
+            "candidate_count": candidate_count,
+            "screened_out_count": screened_out_count,
+            "imported_count": imported_count,
+            "pending_detail_count": pending_detail_count,
+            "failed_step_count": failed_step_count,
+        }
+        assignments = ", ".join(f"{key} = ?" for key in values)
+        params: list[Any] = list(values.values())
+        if current_phase is not None:
+            assignments += ", current_phase = ?"
+            params.append(current_phase)
+        assignments += ", updated_at = ?"
+        params.extend([utc_now(), task_id])
+        conn.execute(f"UPDATE job_discovery_tasks SET {assignments} WHERE id = ?", tuple(params))
+    return values
+
+
+def discovery_task_search_result(
+    task_id: int,
+    step: dict[str, Any],
+) -> None:
+    started = begin_discovery_task_step(int(step["id"]))
+    if not started:
+        return
+    try:
+        result = search_jobs_in_controlled_edge(
+            str(step["platform"]),
+            str(step["keyword"]),
+            str(step["city"]),
+            limit=JOB_DISCOVERY_CANDIDATE_LIMIT,
+        )
+        visual_review_count = 0
+        visual_reconciled_count = 0
+        visual_review_failed = False
+        if search_result_needs_visual_review(result):
+            visual_result = run_visual_page_review(
+                "viewport",
+                f"受控岗位发现：{step['keyword']}，{step['city']}。请补充当前搜索页中 DOM 未可靠提取的候选字段。",
+                expected_url=result.search_url,
+                platform=str(step["platform"]),
+            )
+            if visual_result.get("status") == "已完成":
+                visual_review_count = 1
+                review = visual_result.get("review") if isinstance(visual_result.get("review"), dict) else {}
+                visual_reconciled_count = reconcile_search_result_with_visual_review(result, review)
+                if visual_reconciled_count:
+                    result.note = (result.note + f" 视觉复核补全 {visual_reconciled_count} 条已匹配候选字段。").strip()
+                elif not result.candidates and review.get("candidate_jobs"):
+                    result.note = (result.note + " 视觉复核识别到候选信息，但没有稳定岗位链接，未自动导入。").strip()
+            elif visual_result.get("status") not in {"未配置"}:
+                visual_review_failed = True
+        search_run_id = save_search_result(result, discovery_task_id=task_id)
+        finish_discovery_task_step(
+            int(step["id"]),
+            DISCOVERY_STEP_COMPLETED,
+            search_run_id=search_run_id,
+            result={
+                "candidate_count": len(result.candidates),
+                "controlled_edge_retry_count": int(getattr(result, "retry_count", 0) or 0),
+                "visual_review_count": visual_review_count,
+                "visual_reconciled_count": visual_reconciled_count,
+                "visual_review_failed": visual_review_failed,
+            },
+        )
+    except Exception as exc:
+        message = str(exc).strip()[:500] or "受控搜索页读取失败。"
+        search_run_id = save_search_failure(
+            str(step["platform"]),
+            str(step["keyword"]),
+            str(step["city"]),
+            "msedge",
+            message,
+            discovery_task_id=task_id,
+        )
+        finish_discovery_task_step(
+            int(step["id"]),
+            DISCOVERY_STEP_FAILED,
+            search_run_id=search_run_id,
+            error_message=message,
+        )
+    refresh_discovery_task_metrics(task_id, "搜索岗位")
+
+
+def ensure_discovery_task_detail_steps(task_id: int) -> int:
+    with connect() as conn:
+        existing_rows = conn.execute(
+            """
+            SELECT candidate_id FROM job_discovery_task_steps
+            WHERE discovery_task_id = ? AND phase = 'JD' AND candidate_id IS NOT NULL
+            """,
+            (task_id,),
+        ).fetchall()
+        existing_candidate_ids = {int(row["candidate_id"]) for row in existing_rows}
+        rows = conn.execute(
+            """
+            SELECT c.*
+            FROM job_candidates c
+            JOIN job_search_runs r ON r.id = c.search_run_id
+            WHERE r.discovery_task_id = ?
+            ORDER BY c.id
+            """,
+            (task_id,),
+        ).fetchall()
+        task_row = conn.execute("SELECT filters_json FROM job_discovery_tasks WHERE id = ?", (task_id,)).fetchone()
+        preferences = loads(task_row["filters_json"], {}) if task_row else {}
+        preferences = preferences if isinstance(preferences, dict) else {}
+        accepted: list[tuple[int, int]] = []
+        seen_urls: set[str] = set()
+        now = utc_now()
+        for row in rows:
+            candidate = {key: row[key] for key in row.keys()}
+            candidate_id = int(candidate["id"])
+            source_url = str(candidate.get("source_url") or "")
+            comparable = comparable_source_url(source_url)
+            key = min(comparable) if comparable else source_url
+            if not key or key in seen_urls:
+                if not candidate.get("job_id") and candidate.get("status") == "候选":
+                    conn.execute(
+                        "UPDATE job_candidates SET status = ?, error_message = ?, updated_at = ? WHERE id = ?",
+                        ("初筛待确认", "本轮存在相同岗位链接，未重复读取 JD；可手动复核。", now, candidate_id),
+                    )
+                continue
+            seen_urls.add(key)
+            if candidate.get("job_id"):
+                continue
+            should_import, screening_note = discovery_candidate_screening(candidate, preferences)
+            if not should_import:
+                is_salary_filter = screening_note.startswith("搜索摘要日薪最低")
+                conn.execute(
+                    "UPDATE job_candidates SET status = ?, error_message = ?, updated_at = ? WHERE id = ?",
+                    ("初筛跳过" if is_salary_filter else "初筛待确认", screening_note, now, candidate_id),
+                )
+                continue
+            accepted.append((discovery_candidate_priority(candidate), candidate_id))
+
+        accepted.sort(key=lambda item: (-item[0], item[1]))
+        sequence_base = int(
+            conn.execute(
+                "SELECT COALESCE(MAX(sequence_no), 0) AS value FROM job_discovery_task_steps WHERE discovery_task_id = ? AND phase = 'JD'",
+                (task_id,),
+            ).fetchone()["value"]
+            or 0
+        )
+        created = 0
+        capacity = max(0, JOB_DISCOVERY_IMPORT_LIMIT - len(existing_candidate_ids))
+        for _priority, candidate_id in accepted:
+            if candidate_id in existing_candidate_ids:
+                continue
+            if created >= capacity:
+                conn.execute(
+                    "UPDATE job_candidates SET status = ?, error_message = ?, updated_at = ? WHERE id = ? AND status = '候选'",
+                    ("初筛待确认", "本轮已达到自动读取 JD 上限；可手动导入复核。", now, candidate_id),
+                )
+                continue
+            candidate_row = conn.execute("SELECT * FROM job_candidates WHERE id = ?", (candidate_id,)).fetchone()
+            conn.execute(
+                """
+                INSERT INTO job_discovery_task_steps (
+                    discovery_task_id, phase, sequence_no, platform, keyword, city, candidate_id,
+                    source_url, status, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    "JD",
+                    sequence_base + created + 1,
+                    str(candidate_row["platform"] or ""),
+                    "",
+                    str(candidate_row["city"] or ""),
+                    candidate_id,
+                    str(candidate_row["source_url"] or ""),
+                    DISCOVERY_STEP_PENDING,
+                    now,
+                ),
+            )
+            created += 1
+    refresh_discovery_task_metrics(task_id, "筛选候选")
+    return created
+
+
+def discovery_task_detail_result(task_id: int, step: dict[str, Any]) -> None:
+    started = begin_discovery_task_step(int(step["id"]))
+    if not started:
+        return
+    task = discovery_task_row(task_id)
+    if not task:
+        return
+    candidate_id = int(started.get("candidate_id") or 0)
+    result = import_discovery_candidate(candidate_id, task.get("resume_id"), discovery_task_filters(task))
+    result_status = str(result.get("status") or "")
+    if result_status in {"已导入", "已存在"}:
+        finish_discovery_task_step(
+            int(step["id"]),
+            DISCOVERY_STEP_COMPLETED,
+            candidate_id=candidate_id,
+            result={
+                "status": result_status,
+                "job_id": result.get("job_id"),
+                "fetch_mode": result.get("fetch_mode"),
+                "visual_detail_fallback": bool(result.get("visual_detail_fallback")),
+            },
+        )
+    else:
+        finish_discovery_task_step(
+            int(step["id"]),
+            DISCOVERY_STEP_FAILED,
+            candidate_id=candidate_id,
+            result={"status": result_status},
+            error_message=str(result.get("note") or "岗位详情读取失败。"),
+        )
+    refresh_discovery_task_metrics(task_id, "读取 JD 并评分")
+
+
+def task_pause_or_cancelled(task_id: int) -> dict[str, Any] | None:
+    task = discovery_task_row(task_id)
+    if not task:
+        return {"status": "不存在", "note": "岗位发现任务不存在。"}
+    status = str(task.get("status") or "")
+    if status == DISCOVERY_TASK_PAUSED:
+        refresh_discovery_task_metrics(task_id, "已暂停")
+        return {"status": status, "note": "任务已暂停，当前已完成步骤会保留。"}
+    if status == DISCOVERY_TASK_CANCELLED:
+        with connect() as conn:
+            conn.execute(
+                """
+                UPDATE job_discovery_task_steps
+                SET status = ?, updated_at = ?, finished_at = ?
+                WHERE discovery_task_id = ? AND status = ?
+                """,
+                (DISCOVERY_STEP_CANCELLED, utc_now(), utc_now(), task_id, DISCOVERY_STEP_PENDING),
+            )
+        refresh_discovery_task_metrics(task_id, "已取消")
+        return {"status": status, "note": "任务已取消，未开始的读取步骤不会继续执行。"}
+    if status == DISCOVERY_TASK_RECOVERABLE:
+        refresh_discovery_task_metrics(task_id, "等待恢复")
+        return {"status": status, "note": "服务中断后的任务等待你确认恢复。"}
+    return None
+
+
+def finish_discovery_task(task_id: int) -> dict[str, Any]:
+    metrics = refresh_discovery_task_metrics(task_id)
+    with connect() as conn:
+        search_rows = conn.execute(
+            "SELECT status FROM job_discovery_task_steps WHERE discovery_task_id = ? AND phase = '搜索'",
+            (task_id,),
+        ).fetchall()
+        detail_rows = conn.execute(
+            "SELECT status, error_message FROM job_discovery_task_steps WHERE discovery_task_id = ? AND phase = 'JD'",
+            (task_id,),
+        ).fetchall()
+        completed_search_count = sum(1 for row in search_rows if row["status"] == DISCOVERY_STEP_COMPLETED)
+        failed_step_count = sum(
+            1 for row in [*search_rows, *detail_rows] if row["status"] == DISCOVERY_STEP_FAILED
+        )
+        if not completed_search_count:
+            status = "失败"
+        elif failed_step_count:
+            status = "部分完成"
+        else:
+            status = "完成"
+        note = (
+            f"完成 {completed_search_count}/{len(search_rows)} 个受控搜索页，"
+            f"识别 {metrics['candidate_count']} 个候选，完成 {metrics['imported_count']} 个 JD 读取与评分步骤。"
+        )
+        if metrics["screened_out_count"]:
+            note += f" {metrics['screened_out_count']} 个候选未自动读取 JD。"
+        if metrics["pending_detail_count"]:
+            note += f" {metrics['pending_detail_count']} 个详情待补充，可重试失败步骤或手动导入。"
+        if failed_step_count:
+            note += f" {failed_step_count} 个步骤失败，可在本页重试。"
+        errors = [str(row["error_message"] or "") for row in detail_rows if row["status"] == DISCOVERY_STEP_FAILED]
+        conn.execute(
+            """
+            UPDATE job_discovery_tasks
+            SET status = ?, current_phase = ?, summary = ?, error_message = ?, updated_at = ?, finished_at = ?
+            WHERE id = ?
+            """,
+            (status, "已完成", note, "；".join(errors)[:1000], utc_now(), utc_now(), task_id),
+        )
+        log_agent_action(
+            conn,
+            action_type="job_discovery_task",
+            status=status,
+            summary=note,
+            decision={
+                "task_id": task_id,
+                "candidate_count": metrics["candidate_count"],
+                "imported_count": metrics["imported_count"],
+                "failed_step_count": failed_step_count,
+                "auto_apply": False,
+                "auto_message": False,
+            },
+            error_message="；".join(errors)[:500],
+        )
+    return {"status": status, "note": note, **metrics}
+
+
+def execute_controlled_job_discovery_task(task_id: int) -> dict[str, Any]:
+    task = discovery_task_row(task_id)
+    if not task:
+        return {"status": "不存在", "note": "岗位发现任务不存在。"}
+    if str(task.get("status") or "") in DISCOVERY_TASK_COMPLETED:
+        return {"status": str(task.get("status") or ""), "note": str(task.get("summary") or "任务已结束。")}
+    if str(task.get("status") or "") not in {DISCOVERY_TASK_PENDING, DISCOVERY_TASK_RUNNING}:
+        return task_pause_or_cancelled(task_id) or {"status": str(task.get("status") or ""), "note": "任务暂不能执行。"}
+
+    with connect() as conn:
+        conn.execute(
+            """
+            UPDATE job_discovery_tasks
+            SET status = ?, current_phase = ?, started_at = CASE WHEN started_at = '' THEN ? ELSE started_at END,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (DISCOVERY_TASK_RUNNING, "搜索岗位", utc_now(), utc_now(), task_id),
+        )
+
+    while True:
+        stopped = task_pause_or_cancelled(task_id)
+        if stopped:
+            return stopped
+        search_step = task_step_row(task_id, "搜索")
+        if search_step:
+            discovery_task_search_result(task_id, search_step)
+            continue
+        ensure_discovery_task_detail_steps(task_id)
+        stopped = task_pause_or_cancelled(task_id)
+        if stopped:
+            return stopped
+        detail_step = task_step_row(task_id, "JD")
+        if detail_step:
+            discovery_task_detail_result(task_id, detail_step)
+            continue
+        return finish_discovery_task(task_id)
+
+
+def mark_discovery_task_worker_failure(task_id: int, error: Exception) -> None:
+    task = discovery_task_row(task_id)
+    if not task or task.get("status") != DISCOVERY_TASK_RUNNING:
+        return
+    message = str(error).strip()[:500] or "岗位发现后台任务异常结束。"
+    with connect() as conn:
+        conn.execute(
+            """
+            UPDATE job_discovery_tasks
+            SET status = ?, current_phase = ?, summary = ?, error_message = ?, updated_at = ?, finished_at = ?
+            WHERE id = ?
+            """,
+            ("失败", "异常结束", "岗位发现后台任务异常结束，可重试未完成步骤。", message, utc_now(), utc_now(), task_id),
+        )
+
+
+def schedule_discovery_task(task_id: int) -> bool:
+    active = ACTIVE_DISCOVERY_TASKS.get(task_id)
+    if active and not active.done():
+        return False
+
+    async def worker() -> None:
+        try:
+            await asyncio.to_thread(execute_controlled_job_discovery_task, task_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            mark_discovery_task_worker_failure(task_id, exc)
+        finally:
+            current = ACTIVE_DISCOVERY_TASKS.get(task_id)
+            if current is asyncio.current_task():
+                ACTIVE_DISCOVERY_TASKS.pop(task_id, None)
+
+    ACTIVE_DISCOVERY_TASKS[task_id] = asyncio.create_task(worker())
+    return True
+
+
+def pause_discovery_task(task_id: int) -> tuple[bool, str]:
+    with connect() as conn:
+        row = conn.execute("SELECT status FROM job_discovery_tasks WHERE id = ?", (task_id,)).fetchone()
+        if not row:
+            return False, "没有找到岗位发现任务。"
+        if row["status"] not in {DISCOVERY_TASK_PENDING, DISCOVERY_TASK_RUNNING}:
+            return False, "只有等待执行或运行中的任务可以暂停。"
+        conn.execute(
+            "UPDATE job_discovery_tasks SET status = ?, current_phase = ?, updated_at = ? WHERE id = ?",
+            (DISCOVERY_TASK_PAUSED, "暂停请求已记录", utc_now(), task_id),
+        )
+        log_agent_action(
+            conn,
+            action_type="job_discovery_task_control",
+            status=DISCOVERY_TASK_PAUSED,
+            summary="用户暂停岗位发现任务；当前受控读取完成后不会继续下一步。",
+            decision={"task_id": task_id, "action": "pause", "auto_apply": False, "auto_message": False},
+        )
+    return True, "暂停请求已记录，当前正在进行的只读步骤结束后会停止。"
+
+
+def cancel_discovery_task(task_id: int) -> tuple[bool, str]:
+    with connect() as conn:
+        row = conn.execute("SELECT status FROM job_discovery_tasks WHERE id = ?", (task_id,)).fetchone()
+        if not row:
+            return False, "没有找到岗位发现任务。"
+        if row["status"] in DISCOVERY_TASK_COMPLETED:
+            return False, "任务已经结束，不能取消。"
+        now = utc_now()
+        conn.execute(
+            """
+            UPDATE job_discovery_tasks
+            SET status = ?, current_phase = ?, summary = ?, updated_at = ?, finished_at = ?
+            WHERE id = ?
+            """,
+            (DISCOVERY_TASK_CANCELLED, "已取消", "用户取消岗位发现任务；未开始的步骤不会继续执行。", now, now, task_id),
+        )
+        conn.execute(
+            """
+            UPDATE job_discovery_task_steps
+            SET status = ?, updated_at = ?, finished_at = ?
+            WHERE discovery_task_id = ? AND status = ?
+            """,
+            (DISCOVERY_STEP_CANCELLED, now, now, task_id, DISCOVERY_STEP_PENDING),
+        )
+        log_agent_action(
+            conn,
+            action_type="job_discovery_task_control",
+            status=DISCOVERY_TASK_CANCELLED,
+            summary="用户取消岗位发现任务；不会继续任何未开始的读取。",
+            decision={"task_id": task_id, "action": "cancel", "auto_apply": False, "auto_message": False},
+        )
+    return True, "任务已取消。"
+
+
+def resume_discovery_task(task_id: int) -> tuple[bool, str]:
+    with connect() as conn:
+        row = conn.execute("SELECT status FROM job_discovery_tasks WHERE id = ?", (task_id,)).fetchone()
+        if not row:
+            return False, "没有找到岗位发现任务。"
+        status = str(row["status"] or "")
+        if status not in {DISCOVERY_TASK_PAUSED, DISCOVERY_TASK_RECOVERABLE, "失败", "部分完成"}:
+            return False, "当前任务不需要恢复；已取消任务请使用完整回放。"
+        running_step = conn.execute(
+            "SELECT id FROM job_discovery_task_steps WHERE discovery_task_id = ? AND status = ? LIMIT 1",
+            (task_id, DISCOVERY_STEP_RUNNING),
+        ).fetchone()
+        if running_step:
+            return False, "当前读取步骤尚未结束，请稍后刷新后再恢复。"
+        now = utc_now()
+        reset_statuses = (DISCOVERY_STEP_RUNNING,)
+        if status in {"失败", "部分完成"}:
+            reset_statuses = (DISCOVERY_STEP_RUNNING, DISCOVERY_STEP_FAILED)
+        placeholders = ", ".join("?" for _ in reset_statuses)
+        conn.execute(
+            f"""
+            UPDATE job_discovery_task_steps
+            SET status = ?, error_message = '', updated_at = ?, finished_at = ''
+            WHERE discovery_task_id = ? AND status IN ({placeholders})
+            """,
+            (DISCOVERY_STEP_PENDING, now, task_id, *reset_statuses),
+        )
+        conn.execute(
+            """
+            UPDATE job_discovery_tasks
+            SET status = ?, current_phase = ?, summary = ?, error_message = '', updated_at = ?, finished_at = ''
+            WHERE id = ?
+            """,
+            (DISCOVERY_TASK_PENDING, "等待恢复", "已恢复未完成或失败的只读步骤。", now, task_id),
+        )
+        log_agent_action(
+            conn,
+            action_type="job_discovery_task_control",
+            status="已恢复",
+            summary="用户恢复岗位发现任务；只会继续未完成或失败的搜索/JD 读取步骤。",
+            decision={"task_id": task_id, "action": "resume", "auto_apply": False, "auto_message": False},
+        )
+    schedule_discovery_task(task_id)
+    return True, "任务已恢复。"
+
+
+def replay_discovery_task(task_id: int) -> tuple[int | None, str]:
+    task = discovery_task_row(task_id)
+    if not task:
+        return None, "没有找到岗位发现任务。"
+    try:
+        new_task_id = create_controlled_job_discovery_task(
+            discovery_task_filters(task),
+            replay_of_task_id=task_id,
+            replay_plan=discovery_task_plan(task),
+        )
+    except ValueError as exc:
+        return None, str(exc)
+    schedule_discovery_task(new_task_id)
+    return new_task_id, "已创建新的完整回放任务。"
+
+
+def recover_interrupted_discovery_tasks() -> None:
+    now = utc_now()
+    with connect() as conn:
+        conn.execute(
+            """
+            UPDATE job_discovery_tasks
+            SET status = ?, current_phase = ?, summary = ?, updated_at = ?
+            WHERE status = ?
+            """,
+            (
+                DISCOVERY_TASK_RECOVERABLE,
+                "等待恢复",
+                "应用上次退出时任务尚未结束，请确认后恢复未完成的只读步骤。",
+                now,
+                DISCOVERY_TASK_RUNNING,
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE job_discovery_task_steps
+            SET status = ?, updated_at = ?
+            WHERE status = ?
+            """,
+            (DISCOVERY_STEP_PENDING, now, DISCOVERY_STEP_RUNNING),
+        )
+
+
+def mark_active_discovery_tasks_for_recovery() -> None:
+    if not ACTIVE_DISCOVERY_TASKS:
+        return
+    now = utc_now()
+    task_ids = tuple(ACTIVE_DISCOVERY_TASKS)
+    placeholders = ", ".join("?" for _ in task_ids)
+    with connect() as conn:
+        conn.execute(
+            f"""
+            UPDATE job_discovery_tasks
+            SET status = ?, current_phase = ?, summary = ?, updated_at = ?
+            WHERE id IN ({placeholders}) AND status = ?
+            """,
+            (
+                DISCOVERY_TASK_RECOVERABLE,
+                "等待恢复",
+                "应用正在退出，任务将在下次启动后等待你确认恢复。",
+                now,
+                *task_ids,
+                DISCOVERY_TASK_RUNNING,
+            ),
+        )
 
 
 def api_error(message: str, status_code: int = 400) -> JSONResponse:
@@ -5507,12 +6283,20 @@ async def process_control_message(message: str) -> dict[str, Any]:
             )
         )
         try:
-            result = await run_in_threadpool(run_controlled_job_discovery, filters)
-            execution_status = "已完成" if result.get("status") != "失败" else "失败"
+            task_id = await run_in_threadpool(create_controlled_job_discovery_task, filters)
+            scheduled = schedule_discovery_task(task_id)
+            result = {
+                "task_id": task_id,
+                "status": "已启动" if scheduled else "待执行",
+                "task_url": f"/job-discovery/tasks/{task_id}",
+            }
+            execution_status = "已启动"
             response_text = (
-                f"已执行岗位发现：{result.get('note') or '任务已完成。'}"
-                " 已保留搜索、JD 评分和审计记录；未发送消息、未上传简历、未投递。"
+                f"已启动岗位发现任务 #{task_id}。搜索、JD 读取和评分会在后台按步骤执行；"
+                "可在任务页查看、暂停、取消、恢复或回放。未发送消息、未上传简历、未投递。"
             )
+            suggestions = [{"label": f"查看任务 #{task_id}", "url": f"/job-discovery/tasks/{task_id}"}]
+            evidence["suggestions"] = suggestions
         except Exception as exc:
             result = {"error": str(exc)[:300]}
             execution_status = "失败"
@@ -5521,7 +6305,9 @@ async def process_control_message(message: str) -> dict[str, Any]:
             control_event(
                 "工具结果",
                 execution_status,
-                str(result.get("note") or result.get("error") or "岗位发现已返回结果。")[:500],
+                (
+                    f"任务 #{result['task_id']} 已启动。" if result.get("task_id") else str(result.get("error") or "岗位发现未能启动。")
+                )[:500],
             )
         )
         events.append(
@@ -5533,7 +6319,7 @@ async def process_control_message(message: str) -> dict[str, Any]:
         )
         evidence["execution"] = {
             "mode": "chat_direct_non_submitting",
-            "action_type": "job_discovery",
+            "action_type": "job_discovery_task",
             "status": execution_status,
             "result": result,
         }
@@ -5541,7 +6327,7 @@ async def process_control_message(message: str) -> dict[str, Any]:
             execution_id = create_completed_control_execution(
                 conn,
                 conversation_id,
-                "job_discovery",
+                "job_discovery_task",
                 summary,
                 filters,
                 result,
@@ -7479,6 +8265,15 @@ def searches_page(request: Request) -> Any:
         profile_data = {key: profile[key] for key in profile.keys()} if profile else {}
         discovery_filters = discovery_filters_from_profile(profile_data)
         discovery_plan, _resume_id = controlled_job_discovery_plan(conn)
+        task_rows = conn.execute(
+            """
+            SELECT * FROM job_discovery_tasks
+            ORDER BY CASE status WHEN '运行中' THEN 0 WHEN '待执行' THEN 1 WHEN '已暂停' THEN 2
+                                 WHEN '待恢复' THEN 3 ELSE 4 END,
+                     updated_at DESC, id DESC
+            LIMIT 20
+            """
+        ).fetchall()
     return templates.TemplateResponse(
         request,
         "searches.html",
@@ -7487,6 +8282,7 @@ def searches_page(request: Request) -> Any:
             "search_form": search_form,
             "discovery_plan": discovery_plan,
             "discovery_filters": discovery_filters,
+            "discovery_tasks": [{key: row[key] for key in row.keys()} for row in task_rows],
             "controlled_edge_status": edge_status,
             "notice": request.query_params.get("notice", ""),
             "notice_type": request.query_params.get("notice_type", "info"),
@@ -7530,13 +8326,79 @@ async def start_controlled_job_discovery(request: Request) -> RedirectResponse:
                 if not profile:
                     return redirect_with_notice(return_to, "没有找到候选人画像。", "error")
                 update_profile_discovery_preferences(conn, profile, filters)
-        result = await run_in_threadpool(run_controlled_job_discovery, filters)
+        task_id = create_controlled_job_discovery_task(filters)
+        scheduled = schedule_discovery_task(task_id)
     except ValueError as exc:
         return redirect_with_notice(return_to, str(exc), "error")
     except Exception as exc:
         return redirect_with_notice(return_to, f"岗位发现失败：{str(exc)[:180]}", "error")
-    notice_type = "success" if result["status"] == "完成" else "warning" if result["status"] == "部分完成" else "error"
-    return redirect_with_notice(return_to, f"岗位发现：{result['note']}", notice_type)
+    notice = "岗位发现已在后台开始。" if scheduled else "岗位发现任务已创建，等待执行器接管。"
+    return redirect_with_notice(f"/job-discovery/tasks/{task_id}", notice, "success")
+
+
+@app.get("/job-discovery/tasks/{task_id}")
+def job_discovery_task_page(task_id: int, request: Request) -> Any:
+    with connect() as conn:
+        task_row = conn.execute("SELECT * FROM job_discovery_tasks WHERE id = ?", (task_id,)).fetchone()
+        step_rows = conn.execute(
+            """
+            SELECT s.*, c.title AS candidate_title, c.company AS candidate_company, c.status AS candidate_status,
+                   c.error_message AS candidate_error
+            FROM job_discovery_task_steps s
+            LEFT JOIN job_candidates c ON c.id = s.candidate_id
+            WHERE s.discovery_task_id = ?
+            ORDER BY CASE s.phase WHEN '搜索' THEN 0 ELSE 1 END, s.sequence_no, s.id
+            """,
+            (task_id,),
+        ).fetchall()
+    if not task_row:
+        return redirect_with_notice("/searches", "没有找到岗位发现任务。", "error")
+    task = {key: task_row[key] for key in task_row.keys()}
+    task["filters"] = discovery_task_filters(task)
+    task["plan"] = discovery_task_plan(task)
+    return templates.TemplateResponse(
+        request,
+        "job_discovery_task.html",
+        {
+            "task": task,
+            "steps": [{key: row[key] for key in row.keys()} for row in step_rows],
+            "active": bool(ACTIVE_DISCOVERY_TASKS.get(task_id) and not ACTIVE_DISCOVERY_TASKS[task_id].done()),
+            "notice": request.query_params.get("notice", ""),
+            "notice_type": request.query_params.get("notice_type", "info"),
+        },
+    )
+
+
+@app.post("/job-discovery/tasks/{task_id}/pause")
+async def pause_job_discovery_task(task_id: int, request: Request) -> RedirectResponse:
+    success, message = pause_discovery_task(task_id)
+    return redirect_with_notice(
+        f"/job-discovery/tasks/{task_id}", message, "success" if success else "error"
+    )
+
+
+@app.post("/job-discovery/tasks/{task_id}/resume")
+async def resume_job_discovery_task(task_id: int, request: Request) -> RedirectResponse:
+    success, message = resume_discovery_task(task_id)
+    return redirect_with_notice(
+        f"/job-discovery/tasks/{task_id}", message, "success" if success else "error"
+    )
+
+
+@app.post("/job-discovery/tasks/{task_id}/cancel")
+async def cancel_job_discovery_task(task_id: int, request: Request) -> RedirectResponse:
+    success, message = cancel_discovery_task(task_id)
+    return redirect_with_notice(
+        f"/job-discovery/tasks/{task_id}", message, "success" if success else "error"
+    )
+
+
+@app.post("/job-discovery/tasks/{task_id}/replay")
+async def replay_job_discovery_task(task_id: int, request: Request) -> RedirectResponse:
+    new_task_id, message = replay_discovery_task(task_id)
+    if not new_task_id:
+        return redirect_with_notice(f"/job-discovery/tasks/{task_id}", message, "error")
+    return redirect_with_notice(f"/job-discovery/tasks/{new_task_id}", message, "success")
 
 
 @app.post("/searches/open-manual")

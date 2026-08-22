@@ -43,6 +43,26 @@ def test_extract_candidates_from_anchor_context():
     assert candidates[0].company == "杭州搜索智能科技有限公司"
 
 
+def test_extract_candidates_skips_navigation_anchor_with_a_job_detail_url():
+    anchors = [
+        {
+            "href": "https://www.zhipin.com/job_detail/navigation.html",
+            "text": "查看更多信息",
+            "context": "查看更多信息\n举报\n职位描述",
+        },
+        {
+            "href": "https://www.zhipin.com/job_detail/agent-2.html",
+            "text": "AI 应用开发实习生",
+            "context": "AI 应用开发实习生\n杭州验证智能科技有限公司\nPython RAG FastAPI",
+        },
+    ]
+
+    candidates = extract_candidates_from_anchors(anchors, "Boss 直聘", "杭州")
+
+    assert len(candidates) == 1
+    assert candidates[0].title == "AI 应用开发实习生"
+
+
 def test_extract_candidates_filters_mixed_card_fields():
     anchors = [
         {
