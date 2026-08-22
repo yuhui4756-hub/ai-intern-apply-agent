@@ -35,7 +35,12 @@ from .services.browser_patrol import (
     open_message_patrol_browser,
     scan_controlled_edge_unread_conversations,
 )
-from .services.application_browser import build_application_browser_plan, fill_application_note_in_controlled_edge, probe_application_browser_plan
+from .services.application_browser import (
+    build_application_browser_plan,
+    fill_application_note_in_controlled_edge,
+    probe_application_browser_plan,
+    upload_application_resume_in_controlled_edge,
+)
 from .services.communication_browser import (
     build_browser_send_adapter_plan,
     calibrate_controlled_edge_chat_pages,
@@ -6888,7 +6893,8 @@ def application_preparations_page(request: Request) -> Any:
             SELECT p.*, j.title AS job_title, j.company AS company, j.city AS city,
                    j.platform AS platform, j.match_score AS match_score,
                    j.risk_level AS risk_level, j.status AS job_status,
-                   r.name AS resume_name
+                   r.name AS resume_name, r.file_path AS resume_file_path, r.file_type AS resume_file_type,
+                   LENGTH(r.parsed_text) AS resume_text_length
             FROM application_preparations p
             JOIN job_postings j ON j.id = p.job_id
             LEFT JOIN resume_versions r ON r.id = p.resume_id
@@ -7078,6 +7084,20 @@ async def fill_application_note_in_browser(preparation_id: int, request: Request
     result = await run_in_threadpool(run_application_browser_note_fill, preparation_id)
     notice_type = "success" if result.get("status") == "已填入" else "error"
     return redirect_with_notice(return_to, f"投递附言填入：{result.get('note') or result.get('status')}", notice_type)
+
+
+@app.post("/applications/{preparation_id}/browser-upload-resume")
+async def upload_application_resume_in_browser(preparation_id: int, request: Request) -> RedirectResponse:
+    form = await request.form()
+    return_to = str(form.get("return_to") or "/applications")
+    if not return_to.startswith("/") or return_to.startswith("//"):
+        return_to = "/applications"
+    if str(form.get("confirmation") or "").strip() != "选择并上传简历":
+        return redirect_with_notice(return_to, "请在确认框中输入“选择并上传简历”后再执行。", "error")
+
+    result = await run_in_threadpool(run_application_browser_resume_upload, preparation_id)
+    notice_type = "success" if result.get("status") == "已选择简历" else "error"
+    return redirect_with_notice(return_to, f"简历文件选择：{result.get('note') or result.get('status')}", notice_type)
 
 
 @app.get("/communications")
@@ -8741,7 +8761,10 @@ def application_browser_item(conn: Any, preparation_id: int) -> dict[str, Any] |
         """
         SELECT p.id AS preparation_id, p.status AS preparation_status, p.resume_id, p.application_message,
                j.id AS job_id, j.platform, j.source_url, j.title AS job_title,
-               j.company, j.status AS job_status, r.name AS resume_name
+               j.company, j.status AS job_status, r.name AS resume_name,
+               r.file_path AS resume_file_path, r.file_type AS resume_file_type,
+               LENGTH(r.parsed_text) AS resume_text_length,
+               (SELECT name FROM candidate_profile ORDER BY id LIMIT 1) AS candidate_name
         FROM application_preparations p
         JOIN job_postings j ON j.id = p.job_id
         LEFT JOIN resume_versions r ON r.id = p.resume_id
@@ -8828,6 +8851,65 @@ def run_application_browser_note_fill(preparation_id: int) -> dict[str, Any]:
                 "application_message_filled": bool(result.get("application_message_filled")),
                 "browser_clicked": False,
                 "resume_uploaded": False,
+                "model_called": False,
+                "user_confirmation_required": True,
+            },
+        )
+    return result
+
+
+def run_application_browser_resume_upload(preparation_id: int) -> dict[str, Any]:
+    with connect() as conn:
+        item = application_browser_item(conn, preparation_id)
+    if not item:
+        return {"status": "未找到投递准备", "note": "没有找到这条投递准备。", "preparation_id": preparation_id}
+    if not str(item.get("candidate_name") or "").strip():
+        return {
+            "status": "未选择",
+            "note": "候选人名称尚未填写，停止选择简历文件。请先在候选人画像页补全后再确认。",
+            "resume_uploaded": False,
+            "browser_clicked": False,
+        }
+    if int(item.get("resume_text_length") or 0) < 160:
+        return {
+            "status": "未选择",
+            "note": "当前简历版本正文未导入或过短，停止选择简历文件。请先完善简历版本。",
+            "resume_uploaded": False,
+            "browser_clicked": False,
+        }
+
+    plan = build_application_browser_plan(item)
+    try:
+        result = upload_application_resume_in_controlled_edge(plan, str(item.get("resume_file_path") or ""))
+    except ValueError as exc:
+        result = {
+            "status": "未选择",
+            "note": str(exc)[:500],
+            "file_selection_verified": False,
+            "browser_clicked": False,
+            "resume_uploaded": False,
+            "resume_path_saved": False,
+        }
+
+    with connect() as conn:
+        log_agent_action(
+            conn,
+            action_type="application_browser_resume_upload",
+            status=str(result.get("status") or "未知"),
+            summary=str(result.get("note") or "投递简历文件选择完成。"),
+            platform=str(item.get("platform") or ""),
+            job_id=int(item["job_id"]),
+            decision={
+                "preparation_id": preparation_id,
+                "resume_id": item.get("resume_id"),
+                "resume_file_type": str(result.get("resume_suffix") or item.get("resume_file_type") or ""),
+                "resume_size_bytes": int(result.get("resume_size_bytes") or 0),
+                "file_input_count": int(result.get("file_input_count") or 0),
+                "file_selection_verified": bool(result.get("file_selection_verified")),
+                "resume_uploaded": bool(result.get("resume_uploaded")),
+                "resume_path_saved": False,
+                "browser_clicked": False,
+                "application_submitted": False,
                 "model_called": False,
                 "user_confirmation_required": True,
             },

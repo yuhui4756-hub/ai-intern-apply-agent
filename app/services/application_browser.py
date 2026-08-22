@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from pathlib import Path
 from urllib.parse import urlparse
 
 from .job_fetcher import normalize_browser_channel
@@ -10,6 +11,7 @@ from .job_searcher import (
     controlled_edge_dom_snapshot_expression,
     evaluate_cdp_expression,
     read_controlled_edge_targets,
+    send_cdp_command,
     target_url,
     wait_for_debug_endpoint,
 )
@@ -136,6 +138,8 @@ APPLICATION_FILL_BLOCKING_SIGNALS = (
     "支付",
     "收费",
 )
+APPLICATION_RESUME_EXTENSIONS = {".pdf", ".doc", ".docx"}
+MAX_APPLICATION_RESUME_BYTES = 20 * 1024 * 1024
 
 
 def build_application_browser_plan(item: dict[str, object]) -> dict[str, object]:
@@ -148,6 +152,7 @@ def build_application_browser_plan(item: dict[str, object]) -> dict[str, object]
         "source_url": str(item.get("source_url") or ""),
         "resume_id": item.get("resume_id"),
         "resume_name": str(item.get("resume_name") or ""),
+        "resume_file_configured": bool(str(item.get("resume_file_path") or "").strip()),
         "application_message_length": len(str(item.get("application_message") or "").strip()),
         "browser_filled": False,
         "browser_clicked": False,
@@ -397,6 +402,77 @@ def fill_application_note_in_controlled_edge(
         raise ValueError(f"无法填入当前 Edge 的投递附言：{detail[:180]}。") from exc
 
 
+def validate_application_resume_file(file_path: str) -> dict[str, object]:
+    path = Path(str(file_path or "").strip().strip('"')).expanduser()
+    if not str(path):
+        raise ValueError("当前简历版本没有配置本地文件路径。")
+    if not path.exists() or not path.is_file():
+        raise ValueError("当前简历文件不存在，请在候选人画像页更新文件路径后重试。")
+    suffix = path.suffix.lower()
+    if suffix not in APPLICATION_RESUME_EXTENSIONS:
+        raise ValueError("投递页简历选择仅支持 PDF、DOC 或 DOCX 文件。")
+    size_bytes = int(path.stat().st_size)
+    if size_bytes <= 0:
+        raise ValueError("当前简历文件为空，不能选择。")
+    if size_bytes > MAX_APPLICATION_RESUME_BYTES:
+        raise ValueError("当前简历文件超过 20MB，不能选择。")
+    return {"path": path, "suffix": suffix.lstrip("."), "size_bytes": size_bytes}
+
+
+def upload_application_resume_in_controlled_edge(
+    plan: dict[str, object],
+    file_path: str,
+    *,
+    browser_channel: str = "msedge",
+) -> dict[str, object]:
+    """Select a verified local resume file without clicking apply or submit."""
+    if plan.get("browser_action") != "dry_run_ready":
+        raise ValueError(str(plan.get("reason") or "当前岗位不能进入简历选择流程。"))
+    if normalize_browser_channel(browser_channel) != "msedge":
+        raise ValueError("当前投递简历选择先支持 Microsoft Edge。")
+    file_info = validate_application_resume_file(file_path)
+    try:
+        target, probe = find_unique_verified_application_resume_target(plan)
+        root = send_cdp_command(target, "DOM.getDocument", {"depth": 1})
+        document = root.get("root") if isinstance(root.get("root"), dict) else {}
+        root_node_id = int(document.get("nodeId") or 0)
+        if not root_node_id:
+            raise ValueError("当前 Edge 页面没有可用 DOM 根节点。")
+        queried = send_cdp_command(
+            target,
+            "DOM.querySelectorAll",
+            {"nodeId": root_node_id, "selector": "input[type='file']"},
+        )
+        node_ids = queried.get("nodeIds") if isinstance(queried.get("nodeIds"), list) else []
+        if len(node_ids) != 1:
+            raise ValueError("页面未找到唯一简历文件输入框，已停止选择。")
+        send_cdp_command(
+            target,
+            "DOM.setFileInputFiles",
+            {"files": [str(file_info["path"])], "nodeId": int(node_ids[0])},
+        )
+        verification = evaluate_cdp_expression(target, file_input_selection_expression())
+        if not isinstance(verification, dict) or int(verification.get("selected_count") or 0) != 1:
+            raise ValueError("页面未确认已选择唯一简历文件。")
+        return {
+            "status": "已选择简历",
+            "note": "已在当前 Edge 选择本地简历文件；未点击投递或提交。部分平台可能在选择文件后自行预上传，请在页面上人工核对。",
+            "matched_page": probe,
+            "file_input_count": 1,
+            "file_selection_verified": True,
+            "resume_suffix": str(file_info["suffix"]),
+            "resume_size_bytes": int(file_info["size_bytes"]),
+            "browser_clicked": False,
+            "resume_uploaded": True,
+            "resume_path_saved": False,
+        }
+    except ValueError:
+        raise
+    except Exception as exc:
+        detail = str(exc).strip() or exc.__class__.__name__
+        raise ValueError(f"无法在当前 Edge 选择简历文件：{detail[:180]}。") from exc
+
+
 def find_unique_verified_application_target(plan: dict[str, object]) -> tuple[dict, dict[str, object]]:
     if not wait_for_debug_endpoint(timeout_seconds=3):
         raise ValueError("没有检测到应用打开的 Edge 调试窗口，请先打开岗位页并完成只读演练。")
@@ -423,6 +499,44 @@ def find_unique_verified_application_target(plan: dict[str, object]) -> tuple[di
         raise ValueError("未找到身份匹配且有投递附言输入框的安全页面；请先在受控 Edge 手动打开投递弹窗后重试。")
     if len(candidates) != 1:
         raise ValueError("找到多个可填写的投递页面，已停止操作；请只保留当前岗位页面后重试。")
+    return candidates[0]
+
+
+def find_unique_verified_application_resume_target(plan: dict[str, object]) -> tuple[dict, dict[str, object]]:
+    if not wait_for_debug_endpoint(timeout_seconds=3):
+        raise ValueError("没有检测到应用打开的 Edge 调试窗口，请先打开岗位页并完成只读演练。")
+
+    candidates: list[tuple[dict, dict[str, object]]] = []
+    ambiguous_input_found = False
+    for target in read_controlled_edge_targets():
+        if not target_url(target).startswith(("http://", "https://")):
+            continue
+        try:
+            snapshot = capture_application_target_snapshot(target, plan)
+        except Exception:
+            continue
+        if application_fill_blocking_signals(snapshot):
+            continue
+        probe = score_application_page(plan, snapshot)
+        identity_ok = bool(
+            probe["domain_match"]
+            and (probe["company_match"] or probe["job_title_match"] or probe["source_host_match"])
+        )
+        if not identity_ok or int(probe["resume_control_count"] or 0) <= 0:
+            continue
+        input_state = evaluate_cdp_expression(target, file_input_selection_expression())
+        input_count = int(input_state.get("input_count") or 0) if isinstance(input_state, dict) else 0
+        if input_count == 1:
+            candidates.append((target, probe))
+        elif input_count > 1:
+            ambiguous_input_found = True
+
+    if not candidates:
+        if ambiguous_input_found:
+            raise ValueError("身份匹配页面存在多个简历文件输入框，已停止选择。")
+        raise ValueError("未找到身份匹配且有唯一简历文件输入框的安全页面；请先打开投递弹窗后重试。")
+    if len(candidates) != 1:
+        raise ValueError("找到多个可选择简历的投递页面，已停止操作；请只保留当前岗位页面后重试。")
     return candidates[0]
 
 
@@ -477,6 +591,17 @@ def fill_application_note_expression(plan: dict[str, object], application_messag
         field.dispatchEvent(new Event('change', {{bubbles: true}}));
         return {{ok: true, selector}};
     }})()"""
+
+
+def file_input_selection_expression() -> str:
+    return """(() => {
+        const inputs = Array.from(document.querySelectorAll("input[type='file']"))
+            .filter(input => !input.disabled);
+        return {
+            input_count: inputs.length,
+            selected_count: inputs.length === 1 && inputs[0].files ? inputs[0].files.length : 0
+        };
+    })()"""
 
 
 def application_note_selectors(plan: dict[str, object]) -> list[str]:

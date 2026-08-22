@@ -78,6 +78,17 @@
               <input type="hidden" name="return_to" value="/applications">
               <button class="button compact" type="submit">只读演练</button>
             </form>
+            {% if item.resume_file_configured %}
+            <form method="post" action="/applications/{{ item.id }}/browser-upload-resume" class="form-stack compact-form">
+              <label>确认短语
+                <input name="confirmation" placeholder="选择并上传简历" autocomplete="off">
+              </label>
+              <input type="hidden" name="return_to" value="/applications">
+              <button class="button compact" type="submit">选择简历文件</button>
+            </form>
+            {% else %}
+            <p class="muted">当前简历版本未配置可上传文件。</p>
+            {% endif %}
             {% if item.application_message %}
             <form method="post" action="/applications/{{ item.id }}/browser-fill-note" class="form-stack compact-form">
               <label>确认短语
