@@ -125,13 +125,102 @@ def test_visual_review_reuses_task_chat_model_and_history(monkeypatch):
 
     result = main.run_visual_page_review("viewport", "识图分析当前页面")
 
-    assert routed_tasks == ["agent_chat"]
+    assert routed_tasks == ["agent_chat", "control_intent"]
     assert result["status"] == "已完成"
     assert result["model_profile"] == "聊天视觉模型"
     assert result["review"]["company"] == "测试科技"
     assert calls[0][2] == "data:image/jpeg;base64,dGVzdA=="
     assert "找杭州 AI 应用开发实习" in calls[0][1]
     assert "识图分析当前页面" in calls[0][1]
+
+
+def test_visual_review_falls_back_after_primary_model_timeout(monkeypatch):
+    from app import main
+
+    class TimeoutClient:
+        configured = True
+        profile = {"id": 1, "name": "Grok"}
+        model = "grok-4.5"
+
+        def __init__(self):
+            self.errors = []
+
+        def complete_json_with_image(self, *_args):
+            raise RuntimeError("The read operation timed out")
+
+        def log_error(self, message):
+            self.errors.append(message)
+
+    class FallbackClient:
+        configured = True
+        profile = {"id": 2, "name": "GPT"}
+        model = "gpt-5.6-terra"
+
+        def complete_json_with_image(self, *_args):
+            return {
+                "page_type": "search_results",
+                "candidate_jobs": [{"company": "回退视觉科技", "title": "AI 应用开发实习生", "salary_text": "200-300元/天"}],
+                "confidence": 0.86,
+                "uncertainties": [],
+            }
+
+        def log_error(self, _message):
+            raise AssertionError("备用模型不应记录错误")
+
+    timeout = TimeoutClient()
+    fallback = FallbackClient()
+    monkeypatch.setattr(main, "client_for_task", lambda task_type: {"agent_chat": fallback, "control_intent": None}.get(task_type))
+    monkeypatch.setattr(
+        main,
+        "capture_controlled_edge_visual_page",
+        lambda _mode, **_kwargs: {"image_data_url": "data:image/jpeg;base64,dGVzdA==", "metadata": {"platform": "Boss 直聘", "image_persisted": False}},
+    )
+    monkeypatch.setattr(main, "control_history_for_model", lambda: [])
+
+    result = main.run_visual_page_review("viewport", "补充薪资", client_override=timeout)
+
+    assert result["status"] == "已完成"
+    assert result["model_profile"] == "GPT"
+    assert result["fallback_used"] is True
+    assert [item["status"] for item in result["visual_attempts"]] == ["失败", "已完成"]
+    assert "timed out" in timeout.errors[0]
+
+
+def test_visual_review_records_all_failed_model_attempts_once(monkeypatch):
+    from app import main
+
+    class FailingClient:
+        configured = True
+
+        def __init__(self, profile_id, name, error):
+            self.profile = {"id": profile_id, "name": name}
+            self.model = name.lower()
+            self.error = error
+            self.logged = []
+
+        def complete_json_with_image(self, *_args):
+            raise RuntimeError(self.error)
+
+        def log_error(self, message):
+            self.logged.append(message)
+
+    primary = FailingClient(1, "Grok", "The read operation timed out")
+    fallback = FailingClient(2, "GPT", "upstream unavailable")
+    monkeypatch.setattr(main, "client_for_task", lambda task_type: {"agent_chat": primary, "control_intent": fallback}.get(task_type))
+    monkeypatch.setattr(
+        main,
+        "capture_controlled_edge_visual_page",
+        lambda _mode, **_kwargs: {"image_data_url": "data:image/jpeg;base64,dGVzdA==", "metadata": {"platform": "Boss 直聘", "image_persisted": False}},
+    )
+    monkeypatch.setattr(main, "control_history_for_model", lambda: [])
+
+    result = main.run_visual_page_review("viewport", "复核页面")
+
+    assert result["status"] == "失败"
+    assert [item["model_profile"] for item in result["visual_attempts"]] == ["Grok", "GPT"]
+    assert [item["status"] for item in result["visual_attempts"]] == ["失败", "失败"]
+    assert primary.logged == ["The read operation timed out"]
+    assert fallback.logged == ["upstream unavailable"]
 
 
 def test_visual_reconciliation_only_enriches_a_unique_dom_candidate_and_screens_senior_experience():

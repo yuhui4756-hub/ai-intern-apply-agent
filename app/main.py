@@ -5741,6 +5741,64 @@ def normalize_visual_page_review(value: object) -> dict[str, Any]:
     }
 
 
+def visual_client_identity(client: OpenAICompatibleClient) -> tuple[object, str, str]:
+    profile = getattr(client, "profile", {})
+    return (
+        profile.get("id") if isinstance(profile, dict) else None,
+        str(profile.get("name") or "") if isinstance(profile, dict) else "",
+        str(getattr(client, "model", "") or ""),
+    )
+
+
+def visual_review_clients(client_override: OpenAICompatibleClient | None = None) -> list[OpenAICompatibleClient]:
+    candidates = [client_override] if client_override else []
+    candidates.extend([client_for_task("agent_chat"), client_for_task("control_intent")])
+    selected: list[OpenAICompatibleClient] = []
+    identities: set[tuple[object, str, str]] = set()
+    for client in candidates:
+        if not client or not client.configured:
+            continue
+        identity = visual_client_identity(client)
+        if identity in identities:
+            continue
+        identities.add(identity)
+        selected.append(client)
+    return selected
+
+
+class VisualReviewError(ValueError):
+    def __init__(self, message: str, attempts: list[dict[str, str]]):
+        super().__init__(message)
+        self.attempts = attempts
+
+
+def complete_visual_with_fallback(
+    clients: list[OpenAICompatibleClient],
+    system_prompt: str,
+    user_prompt: str,
+    image_data_url: str,
+) -> tuple[dict[str, Any], OpenAICompatibleClient, list[dict[str, str]]]:
+    attempts: list[dict[str, str]] = []
+    for client in clients[:2]:
+        profile = getattr(client, "profile", {})
+        profile_name = str(profile.get("name") or "") if isinstance(profile, dict) else ""
+        model_name = str(getattr(client, "model", "") or "")
+        try:
+            response = client.complete_json_with_image(system_prompt, user_prompt, image_data_url)
+            attempts.append({"model_profile": profile_name, "model_name": model_name, "status": "已完成", "error": ""})
+            return response, client, attempts
+        except Exception as exc:
+            error = str(exc).strip()[:300] or exc.__class__.__name__
+            if hasattr(client, "log_error"):
+                client.log_error(error)
+            attempts.append({"model_profile": profile_name, "model_name": model_name, "status": "失败", "error": error})
+    errors = "；".join(
+        f"{item['model_profile'] or item['model_name'] or '视觉模型'}：{item['error']}"
+        for item in attempts
+    )
+    raise VisualReviewError(f"视觉模型未返回可用结果：{errors[:500]}", attempts)
+
+
 def run_visual_page_review(
     mode: str = "viewport",
     user_message: str = "",
@@ -5751,14 +5809,16 @@ def run_visual_page_review(
     client_override: OpenAICompatibleClient | None = None,
 ) -> dict[str, Any]:
     # Keep page understanding on the main task-chat model; fall back only for older configurations.
-    client = client_override or client_for_task("agent_chat") or client_for_task("control_intent")
-    if not client or not client.configured:
+    clients = visual_review_clients(client_override)
+    if not clients:
         return {
             "status": "未配置",
             "note": "请先将“控制层意图理解”配置为支持图像输入的 OpenAI-compatible 聊天模型。",
             "model_called": False,
             "image_sent_to_model": False,
         }
+    client = clients[0]
+    visual_attempts: list[dict[str, str]] = []
     try:
         capture = capture_controlled_edge_visual_page(mode, expected_url=expected_url, platform=platform)
         metadata = capture.get("metadata") if isinstance(capture.get("metadata"), dict) else {}
@@ -5796,27 +5856,40 @@ def run_visual_page_review(
                 "看不清则 salary_text 留空，绝不推测：\n"
                 + dumps(normalized_salary_targets)
             )
-        raw = client.complete_json_with_image(prompt, user_prompt, str(capture["image_data_url"]))
+        raw, client, visual_attempts = complete_visual_with_fallback(
+            clients,
+            prompt,
+            user_prompt,
+            str(capture["image_data_url"]),
+        )
         review = normalize_visual_page_review(raw)
     except Exception as exc:
-        if hasattr(client, "log_error"):
+        if isinstance(exc, VisualReviewError):
+            visual_attempts = exc.attempts
+        elif hasattr(client, "log_error"):
             client.log_error(str(exc))
         return {
             "status": "失败",
             "note": f"页面视觉复核失败：{str(exc)[:300]}",
             "error": str(exc)[:300],
-            "model_called": True,
-            "image_sent_to_model": True,
+            "model_called": bool(visual_attempts),
+            "image_sent_to_model": bool(visual_attempts),
+            "visual_attempts": visual_attempts,
         }
+    note = "页面视觉复核已完成；截图未保存，仅保留结构化摘要。"
+    if len(visual_attempts) > 1:
+        note = "页面视觉复核已完成；主模型失败后已使用备用视觉模型，截图未保存。"
     return {
         "status": "已完成",
-        "note": "页面视觉复核已完成；截图未保存，仅保留结构化摘要。",
+        "note": note,
         "review": review,
         "capture": metadata,
         "model_called": True,
         "model_profile": str(getattr(client, "profile", {}).get("name") or ""),
         "model_name": str(getattr(client, "model", "") or ""),
         "image_sent_to_model": True,
+        "visual_attempts": visual_attempts,
+        "fallback_used": len(visual_attempts) > 1,
     }
 
 
@@ -5860,16 +5933,17 @@ def normalize_visual_job_detail_review(value: object) -> dict[str, Any]:
 
 def run_visual_job_detail_fallback(url: str, candidate: dict[str, Any]) -> dict[str, Any]:
     """Recover a short/empty DOM JD through one temporary detail-page screenshot."""
-    client = client_for_task("agent_chat") or client_for_task("control_intent")
-    if not client or not client.configured:
+    clients = visual_review_clients()
+    if not clients:
         return {
             "status": "未配置",
             "note": "控制层聊天模型未配置，无法执行详情页视觉复核。",
             "model_called": False,
             "image_sent_to_model": False,
         }
+    client = clients[0]
     target: dict[str, Any] | None = None
-    image_sent = False
+    visual_attempts: list[dict[str, str]] = []
     try:
         safe_url = ensure_public_http_url(url)
         target = create_controlled_edge_target(safe_url)
@@ -5914,19 +5988,26 @@ def run_visual_job_detail_fallback(url: str, candidate: dict[str, Any]) -> dict[
             f"最近对话：\n{history_text}\n\n"
             "请按约定 JSON 返回。"
         )
-        image_sent = True
-        raw = client.complete_json_with_image(prompt, user_prompt, str(capture["image_data_url"]))
+        raw, client, visual_attempts = complete_visual_with_fallback(
+            clients,
+            prompt,
+            user_prompt,
+            str(capture["image_data_url"]),
+        )
         review = normalize_visual_job_detail_review(raw)
     except Exception as exc:
-        if hasattr(client, "log_error"):
+        if isinstance(exc, VisualReviewError):
+            visual_attempts = exc.attempts
+        elif hasattr(client, "log_error"):
             client.log_error(str(exc))
         return {
             "status": "失败",
             "note": f"详情页视觉复核未完成：{str(exc)[:300]}",
             "error": str(exc)[:300],
             "capture": metadata,
-            "model_called": image_sent,
-            "image_sent_to_model": image_sent,
+            "model_called": bool(visual_attempts),
+            "image_sent_to_model": bool(visual_attempts),
+            "visual_attempts": visual_attempts,
         }
 
     fetched = FetchResult(
@@ -5937,9 +6018,12 @@ def run_visual_job_detail_fallback(url: str, candidate: dict[str, Any]) -> dict[
         fetch_mode="controlled_edge_visual",
         note="DOM 岗位详情文本不足，已用临时页面视觉复核补充；截图未保存。",
     )
+    note = "详情页视觉复核已完成；截图未保存，已返回可校验 JD 文本。"
+    if len(visual_attempts) > 1:
+        note = "详情页视觉复核已完成；主模型失败后已使用备用视觉模型，截图未保存。"
     return {
         "status": "已完成",
-        "note": "详情页视觉复核已完成；截图未保存，已返回可校验 JD 文本。",
+        "note": note,
         "fetched": fetched,
         "review": review,
         "capture": metadata,
@@ -5947,6 +6031,8 @@ def run_visual_job_detail_fallback(url: str, candidate: dict[str, Any]) -> dict[
         "model_profile": str(getattr(client, "profile", {}).get("name") or ""),
         "model_name": str(getattr(client, "model", "") or ""),
         "image_sent_to_model": True,
+        "visual_attempts": visual_attempts,
+        "fallback_used": len(visual_attempts) > 1,
     }
 
 
