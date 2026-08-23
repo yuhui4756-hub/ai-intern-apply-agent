@@ -186,6 +186,53 @@ def test_visual_review_falls_back_after_primary_model_timeout(monkeypatch):
     assert "timed out" in timeout.errors[0]
 
 
+def test_visual_review_falls_back_after_primary_returns_non_object_json(monkeypatch):
+    from app import main
+
+    class InvalidJsonClient:
+        configured = True
+        profile = {"id": 1, "name": "主模型"}
+        model = "primary-vision"
+
+        def complete_json_with_image(self, *_args):
+            return ["not", "an", "object"]
+
+        def log_error(self, _message):
+            return None
+
+    class FallbackClient:
+        configured = True
+        profile = {"id": 2, "name": "备用模型"}
+        model = "fallback-vision"
+
+        def complete_json_with_image(self, *_args):
+            return {
+                "page_type": "search_results",
+                "candidate_jobs": [],
+                "confidence": 0.8,
+                "uncertainties": [],
+            }
+
+        def log_error(self, _message):
+            return None
+
+    primary = InvalidJsonClient()
+    fallback = FallbackClient()
+    monkeypatch.setattr(main, "client_for_task", lambda task_type: {"agent_chat": fallback, "control_intent": None}.get(task_type))
+    monkeypatch.setattr(
+        main,
+        "capture_controlled_edge_visual_page",
+        lambda _mode, **_kwargs: {"image_data_url": "data:image/jpeg;base64,dGVzdA==", "metadata": {"platform": "Boss 直聘", "image_persisted": False}},
+    )
+    monkeypatch.setattr(main, "control_history_for_model", lambda: [])
+
+    result = main.run_visual_page_review("viewport", "复核页面", client_override=primary)
+
+    assert result["status"] == "已完成"
+    assert result["model_profile"] == "备用模型"
+    assert [item["status"] for item in result["visual_attempts"]] == ["失败", "已完成"]
+
+
 def test_visual_review_records_all_failed_model_attempts_once(monkeypatch):
     from app import main
 
@@ -221,6 +268,47 @@ def test_visual_review_records_all_failed_model_attempts_once(monkeypatch):
     assert [item["status"] for item in result["visual_attempts"]] == ["失败", "失败"]
     assert primary.logged == ["The read operation timed out"]
     assert fallback.logged == ["upstream unavailable"]
+
+
+def test_visual_review_does_not_fallback_for_a_non_timeout_primary_failure(monkeypatch):
+    from app import main
+
+    class PrimaryClient:
+        configured = True
+        profile = {"id": 1, "name": "主模型"}
+        model = "primary-vision"
+
+        def complete_json_with_image(self, *_args):
+            raise RuntimeError("HTTP 503: upstream unavailable")
+
+        def log_error(self, _message):
+            return None
+
+    class FallbackClient:
+        configured = True
+        profile = {"id": 2, "name": "备用模型"}
+        model = "fallback-vision"
+
+        def complete_json_with_image(self, *_args):
+            raise AssertionError("非超时错误不应触发备用视觉模型")
+
+        def log_error(self, _message):
+            return None
+
+    primary = PrimaryClient()
+    fallback = FallbackClient()
+    monkeypatch.setattr(main, "client_for_task", lambda task_type: {"agent_chat": fallback, "control_intent": None}.get(task_type))
+    monkeypatch.setattr(
+        main,
+        "capture_controlled_edge_visual_page",
+        lambda _mode, **_kwargs: {"image_data_url": "data:image/jpeg;base64,dGVzdA==", "metadata": {"platform": "Boss 直聘", "image_persisted": False}},
+    )
+    monkeypatch.setattr(main, "control_history_for_model", lambda: [])
+
+    result = main.run_visual_page_review("viewport", "复核页面", client_override=primary)
+
+    assert result["status"] == "失败"
+    assert [item["model_profile"] for item in result["visual_attempts"]] == ["主模型"]
 
 
 def test_visual_reconciliation_only_enriches_a_unique_dom_candidate_and_screens_senior_experience():
@@ -461,7 +549,7 @@ def test_visual_detail_fallback_is_used_for_short_dom_text_but_not_login(tmp_pat
     monkeypatch.setattr(
         main,
         "run_visual_job_detail_fallback",
-        lambda url, candidate: fallback_calls.append((url, candidate["title"])) or {
+        lambda url, candidate, **_kwargs: fallback_calls.append((url, candidate["title"])) or {
             "status": "已完成",
             "fetched": main.FetchResult(
                 url=url,

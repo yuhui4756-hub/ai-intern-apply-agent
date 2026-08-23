@@ -79,6 +79,7 @@ from .services.job_searcher import (
     SearchResult,
     capture_current_search_page,
     close_controlled_edge_target,
+    close_owned_search_target,
     controlled_job_snapshot_expression,
     controlled_edge_status,
     create_controlled_edge_target,
@@ -1771,6 +1772,7 @@ def import_discovery_candidate(
     candidate_id: int,
     resume_id: int | None,
     matching_preferences: dict[str, Any] | None = None,
+    visual_client_override: OpenAICompatibleClient | None = None,
 ) -> dict[str, Any]:
     with connect() as conn:
         row = conn.execute("SELECT * FROM job_candidates WHERE id = ?", (candidate_id,)).fetchone()
@@ -1782,7 +1784,7 @@ def import_discovery_candidate(
         return {"candidate_id": candidate_id, "status": "已存在", "job_id": int(candidate["job_id"]), "note": "候选岗位已有关联分析。"}
 
     try:
-        fetched, detail_metadata = fetch_discovery_candidate_detail(candidate)
+        fetched, detail_metadata = fetch_discovery_candidate_detail(candidate, visual_client_override=visual_client_override)
     except Exception as exc:
         note = str(exc)[:500]
         with connect() as conn:
@@ -1875,6 +1877,7 @@ def run_controlled_job_discovery(filters: dict[str, Any] | None = None) -> dict[
     visual_review_errors: list[str] = []
     seen_urls: set[str] = set()
     for item in plan:
+        result: SearchResult | None = None
         try:
             result = search_jobs_in_controlled_edge(
                 item["platform"],
@@ -1911,6 +1914,9 @@ def run_controlled_job_discovery(filters: dict[str, Any] | None = None) -> dict[
             search_errors.append(note)
             run_ids.append(run_id)
             continue
+        finally:
+            if result and result.owned_target:
+                close_owned_search_target(result)
 
         run_ids.append(run_id)
         with connect() as conn:
@@ -2053,6 +2059,7 @@ def create_controlled_job_discovery_task(
     *,
     replay_of_task_id: int | None = None,
     replay_plan: list[dict[str, str]] | None = None,
+    visual_model_profile_id: int | None = None,
 ) -> int:
     now = utc_now()
     with connect() as conn:
@@ -2060,6 +2067,10 @@ def create_controlled_job_discovery_task(
         profile_data = {key: profile[key] for key in profile.keys()} if profile else {}
         effective_filters = discovery_filters_from_profile(profile_data, filters)
         generated_plan, resume_id = controlled_job_discovery_plan(conn, filters=filters)
+        if visual_model_profile_id is not None:
+            model_profile = conn.execute("SELECT id FROM model_profiles WHERE id = ?", (visual_model_profile_id,)).fetchone()
+            if not model_profile:
+                raise ValueError("选择的视觉模型档案不存在。")
         plan = replay_plan if replay_plan is not None else generated_plan
         normalized_plan = [
             {
@@ -2076,8 +2087,8 @@ def create_controlled_job_discovery_task(
             """
             INSERT INTO job_discovery_tasks (
                 replay_of_task_id, status, current_phase, filters_json, plan_json, resume_id,
-                created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                visual_model_profile_id, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 replay_of_task_id,
@@ -2086,6 +2097,7 @@ def create_controlled_job_discovery_task(
                 dumps(effective_filters),
                 dumps(normalized_plan),
                 resume_id,
+                visual_model_profile_id,
                 now,
                 now,
             ),
@@ -2119,11 +2131,25 @@ def create_controlled_job_discovery_task(
                 "replay_of_task_id": replay_of_task_id,
                 "search_page_count": len(normalized_plan),
                 "detail_import_limit": JOB_DISCOVERY_IMPORT_LIMIT,
+                "visual_model_profile_id": visual_model_profile_id,
                 "auto_apply": False,
                 "auto_message": False,
             },
         )
     return task_id
+
+
+def discovery_task_visual_client(task: dict[str, Any]) -> OpenAICompatibleClient | None:
+    profile_id = task.get("visual_model_profile_id")
+    if not profile_id:
+        return None
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM model_profiles WHERE id = ?", (int(profile_id),)).fetchone()
+    if not row:
+        return None
+    profile = {key: row[key] for key in row.keys()}
+    client = OpenAICompatibleClient(profile, "agent_chat")
+    return client if client.configured else None
 
 
 def discovery_task_control_state(task_id: int) -> str:
@@ -2249,6 +2275,10 @@ def discovery_task_search_result(
     started = begin_discovery_task_step(int(step["id"]))
     if not started:
         return
+    task = discovery_task_row(task_id)
+    visual_client = discovery_task_visual_client(task) if task else None
+    result: SearchResult | None = None
+    owned_search_page_closed = False
     try:
         result = search_jobs_in_controlled_edge(
             str(step["platform"]),
@@ -2268,6 +2298,7 @@ def discovery_task_search_result(
                 expected_url=result.search_url,
                 platform=str(step["platform"]),
                 salary_targets=salary_targets,
+                client_override=visual_client,
             )
             if visual_result.get("status") == "已完成":
                 visual_review_count = 1
@@ -2281,6 +2312,7 @@ def discovery_task_search_result(
                 visual_review_failed = True
                 visual_review_error = compact_visual_review_text(visual_result.get("note"), 320)
         search_run_id = save_search_result(result, discovery_task_id=task_id)
+        owned_search_page_closed = close_owned_search_target(result)
         finish_discovery_task_step(
             int(step["id"]),
             DISCOVERY_STEP_COMPLETED,
@@ -2292,6 +2324,7 @@ def discovery_task_search_result(
                 "visual_reconciled_count": visual_reconciled_count,
                 "visual_review_failed": visual_review_failed,
                 "visual_review_error": visual_review_error,
+                "owned_search_page_closed": owned_search_page_closed,
             },
         )
     except Exception as exc:
@@ -2310,6 +2343,9 @@ def discovery_task_search_result(
             search_run_id=search_run_id,
             error_message=message,
         )
+    finally:
+        if result and result.owned_target:
+            close_owned_search_target(result)
     refresh_discovery_task_metrics(task_id, "搜索岗位")
 
 
@@ -2418,7 +2454,12 @@ def discovery_task_detail_result(task_id: int, step: dict[str, Any]) -> None:
     if not task:
         return
     candidate_id = int(started.get("candidate_id") or 0)
-    result = import_discovery_candidate(candidate_id, task.get("resume_id"), discovery_task_filters(task))
+    result = import_discovery_candidate(
+        candidate_id,
+        task.get("resume_id"),
+        discovery_task_filters(task),
+        visual_client_override=discovery_task_visual_client(task),
+    )
     result_status = str(result.get("status") or "")
     if result_status in {"已导入", "已存在"}:
         finish_discovery_task_step(
@@ -2713,6 +2754,7 @@ def replay_discovery_task(task_id: int) -> tuple[int | None, str]:
             discovery_task_filters(task),
             replay_of_task_id=task_id,
             replay_plan=discovery_task_plan(task),
+            visual_model_profile_id=int(task["visual_model_profile_id"]) if task.get("visual_model_profile_id") else None,
         )
     except ValueError as exc:
         return None, str(exc)
@@ -5772,6 +5814,23 @@ class VisualReviewError(ValueError):
         self.attempts = attempts
 
 
+def visual_fallback_allowed(error: Exception) -> bool:
+    """Only retry a visual request when the primary model timed out or broke its JSON contract."""
+    message = str(error or "").lower()
+    return any(
+        signal in message
+        for signal in (
+            "timed out",
+            "timeout",
+            "jsondecodeerror",
+            "json parse failed",
+            "invalid json",
+            "expecting value",
+            "extra data",
+        )
+    )
+
+
 def complete_visual_with_fallback(
     clients: list[OpenAICompatibleClient],
     system_prompt: str,
@@ -5779,12 +5838,14 @@ def complete_visual_with_fallback(
     image_data_url: str,
 ) -> tuple[dict[str, Any], OpenAICompatibleClient, list[dict[str, str]]]:
     attempts: list[dict[str, str]] = []
-    for client in clients[:2]:
+    for index, client in enumerate(clients[:2]):
         profile = getattr(client, "profile", {})
         profile_name = str(profile.get("name") or "") if isinstance(profile, dict) else ""
         model_name = str(getattr(client, "model", "") or "")
         try:
             response = client.complete_json_with_image(system_prompt, user_prompt, image_data_url)
+            if not isinstance(response, dict):
+                raise ValueError("Invalid JSON object from visual model.")
             attempts.append({"model_profile": profile_name, "model_name": model_name, "status": "已完成", "error": ""})
             return response, client, attempts
         except Exception as exc:
@@ -5792,6 +5853,9 @@ def complete_visual_with_fallback(
             if hasattr(client, "log_error"):
                 client.log_error(error)
             attempts.append({"model_profile": profile_name, "model_name": model_name, "status": "失败", "error": error})
+            if index == 0 and len(clients) > 1 and visual_fallback_allowed(exc):
+                continue
+            break
     errors = "；".join(
         f"{item['model_profile'] or item['model_name'] or '视觉模型'}：{item['error']}"
         for item in attempts
@@ -5931,9 +5995,14 @@ def normalize_visual_job_detail_review(value: object) -> dict[str, Any]:
     }
 
 
-def run_visual_job_detail_fallback(url: str, candidate: dict[str, Any]) -> dict[str, Any]:
+def run_visual_job_detail_fallback(
+    url: str,
+    candidate: dict[str, Any],
+    *,
+    client_override: OpenAICompatibleClient | None = None,
+) -> dict[str, Any]:
     """Recover a short/empty DOM JD through one temporary detail-page screenshot."""
-    clients = visual_review_clients()
+    clients = visual_review_clients(client_override)
     if not clients:
         return {
             "status": "未配置",
@@ -6036,14 +6105,18 @@ def run_visual_job_detail_fallback(url: str, candidate: dict[str, Any]) -> dict[
     }
 
 
-def fetch_discovery_candidate_detail(candidate: dict[str, Any]) -> tuple[FetchResult, dict[str, Any]]:
+def fetch_discovery_candidate_detail(
+    candidate: dict[str, Any],
+    *,
+    visual_client_override: OpenAICompatibleClient | None = None,
+) -> tuple[FetchResult, dict[str, Any]]:
     source_url = str(candidate.get("source_url") or "")
     try:
         return fetch_job_from_controlled_edge(source_url), {"visual_detail_fallback": False}
     except Exception as dom_error:
         if not visual_detail_fallback_allowed(dom_error):
             raise
-        visual_result = run_visual_job_detail_fallback(source_url, candidate)
+        visual_result = run_visual_job_detail_fallback(source_url, candidate, client_override=visual_client_override)
         fetched = visual_result.get("fetched")
         if visual_result.get("status") == "已完成" and isinstance(fetched, FetchResult):
             return fetched, {

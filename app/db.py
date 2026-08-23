@@ -178,6 +178,7 @@ def init_db() -> None:
                 filters_json TEXT NOT NULL DEFAULT '{}',
                 plan_json TEXT NOT NULL DEFAULT '[]',
                 resume_id INTEGER,
+                visual_model_profile_id INTEGER,
                 summary TEXT NOT NULL DEFAULT '',
                 error_message TEXT NOT NULL DEFAULT '',
                 candidate_count INTEGER NOT NULL DEFAULT 0,
@@ -190,7 +191,8 @@ def init_db() -> None:
                 updated_at TEXT NOT NULL,
                 finished_at TEXT NOT NULL DEFAULT '',
                 FOREIGN KEY(replay_of_task_id) REFERENCES job_discovery_tasks(id) ON DELETE SET NULL,
-                FOREIGN KEY(resume_id) REFERENCES resume_versions(id) ON DELETE SET NULL
+                FOREIGN KEY(resume_id) REFERENCES resume_versions(id) ON DELETE SET NULL,
+                FOREIGN KEY(visual_model_profile_id) REFERENCES model_profiles(id) ON DELETE SET NULL
             );
 
             CREATE TABLE IF NOT EXISTS job_discovery_task_steps (
@@ -537,6 +539,10 @@ def ensure_columns(conn: sqlite3.Connection) -> None:
     search_run_columns = table_column_names(conn, "job_search_runs")
     if "discovery_task_id" not in search_run_columns:
         conn.execute("ALTER TABLE job_search_runs ADD COLUMN discovery_task_id INTEGER")
+
+    discovery_task_columns = table_column_names(conn, "job_discovery_tasks")
+    if "visual_model_profile_id" not in discovery_task_columns:
+        conn.execute("ALTER TABLE job_discovery_tasks ADD COLUMN visual_model_profile_id INTEGER")
 
     application_columns = table_column_names(conn, "application_preparations")
     if "application_message" not in application_columns:

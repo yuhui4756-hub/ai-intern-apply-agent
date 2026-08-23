@@ -427,7 +427,13 @@ async def execute_tool(
             if minimum is not None and not 0 <= minimum <= 10000:
                 raise ValueError("最低日薪范围无效。")
             filters = {"role": role, "city": city, "min_salary_per_day": minimum}
-            task_id = await asyncio.to_thread(app_main.create_controlled_job_discovery_task, filters)
+            profile = getattr(selected_client, "profile", {})
+            visual_model_profile_id = profile.get("id") if isinstance(profile, dict) else None
+            task_id = await asyncio.to_thread(
+                app_main.create_controlled_job_discovery_task,
+                filters,
+                visual_model_profile_id=visual_model_profile_id,
+            )
             app_main.schedule_discovery_task(task_id)
             result = {"status": "已启动", "task_id": task_id, "task_url": f"/job-discovery/tasks/{task_id}", "filters": filters}
         elif name == "inspect_current_page":

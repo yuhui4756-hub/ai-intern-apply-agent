@@ -4,6 +4,7 @@ from app.services import job_searcher
 from app.services.job_searcher import (
     build_search_url,
     capture_current_search_page,
+    close_owned_search_target,
     controlled_edge_status,
     extract_candidates_from_anchors,
     fetch_job_from_controlled_edge,
@@ -11,6 +12,7 @@ from app.services.job_searcher import (
     is_recruitment_interstitial_url,
     open_manual_search_in_edge,
     pick_search_page,
+    search_jobs_in_controlled_edge,
 )
 
 
@@ -273,6 +275,43 @@ def test_fetch_controlled_edge_closes_only_created_detail_target(monkeypatch):
 
     assert result.fetch_mode == "controlled_edge"
     assert closed_targets == [target]
+
+
+def test_automatic_search_keeps_its_owned_target_until_the_task_closes_it(monkeypatch):
+    target = {
+        "id": "automatic-search",
+        "type": "page",
+        "url": "https://www.zhipin.com/web/geek/job?query=AI+Agent",
+        "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/automatic-search",
+    }
+    closed_targets = []
+    snapshot = {
+        "url": "https://www.zhipin.com/web/geek/jobs?query=AI+Agent",
+        "anchors": [
+            {
+                "href": "https://www.zhipin.com/job_detail/automatic-1.html",
+                "text": "AI Agent 开发实习生",
+                "context": "AI Agent 开发实习生\n自动化验证科技\n杭州\n200-250元/天",
+            }
+        ],
+    }
+
+    monkeypatch.setattr(job_searcher, "_ensure_controlled_edge_started", lambda: None)
+    monkeypatch.setattr(job_searcher, "create_controlled_edge_target", lambda _url: target)
+    monkeypatch.setattr(job_searcher, "wait_for_debug_endpoint", lambda **_kwargs: True)
+    monkeypatch.setattr(job_searcher, "wait_for_cdp_document_ready", lambda _target: None)
+    monkeypatch.setattr(job_searcher, "evaluate_cdp_expression", lambda *_args, **_kwargs: snapshot)
+    monkeypatch.setattr(job_searcher, "close_controlled_edge_target", lambda value: closed_targets.append(value) or True)
+    monkeypatch.setattr(job_searcher.time, "sleep", lambda _seconds: None)
+
+    result = search_jobs_in_controlled_edge("Boss 直聘", "AI Agent", "杭州")
+
+    assert result.owned_target == target
+    assert closed_targets == []
+    assert result.candidates[0].company == "自动化验证科技"
+    assert close_owned_search_target(result) is True
+    assert closed_targets == [target]
+    assert result.owned_target is None
 
 
 def test_open_manual_search_opens_target_after_controlled_edge_starts(tmp_path, monkeypatch):

@@ -60,7 +60,10 @@ def test_discovery_task_persists_steps_and_keeps_outbound_actions_disabled(tmp_p
     monkeypatch.setattr(main, "search_jobs_in_controlled_edge", fake_search)
     monkeypatch.setattr(main, "fetch_job_from_controlled_edge", _detail)
 
-    task_id = main.create_controlled_job_discovery_task({"role": "AI 应用开发实习", "city": "杭州"})
+    task_id = main.create_controlled_job_discovery_task(
+        {"role": "AI 应用开发实习", "city": "杭州"},
+        visual_model_profile_id=1,
+    )
     result = main.execute_controlled_job_discovery_task(task_id)
 
     assert result["status"] == "完成"
@@ -75,6 +78,7 @@ def test_discovery_task_persists_steps_and_keeps_outbound_actions_disabled(tmp_p
         drafts = conn.execute("SELECT COUNT(*) AS count FROM message_drafts").fetchone()["count"]
         preparations = conn.execute("SELECT COUNT(*) AS count FROM application_preparations").fetchone()["count"]
     assert task["status"] == "完成"
+    assert task["visual_model_profile_id"] == 1
     assert task["imported_count"] == 3
     assert [row["phase"] for row in steps] == ["搜索", "搜索", "搜索", "JD", "JD", "JD"]
     assert all(row["status"] == "完成" for row in steps)
@@ -138,6 +142,55 @@ def test_discovery_task_pause_cancel_and_resume_boundaries(tmp_path, monkeypatch
     assert cancelled_count == 2
 
 
+def test_discovery_task_reuses_its_saved_chat_model_for_visual_review(tmp_path, monkeypatch):
+    main = _prepare(tmp_path, monkeypatch)
+    from app.db import connect
+
+    monkeypatch.setenv("TEST_DISCOVERY_VISUAL_KEY", "test-key")
+    with connect() as conn:
+        conn.execute(
+            "UPDATE model_profiles SET base_url = ?, api_key_env = ?, model = ? WHERE id = 1",
+            ("https://example.com/v1", "TEST_DISCOVERY_VISUAL_KEY", "test-vision"),
+        )
+
+    task_id = main.create_controlled_job_discovery_task(
+        {"role": "AI 应用开发实习", "city": "杭州"},
+        visual_model_profile_id=1,
+    )
+    step = main.task_step_row(task_id, "搜索")
+    assert step is not None
+    review_clients = []
+    incomplete_result = SearchResult(
+        platform="Boss 直聘",
+        keyword="AI 应用开发实习",
+        city="杭州",
+        search_url="https://jobs.example.com/search/visual-profile",
+        browser_channel="msedge",
+        candidates=[
+            SearchCandidate(
+                title="AI 应用开发实习生",
+                company="",
+                city="杭州",
+                source_url="https://jobs.example.com/detail/visual-profile",
+                summary="Python",
+            )
+        ],
+    )
+
+    monkeypatch.setattr(main, "search_jobs_in_controlled_edge", lambda *_args, **_kwargs: incomplete_result)
+    monkeypatch.setattr(
+        main,
+        "run_visual_page_review",
+        lambda *_args, client_override=None, **_kwargs: review_clients.append(client_override) or {"status": "未配置"},
+    )
+
+    main.discovery_task_search_result(task_id, step)
+
+    assert len(review_clients) == 1
+    assert review_clients[0].profile["id"] == 1
+    assert review_clients[0].model == "test-vision"
+
+
 def test_discovery_task_retries_failed_search_and_replays_into_new_task(tmp_path, monkeypatch):
     main = _prepare(tmp_path, monkeypatch)
     from app.db import connect
@@ -152,7 +205,10 @@ def test_discovery_task_retries_failed_search_and_replays_into_new_task(tmp_path
 
     monkeypatch.setattr(main, "search_jobs_in_controlled_edge", flaky_search)
     monkeypatch.setattr(main, "fetch_job_from_controlled_edge", _detail)
-    task_id = main.create_controlled_job_discovery_task({"role": "AI 应用开发实习", "city": "北京"})
+    task_id = main.create_controlled_job_discovery_task(
+        {"role": "AI 应用开发实习", "city": "北京"},
+        visual_model_profile_id=1,
+    )
     first = main.execute_controlled_job_discovery_task(task_id)
     assert first["status"] == "部分完成"
 
@@ -167,7 +223,10 @@ def test_discovery_task_retries_failed_search_and_replays_into_new_task(tmp_path
     assert replay_id and replay_id != task_id
     assert "完整回放" in message
     with connect() as conn:
-        replay = conn.execute("SELECT replay_of_task_id, status FROM job_discovery_tasks WHERE id = ?", (replay_id,)).fetchone()
+        replay = conn.execute(
+            "SELECT replay_of_task_id, status, visual_model_profile_id FROM job_discovery_tasks WHERE id = ?",
+            (replay_id,),
+        ).fetchone()
         original_steps = conn.execute(
             "SELECT COUNT(*) AS count FROM job_discovery_task_steps WHERE discovery_task_id = ?", (task_id,)
         ).fetchone()["count"]
@@ -176,6 +235,7 @@ def test_discovery_task_retries_failed_search_and_replays_into_new_task(tmp_path
         ).fetchone()["count"]
     assert replay["replay_of_task_id"] == task_id
     assert replay["status"] == "待执行"
+    assert replay["visual_model_profile_id"] == 1
     assert original_steps == 6
     assert replay_steps == main.JOB_DISCOVERY_SEARCH_PAGE_LIMIT
 

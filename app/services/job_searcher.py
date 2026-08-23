@@ -63,6 +63,7 @@ class SearchResult:
     candidates: list[SearchCandidate]
     note: str = ""
     retry_count: int = 0
+    owned_target: dict | None = None
 
 
 def build_search_url(platform: str, keyword: str, city: str = "") -> str:
@@ -141,14 +142,19 @@ def search_jobs_with_browser(
 
 def open_manual_search_in_edge(platform: str, keyword: str, city: str = "") -> str:
     search_url = ensure_public_http_url(build_search_url(platform, keyword, city))
+    _ensure_controlled_edge_started()
+    if not open_url_in_debug_browser(search_url):
+        raise ValueError("无法在受控 Edge 中打开搜索页，请确认 9222 调试端口仍可用。")
+    return search_url
+
+
+def _ensure_controlled_edge_started() -> None:
     edge_path = find_edge_executable()
     if not edge_path:
         raise ValueError("未找到 Microsoft Edge。")
 
     if is_debug_endpoint_ready():
-        if not open_url_in_debug_browser(search_url):
-            raise ValueError("无法在受控 Edge 中打开搜索页，请确认 9222 调试端口仍可用。")
-        return search_url
+        return
 
     user_data_dir = browser_profile_dir("manual-msedge")
     user_data_dir.mkdir(parents=True, exist_ok=True)
@@ -169,9 +175,13 @@ def open_manual_search_in_edge(platform: str, keyword: str, city: str = "") -> s
     )
     if not wait_for_debug_endpoint():
         raise ValueError("Edge 已尝试打开，但 9222 调试端口没有响应。请关闭刚打开的专用 Edge 窗口后再试。")
-    if not open_url_in_debug_browser(search_url):
-        raise ValueError("受控 Edge 已启动，但无法打开搜索页。请稍后重试。")
-    return search_url
+
+
+def open_owned_search_target(platform: str, keyword: str, city: str = "") -> tuple[str, dict]:
+    """Create a search page owned by an automatic task, never a user-opened page."""
+    search_url = ensure_public_http_url(build_search_url(platform, keyword, city))
+    _ensure_controlled_edge_started()
+    return search_url, create_controlled_edge_target(search_url)
 
 
 def capture_current_search_page(
@@ -238,22 +248,63 @@ def _capture_current_search_page_once(platform: str, expected_url: str) -> tuple
     return final_url, [anchor for anchor in anchors if isinstance(anchor, dict)]
 
 
+def _capture_owned_search_target_once(platform: str, target: dict) -> tuple[str, list[dict]]:
+    if not wait_for_debug_endpoint(timeout_seconds=3):
+        raise ValueError("没有检测到应用打开的 Edge 调试窗口。")
+    wait_for_cdp_document_ready(target)
+    time.sleep(1.0)
+    snapshot = evaluate_cdp_expression(target, controlled_search_snapshot_expression())
+    if not isinstance(snapshot, dict):
+        raise ValueError("受控 Edge 搜索页没有返回可读取的页面内容。")
+    final_url = ensure_public_http_url(str(snapshot.get("url") or target_url(target)))
+    if is_recruitment_interstitial_url(final_url):
+        platform_label = platform or "招聘平台"
+        raise ValueError(f"{platform_label} 已跳转到登录或安全验证页，请在受控 Edge 完成验证后重新执行搜索。")
+    anchors = snapshot.get("anchors")
+    if not isinstance(anchors, list):
+        raise ValueError("受控 Edge 搜索页没有返回岗位链接。")
+    return final_url, [anchor for anchor in anchors if isinstance(anchor, dict)]
+
+
 def search_jobs_in_controlled_edge(
     platform: str,
     keyword: str,
     city: str = "",
     limit: int = 30,
 ) -> SearchResult:
-    """Open a search in the shared controlled Edge profile and capture its current results."""
-    search_url = open_manual_search_in_edge(platform, keyword, city)
-    return capture_current_search_page(
-        platform,
-        keyword,
-        city,
-        browser_channel="msedge",
-        limit=limit,
-        expected_url=search_url,
-    )
+    """Create and read one automatic-task search target without touching user-opened pages."""
+    target: dict | None = None
+    try:
+        _search_url, target = open_owned_search_target(platform, keyword, city)
+        (final_url, anchors), retry_count = retry_controlled_edge_read(
+            lambda: _capture_owned_search_target_once(platform, target)
+        )
+        candidates = extract_candidates_from_anchors(anchors, platform, city, final_url, limit=limit)
+        note = "" if candidates else "没有从当前页面识别到岗位候选，可能需要登录、调整筛选条件或手动打开搜索结果。"
+        if retry_count:
+            note = append_controlled_edge_retry_note(note, retry_count)
+        return SearchResult(
+            platform=platform,
+            keyword=keyword,
+            city=city,
+            search_url=final_url,
+            browser_channel="msedge",
+            candidates=candidates,
+            note=note,
+            retry_count=retry_count,
+            owned_target=target,
+        )
+    except Exception:
+        if target:
+            close_controlled_edge_target(target)
+        raise
+
+
+def close_owned_search_target(result: SearchResult) -> bool:
+    """Close only the target created for an automatic discovery search."""
+    target = result.owned_target
+    result.owned_target = None
+    return close_controlled_edge_target(target) if isinstance(target, dict) else False
 
 
 def fetch_job_from_controlled_edge(url: str) -> FetchResult:

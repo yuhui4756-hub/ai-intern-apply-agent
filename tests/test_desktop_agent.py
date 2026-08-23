@@ -130,6 +130,62 @@ def test_desktop_agent_discards_unlisted_tool_and_never_submits(tmp_path, monkey
     assert preparation_count == 0
 
 
+def test_desktop_search_task_uses_the_chat_selected_model_for_visual_work(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "desktop-agent-visual-profile.sqlite3"))
+    from app import main
+    from app.db import init_db
+    from app.services import desktop_agent
+
+    init_db()
+    created = []
+
+    class FakeClient:
+        configured = True
+        profile = {"id": 1, "name": "聊天选择模型"}
+        model = "chat-selected-vision"
+
+        def __init__(self):
+            self.calls = 0
+
+        def complete_json(self, _messages):
+            self.calls += 1
+            if self.calls == 1:
+                return {
+                    "plan": "启动受控岗位发现任务。",
+                    "tool_calls": [{"name": "search_jobs", "arguments": {"role": "AI 应用开发实习", "city": "杭州"}}],
+                    "response": "",
+                    "task_summary": "已启动岗位发现。",
+                }
+            return {
+                "plan": "岗位发现任务已创建。",
+                "tool_calls": [],
+                "response": "已按当前模型启动岗位发现。",
+                "task_summary": "已启动岗位发现。",
+            }
+
+    fake_client = FakeClient()
+    monkeypatch.setattr(desktop_agent, "load_client", lambda _profile_id: (fake_client, fake_client.profile))
+    monkeypatch.setattr(
+        main,
+        "create_controlled_job_discovery_task",
+        lambda filters, *, visual_model_profile_id=None: created.append((filters, visual_model_profile_id)) or 77,
+    )
+    monkeypatch.setattr(main, "schedule_discovery_task", lambda _task_id: True)
+    monkeypatch.setattr(main, "controlled_edge_status", lambda: {"status": "未连接"})
+    monkeypatch.setattr(main, "communication_policy", lambda: {"mode": "draft"})
+    monkeypatch.setattr(main, "automation_control", lambda: {"status_label": "运行中"})
+    client = TestClient(main.app)
+    session_id = client.get("/api/agent/bootstrap").json()["conversation"]["session"]["id"]
+
+    response = client.post(
+        f"/api/agent/sessions/{session_id}/messages",
+        json={"message": "找杭州 AI 应用开发实习", "model_profile_id": 1},
+    )
+
+    assert response.status_code == 200
+    assert created == [({"role": "AI 应用开发实习", "city": "杭州", "min_salary_per_day": None}, 1)]
+
+
 def test_desktop_auto_toggle_authorizes_only_current_session_without_enabling_patrol(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "desktop-agent-auto-toggle.sqlite3"))
     from app import main
