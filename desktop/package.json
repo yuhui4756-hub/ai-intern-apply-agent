@@ -1,7 +1,7 @@
 {
   "name": "job-agent-desktop",
   "productName": "求职agent",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "本地聊天优先的 AI 实习求职 Agent",
   "author": "yuhui4756-hub",
   "main": "main.cjs",
