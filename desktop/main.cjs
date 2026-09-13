@@ -6,6 +6,7 @@ const net = require("net");
 const path = require("path");
 
 const REQUESTED_PORT = Number(process.env.JOB_AGENT_PORT || 0);
+const STARTUP_TIMEOUT_MS = 15_000;
 let port = 0;
 let backend = null;
 let mainWindow = null;
@@ -69,8 +70,9 @@ function htmlEscape(value) {
   })[character]);
 }
 
-function waitForBackend(retries = 300) {
+function waitForBackend(timeoutMs = STARTUP_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
+    const startedAt = Date.now();
     const attempt = (remaining) => {
       if (backend && backend.exitCode !== null) {
         reject(new Error("本地后端进程已提前退出。"));
@@ -78,14 +80,16 @@ function waitForBackend(retries = 300) {
       }
       const request = http.get(`http://127.0.0.1:${port}/agent`, (response) => {
         response.resume();
-        if (response.statusCode === 200) resolve();
-        else if (remaining > 0) setTimeout(() => attempt(remaining - 1), 150);
-        else reject(new Error("本地求职agent服务未能启动。"));
+        if (response.statusCode === 200) resolve(Date.now() - startedAt);
+        else if (Date.now() < startedAt + timeoutMs) setTimeout(attempt, 120);
+        else reject(new Error(`本地求职agent服务在 ${Math.ceil(timeoutMs / 1000)} 秒内未能启动。`));
       });
-      request.on("error", () => remaining > 0 ? setTimeout(() => attempt(remaining - 1), 150) : reject(new Error("本地求职agent服务未能启动。")));
+      request.on("error", () => Date.now() < startedAt + timeoutMs
+        ? setTimeout(attempt, 120)
+        : reject(new Error(`本地求职agent服务在 ${Math.ceil(timeoutMs / 1000)} 秒内未能启动。`)));
       request.setTimeout(500, () => request.destroy());
     };
-    attempt(retries);
+    attempt();
   });
 }
 
@@ -111,7 +115,7 @@ function loadingPage() {
   return "data:text/html;charset=utf-8," + encodeURIComponent(`
     <!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>求职agent</title>
     <style>body{margin:0;background:#f4f5f6;color:#1b2730;font-family:'Microsoft YaHei',sans-serif;display:grid;place-items:center;height:100vh}.panel{width:440px;padding:36px 40px;background:#fff;border:1px solid #dce5e7}.title{font-size:28px;font-weight:700;color:#167f84}.note{margin-top:16px;line-height:1.8;color:#52616a}</style>
-    </head><body><main class="panel"><div class="title">求职agent</div><div class="note">正在启动本地服务并读取你的本机资料。首次启动可能需要几十秒，请勿重复打开。</div></main></body></html>
+    </head><body><main class="panel"><div class="title">求职agent</div><div class="note">正在启动本地服务并读取你的本机资料，通常只需几秒。请勿重复打开。</div></main></body></html>
   `);
 }
 
@@ -131,7 +135,8 @@ app.whenReady().then(async () => {
   port = await choosePort();
   const logFile = startBackend();
   try {
-    await waitForBackend();
+    const startupMs = await waitForBackend();
+    fs.appendFileSync(logFile, `backend ready in ${startupMs}ms on port ${port}\n`);
     await mainWindow.loadURL(`http://127.0.0.1:${port}/agent`);
   } catch (error) {
     await mainWindow.loadURL(errorPage(error, logFile));

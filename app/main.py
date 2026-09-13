@@ -2131,6 +2131,7 @@ def create_controlled_job_discovery_task(
                 "replay_of_task_id": replay_of_task_id,
                 "search_page_count": len(normalized_plan),
                 "detail_import_limit": JOB_DISCOVERY_IMPORT_LIMIT,
+                "orchestrator": "langgraph",
                 "visual_model_profile_id": visual_model_profile_id,
                 "auto_apply": False,
                 "auto_message": False,
@@ -2588,23 +2589,25 @@ def execute_controlled_job_discovery_task(task_id: int) -> dict[str, Any]:
             (DISCOVERY_TASK_RUNNING, "搜索岗位", utc_now(), utc_now(), task_id),
         )
 
-    while True:
-        stopped = task_pause_or_cancelled(task_id)
-        if stopped:
-            return stopped
-        search_step = task_step_row(task_id, "搜索")
-        if search_step:
-            discovery_task_search_result(task_id, search_step)
-            continue
-        ensure_discovery_task_detail_steps(task_id)
-        stopped = task_pause_or_cancelled(task_id)
-        if stopped:
-            return stopped
-        detail_step = task_step_row(task_id, "JD")
-        if detail_step:
-            discovery_task_detail_result(task_id, detail_step)
-            continue
-        return finish_discovery_task(task_id)
+    # Import lazily so the desktop sidecar does not pay LangGraph's import cost at startup.
+    from .services.job_discovery_graph import DiscoveryTaskOperations, run_job_discovery_graph
+
+    state = run_job_discovery_graph(
+        task_id,
+        DiscoveryTaskOperations(
+            check_control=task_pause_or_cancelled,
+            next_search_step=lambda current_task_id: task_step_row(current_task_id, "搜索"),
+            run_search_step=discovery_task_search_result,
+            ensure_detail_steps=ensure_discovery_task_detail_steps,
+            next_detail_step=lambda current_task_id: task_step_row(current_task_id, "JD"),
+            run_detail_step=discovery_task_detail_result,
+            finish_task=finish_discovery_task,
+        ),
+    )
+    result = state.get("result")
+    if isinstance(result, dict):
+        return result
+    return finish_discovery_task(task_id)
 
 
 def mark_discovery_task_worker_failure(task_id: int, error: Exception) -> None:
