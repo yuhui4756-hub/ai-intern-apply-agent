@@ -254,6 +254,7 @@ def action_type_label(value: str) -> str:
         "communication_autonomous_send": "自主沟通发送",
         "communication_autonomous_executor": "自主沟通执行",
         "workflow_control": "求职流程控制",
+        "desktop_agent_session": "Agent 会话管理",
         "job_discovery": "岗位发现",
         "job_discovery_task": "岗位发现任务",
         "job_discovery_task_control": "岗位发现任务控制",
@@ -7572,6 +7573,36 @@ def desktop_agent_get_session(session_id: int) -> JSONResponse:
     except ValueError as exc:
         return api_error(str(exc), 404)
     return JSONResponse({"ok": True, "conversation": conversation})
+
+
+@app.delete("/api/agent/sessions/{session_id}")
+def desktop_agent_delete_session(session_id: int) -> JSONResponse:
+    if not desktop_agent.delete_session(session_id):
+        return api_error("没有找到 Agent 任务会话。", 404)
+    sessions = desktop_agent.list_sessions()
+    if sessions:
+        fallback = desktop_agent.conversation_payload(int(sessions[0]["id"]))
+    else:
+        created = desktop_agent.create_session()
+        fallback = desktop_agent.conversation_payload(int(created["id"]))
+        sessions = desktop_agent.list_sessions()
+    with connect() as conn:
+        log_agent_action(
+            conn,
+            action_type="desktop_agent_session",
+            status="已删除",
+            summary="用户删除了一条本地 Agent 会话及其聊天记录。",
+            decision={"session_id": session_id, "external_effect": False, "job_data_changed": False},
+        )
+    return JSONResponse(
+        {
+            "ok": True,
+            "deleted_session_id": session_id,
+            "sessions": sessions,
+            "conversation": fallback,
+            "canvas": desktop_agent.canvas_items(),
+        }
+    )
 
 
 @app.post("/api/agent/sessions/{session_id}/messages")

@@ -684,9 +684,13 @@ code {
 .agent-wordmark { padding: 4px 10px 18px; font-size: 22px; font-weight: 700; }
 .agent-sidebar-label { margin: 20px 10px 7px; color: #6c7077; font-size: 12px; }
 .agent-nav-button, .agent-session { width: 100%; border: 0; border-radius: 6px; padding: 9px 10px; color: #34373b; background: transparent; text-align: left; cursor: pointer; font: inherit; }
-.agent-nav-button:hover, .agent-session:hover, .agent-session.active { background: #e3e5e8; }
+.agent-nav-button:hover, .agent-session:hover { background: #e3e5e8; }
+.agent-nav-button.active { color: #173e32; background: #dcece5; box-shadow: inset 3px 0 #2d6a56; font-weight: 650; }
 .agent-nav-button.primary { color: #ffffff; background: #2d6a56; }.agent-nav-button.primary:hover { background: #205341; }
-.agent-nav-button.compact { border: 1px solid #d5d8dc; }.agent-session-list { display: grid; gap: 2px; overflow-y: auto; }
+.agent-nav-button.compact { border: 1px solid #d5d8dc; }.agent-session-list { display: grid; gap: 4px; overflow-y: auto; }
+.agent-session-row { display: grid; grid-template-columns: minmax(0, 1fr) 30px; align-items: stretch; border-radius: 6px; }.agent-session-row:hover { background: #e3e5e8; }
+.agent-session { min-width: 0; }.agent-session-row.active { color: #173e32; background: #dcece5; box-shadow: inset 3px 0 #2d6a56; }.agent-session-row.active .agent-session { color: #173e32; }.agent-session-row.active .agent-session strong { font-weight: 700; }.agent-session-row.active .agent-session span { color: #416156; }
+.agent-session-delete { align-self: center; width: 26px; height: 26px; margin-right: 3px; border: 0; border-radius: 5px; color: #6a7076; background: transparent; cursor: pointer; font-size: 19px; line-height: 1; opacity: .72; }.agent-session-delete:hover, .agent-session-delete:focus-visible { color: #9b3030; background: #f8dddd; opacity: 1; outline: none; }
 .agent-session strong, .agent-session span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.agent-session strong { font-size: 13px; font-weight: 600; }.agent-session span { margin-top: 4px; color: #767b82; font-size: 12px; }.agent-sidebar-footer { display: grid; gap: 7px; margin-top: auto; }
 .agent-main { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; min-width: 0; background: #ffffff; }
 .agent-header { display: flex; align-items: center; justify-content: space-between; min-height: 74px; padding: 12px 24px; border-bottom: 1px solid #e2e3e5; }.agent-header h1 { margin: 0; font-size: 18px; font-weight: 650; }.agent-header p { max-width: 620px; margin: 5px 0 0; color: #73777c; font-size: 13px; }.agent-header-actions { display: flex; align-items: center; gap: 10px; }.agent-edge-status { color: #5d636a; font-size: 12px; white-space: nowrap; }

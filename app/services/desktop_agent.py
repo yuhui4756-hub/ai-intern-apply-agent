@@ -82,6 +82,13 @@ def create_session(title: str = "", model_profile_id: int | None = None) -> dict
     return get_session(session_id) or {"id": session_id, "title": "新任务"}
 
 
+def delete_session(session_id: int) -> bool:
+    """Remove one local task conversation and its dependent messages/tool records."""
+    with connect() as conn:
+        deleted = conn.execute("DELETE FROM agent_sessions WHERE id = ?", (session_id,))
+    return bool(deleted.rowcount)
+
+
 def list_sessions(limit: int = 30) -> list[dict[str, Any]]:
     with connect() as conn:
         rows = conn.execute(

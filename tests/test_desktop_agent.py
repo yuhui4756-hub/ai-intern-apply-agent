@@ -130,6 +130,44 @@ def test_desktop_agent_discards_unlisted_tool_and_never_submits(tmp_path, monkey
     assert preparation_count == 0
 
 
+def test_desktop_agent_deletes_only_the_selected_conversation_and_creates_a_fallback(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "desktop-agent-delete.sqlite3"))
+    from app import main
+    from app.db import connect, init_db, utc_now
+    from app.services import desktop_agent
+
+    init_db()
+    now = utc_now()
+    with connect() as conn:
+        job_id = conn.execute(
+            """
+            INSERT INTO job_postings (title, company, jd_text, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            ("AI 应用开发实习生", "保留岗位科技", "Python RAG", now, now),
+        ).lastrowid
+    session = desktop_agent.create_session("待删除会话")
+    session_id = int(session["id"])
+    message_id = desktop_agent.insert_message(session_id, "user", "测试消息", [])
+    desktop_agent.insert_tool_run(session_id, message_id, "list_jobs", "本地只读", "已完成", {}, {"status": "已完成"})
+    with connect() as conn:
+        conn.execute("UPDATE agent_sessions SET active_job_id = ? WHERE id = ?", (job_id, session_id))
+    client = TestClient(main.app)
+
+    response = client.delete(f"/api/agent/sessions/{session_id}")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["deleted_session_id"] == session_id
+    assert payload["conversation"]["session"]["id"] != session_id
+    assert all(item["id"] != session_id for item in payload["sessions"])
+    with connect() as conn:
+        assert conn.execute("SELECT COUNT(*) AS count FROM agent_sessions WHERE id = ?", (session_id,)).fetchone()["count"] == 0
+        assert conn.execute("SELECT COUNT(*) AS count FROM agent_messages WHERE session_id = ?", (session_id,)).fetchone()["count"] == 0
+        assert conn.execute("SELECT COUNT(*) AS count FROM agent_tool_runs WHERE session_id = ?", (session_id,)).fetchone()["count"] == 0
+        assert conn.execute("SELECT COUNT(*) AS count FROM job_postings WHERE id = ?", (job_id,)).fetchone()["count"] == 1
+
+
 def test_desktop_search_task_uses_the_chat_selected_model_for_visual_work(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "desktop-agent-visual-profile.sqlite3"))
     from app import main

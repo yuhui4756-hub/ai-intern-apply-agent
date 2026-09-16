@@ -10,6 +10,7 @@
     conversation: bootstrap.conversation || null,
     view: "chat",
     canvasFilter: "all",
+    pending: false,
   };
   const $ = (selector) => root.querySelector(selector);
   const transcript = $("[data-transcript]");
@@ -76,13 +77,26 @@
     sessionList.replaceChildren();
     const activeId = activeSession()?.id;
     state.sessions.forEach((session) => {
+      const row = document.createElement("div");
+      row.className = `agent-session-row ${session.id === activeId ? "active" : ""}`;
       const button = document.createElement("button");
       button.type = "button";
       button.className = `agent-session ${session.id === activeId ? "active" : ""}`;
       button.dataset.sessionId = session.id;
+      button.disabled = state.pending;
+      button.setAttribute("aria-current", session.id === activeId ? "page" : "false");
       text(button, "strong", session.title || "新任务");
       text(button, "span", session.summary || `${session.message_count || 0} 条消息`);
-      sessionList.appendChild(button);
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "agent-session-delete";
+      remove.dataset.deleteSessionId = session.id;
+      remove.disabled = state.pending;
+      remove.title = "删除此任务会话";
+      remove.setAttribute("aria-label", `删除任务会话：${session.title || "新任务"}`);
+      remove.textContent = "×";
+      row.append(button, remove);
+      sessionList.appendChild(row);
     });
   }
 
@@ -185,11 +199,18 @@
     });
   }
 
-  function render() { renderSessions(); renderModels(); renderTranscript(); renderContext(); renderCanvas(); }
+  function render() {
+    renderSessions(); renderModels(); renderTranscript(); renderContext(); renderCanvas();
+    root.querySelectorAll("[data-view-switch]").forEach((item) => item.classList.toggle("active", item.dataset.viewSwitch === state.view));
+    const newSession = root.querySelector("[data-new-session]");
+    if (newSession) newSession.disabled = state.pending;
+  }
 
   function setPending(pending) {
+    state.pending = pending;
     input.disabled = pending; send.disabled = pending;
     send.textContent = pending ? "执行中" : "发送";
+    root.querySelectorAll("[data-delete-session-id], [data-new-session], [data-session-id]").forEach((element) => { element.disabled = pending; });
   }
 
   async function request(url, options = {}) {
@@ -206,6 +227,22 @@
   }
 
   root.addEventListener("click", async (event) => {
+    if (state.pending && event.target.closest("[data-delete-session-id], [data-new-session], [data-session-id]")) return;
+    const removeSession = event.target.closest("[data-delete-session-id]");
+    if (removeSession) {
+      const sessionId = Number(removeSession.dataset.deleteSessionId);
+      const session = state.sessions.find((item) => item.id === sessionId);
+      if (!Number.isInteger(sessionId) || !window.confirm(`删除“${session?.title || "新任务"}”及其聊天记录？此操作不能撤销。`)) return;
+      try {
+        const payload = await request(`/api/agent/sessions/${sessionId}`, { method: "DELETE" });
+        const wasActive = activeSession()?.id === sessionId;
+        state.sessions = payload.sessions || [];
+        state.canvas = payload.canvas || state.canvas;
+        if (wasActive) state.conversation = payload.conversation;
+        render();
+      } catch (error) { window.alert(error.message || "删除会话失败。"); }
+      return;
+    }
     const sessionButton = event.target.closest("[data-session-id]");
     if (sessionButton) { await loadSession(sessionButton.dataset.sessionId); return; }
     const switcher = event.target.closest("[data-view-switch]");
