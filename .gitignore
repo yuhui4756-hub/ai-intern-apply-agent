@@ -22,9 +22,11 @@ exports/
 logs/
 .playwright-cli/
 output/playwright/
+artifacts/agent-quality-report.json
 dist/
 desktop/node_modules/
 desktop/release/
+job-agent-desktop/
 
 # Resume and interview private artifacts
 private/

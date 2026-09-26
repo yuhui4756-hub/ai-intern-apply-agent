@@ -2,7 +2,7 @@
 
 面向 AI 应用开发、Agent 开发和 AI 后端实习投递的本地网页 Agent。
 
-当前阶段：V0.8 受控岗位发现与自主沟通。
+当前阶段：V0.9 受控岗位发现、聊天式 Harness 与质量证据。
 
 桌面版：`desktop/` 提供 Electron Windows 壳，启动后默认进入聊天优先的“求职agent”工作台；岗位画布与原有手动工具仍可使用。开发版运行 `cd desktop; npm install; npm start`。打包前先执行 `./desktop/build_backend.ps1`，再在 `desktop/` 执行 `npm run dist`。安装包、桌面程序和本地用户资料严格分离，真实 `.env`、SQLite、简历和浏览器 profile 均不会进入 Git 或安装包。
 
@@ -14,7 +14,7 @@
 - 管理投递状态和跳过原因。
 - 在收到面试邀请后生成准备计划、题库和复盘材料。
 
-需求规格见 [docs/requirements.md](docs/requirements.md)，自动化路线见 [docs/agent_automation_plan.md](docs/agent_automation_plan.md)，浏览器扩展说明见 [docs/browser_extension.md](docs/browser_extension.md)，当前完成度见 [docs/status.md](docs/status.md)，工程取舍与简历素材见 [docs/resume_engineering_evidence.md](docs/resume_engineering_evidence.md)。
+需求规格见 [docs/requirements.md](docs/requirements.md)，自动化路线见 [docs/agent_automation_plan.md](docs/agent_automation_plan.md)，浏览器扩展说明见 [docs/browser_extension.md](docs/browser_extension.md)，当前完成度见 [docs/status.md](docs/status.md)，Agent 质量与证据见 [docs/agent_quality.md](docs/agent_quality.md)，工程取舍与简历素材见 [docs/resume_engineering_evidence.md](docs/resume_engineering_evidence.md)。
 
 ## Quick Start
 
@@ -38,6 +38,11 @@ API Key 可以在设置页直接填写；应用会保存到本地 `.env` 并立�
 ## Current Includes
 
 - 本地 SQLite 数据库。
+- 聊天式 Agent harness：模型只能输出 `agent-plan-v1` 中声明的计划和工具参数；Pydantic 会拒绝未知工具、未知字段和非法参数，并最多请求一次 JSON 修复。模型无法直接传入 URL、选择器、命令、SQL、文件路径或平台提交动作。
+- 信任边界：JD、网页、视觉摘要、工具观察和岗位记忆都只是不可信证据，不能改变工具白名单、人工确认或浏览器操作边界；相关提示注入样本纳入离线回归。
+- 离线质量评测：合成/脱敏的 JD 规则、对话分流和 Agent 契约案例可重复运行；固定样本通过不代表真实平台准确率。
+- 回合 trace：本地关联 Agent 消息、工具执行和 token/费用日志，不在模型调用日志中保存完整 prompt、JD、简历、截图或聊天正文。
+- 可检索岗位结论记忆：用户明确要求后才保存结构化评分、风险和补强结论；支持本地 FTS5/关键词检索、更新和删除，不保存 JD、简历、HR 聊天、截图或文件路径。若当前选择远程聊天模型，命中的结构化摘要会作为本轮上下文发送给该模型。
 - 候选人画像和多份简历版本管理，支持读取 DOCX、PDF、TXT、Markdown 简历文本。
 - 项目事实库：可编辑项目事实，并手动刷新具体 GitHub 仓库的 README、语言和最近提交。
 - JD 粘贴分析、岗位链接抓取导入、匹配评分、风险判断和一键复制话术。
@@ -96,6 +101,7 @@ API Key 可以在设置页直接填写；应用会保存到本地 `.env` 并立�
 11. 对已确认条目可点击“打开岗位页”和“只读演练”。演练只检查页面是否与岗位匹配、是否找到控件，为后续受控填写做准备。
 12. 面试结束后，在对应的“面试准备”详情上传本地录音，选择 `base` 或 `small` 后开始转写。`base` 是 CPU 上的默认推荐，速度和中文识别质量较均衡；首次使用某个模型会下载到 `private/whisper_models/`，后续直接复用。转写完成后会刷新本地准备计划和题库。
 13. 不再需要的录音可在同一页面删除。删除会移除本地音频、转写记录以及面试准备中的对应转写段，不会影响手动填写的薄弱点。
+14. 在桌面“求职agent”中，可说“记住当前岗位结论”保存本地结构化结论；说“查找之前记住的岗位结论”检索。右侧“岗位记忆”可删除任意条目。
 
 当前不会自动点击投递、上传简历、提交表单或绕过验证码。自主发送仅限于用户显式启动的受控沟通工作流，且只允许低风险“必投/可投递”岗位的岗位相关询问：每日最多 5 条、单平台最多 3 条、每个岗位最多按你设置的轮次发送。涉及简历附件、联系方式、面试安排、费用、报价或无法唯一定位聊天页/发送按钮时会停止。未匹配到岗位时也会转为人工处理。全局暂停打开后，对话采集、定时巡检和后续自动动作会跳过；手动 Edge 巡检仍可读取当前聊天页做只读差分。重复采集同一段对话会被差分层跳过，不再调用模型，并在“最近巡检”里记录为无新内容。
 
@@ -125,6 +131,7 @@ API Key 可以在设置页直接填写；应用会保存到本地 `.env` 并立�
 ```powershell
 .\.venv\Scripts\python -m pytest -q
 .\.venv\Scripts\python -m compileall app tests
+.\.venv\Scripts\python -m evals.run_agent_quality_eval --strict
 ```
 
 ## License

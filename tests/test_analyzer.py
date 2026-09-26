@@ -1,4 +1,4 @@
-from app.services.analyzer import daily_salary_bounds, clean_extracted, extract_salary, looks_like_salary_text, rule_extract_jd, score_job
+from app.services.analyzer import daily_salary_bounds, clean_extracted, extract_salary, find_skills, looks_like_salary_text, rule_extract_jd, score_job
 
 
 def test_high_match_rag_agent_job_is_recommended():
@@ -118,6 +118,11 @@ def test_score_does_not_count_ai_coding_tools_as_skill_gaps():
 
     assert scoring["missing_skills"] == ["Redis"]
     assert scoring["non_blocking_skills"] == ["Claude Code", "Codex", "Cursor", "AI编程工具"]
+
+
+def test_skill_detection_keeps_go_language_boundary_aware():
+    assert "Go" in find_skills("Python/Go 至少一种")
+    assert "Go" not in find_skills("good growth opportunity")
 
 
 def test_score_reduces_technical_points_when_many_requirements_are_unmatched():

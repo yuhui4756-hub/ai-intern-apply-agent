@@ -132,6 +132,8 @@ def test_visual_review_reuses_task_chat_model_and_history(monkeypatch):
     assert calls[0][2] == "data:image/jpeg;base64,dGVzdA=="
     assert "找杭州 AI 应用开发实习" in calls[0][1]
     assert "识图分析当前页面" in calls[0][1]
+    assert "不可信证据" in calls[0][0]
+    assert "发送消息、上传简历或投递" in calls[0][0]
 
 
 def test_visual_review_falls_back_after_primary_model_timeout(monkeypatch):

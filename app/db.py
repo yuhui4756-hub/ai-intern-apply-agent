@@ -374,6 +374,7 @@ def init_db() -> None:
 
             CREATE TABLE IF NOT EXISTS model_call_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trace_id TEXT NOT NULL DEFAULT '',
                 task_type TEXT NOT NULL,
                 model_profile TEXT NOT NULL DEFAULT '',
                 model_name TEXT NOT NULL DEFAULT '',
@@ -499,6 +500,7 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS agent_messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id INTEGER NOT NULL,
+                trace_id TEXT NOT NULL DEFAULT '',
                 role TEXT NOT NULL DEFAULT '',
                 content TEXT NOT NULL DEFAULT '',
                 events_json TEXT NOT NULL DEFAULT '[]',
@@ -512,6 +514,7 @@ def init_db() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id INTEGER NOT NULL,
                 message_id INTEGER,
+                trace_id TEXT NOT NULL DEFAULT '',
                 tool_name TEXT NOT NULL DEFAULT '',
                 permission_level TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT '',
@@ -523,15 +526,42 @@ def init_db() -> None:
                 FOREIGN KEY(message_id) REFERENCES agent_messages(id) ON DELETE SET NULL
             );
 
+            CREATE TABLE IF NOT EXISTS agent_evidence_memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER UNIQUE,
+                memory_type TEXT NOT NULL DEFAULT 'job_decision',
+                title TEXT NOT NULL DEFAULT '',
+                content TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT 'user_confirmed_local_summary',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(job_id) REFERENCES job_postings(id) ON DELETE CASCADE
+            );
+
             CREATE INDEX IF NOT EXISTS idx_agent_messages_session ON agent_messages(session_id, id);
             CREATE INDEX IF NOT EXISTS idx_agent_tool_runs_session ON agent_tool_runs(session_id, id);
+            CREATE INDEX IF NOT EXISTS idx_agent_evidence_memories_updated ON agent_evidence_memories(updated_at, id);
             """
         )
         ensure_columns(conn)
+        ensure_indexes(conn)
+        ensure_evidence_memory_index(conn)
         seed_defaults(conn)
 
 
 def ensure_columns(conn: sqlite3.Connection) -> None:
+    model_log_columns = table_column_names(conn, "model_call_logs")
+    if "trace_id" not in model_log_columns:
+        conn.execute("ALTER TABLE model_call_logs ADD COLUMN trace_id TEXT NOT NULL DEFAULT ''")
+
+    agent_message_columns = table_column_names(conn, "agent_messages")
+    if "trace_id" not in agent_message_columns:
+        conn.execute("ALTER TABLE agent_messages ADD COLUMN trace_id TEXT NOT NULL DEFAULT ''")
+
+    agent_tool_columns = table_column_names(conn, "agent_tool_runs")
+    if "trace_id" not in agent_tool_columns:
+        conn.execute("ALTER TABLE agent_tool_runs ADD COLUMN trace_id TEXT NOT NULL DEFAULT ''")
+
     job_columns = table_column_names(conn, "job_postings")
     if "analysis_source" not in job_columns:
         conn.execute("ALTER TABLE job_postings ADD COLUMN analysis_source TEXT NOT NULL DEFAULT 'local_rules'")
@@ -590,6 +620,51 @@ def ensure_columns(conn: sqlite3.Connection) -> None:
     for column, definition in patrol_defaults.items():
         if column not in patrol_columns:
             conn.execute(f"ALTER TABLE message_patrol_runs ADD COLUMN {column} {definition}")
+
+
+def ensure_indexes(conn: sqlite3.Connection) -> None:
+    """Create indexes only after additive migrations have added their columns."""
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_agent_messages_trace ON agent_messages(trace_id, id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_agent_tool_runs_trace ON agent_tool_runs(trace_id, id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_model_call_logs_trace ON model_call_logs(trace_id, id)")
+
+
+def ensure_evidence_memory_index(conn: sqlite3.Connection) -> None:
+    """Create an optional FTS5 index; callers safely fall back when unavailable."""
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS job_postings_before_delete_evidence_memory
+        BEFORE DELETE ON job_postings
+        BEGIN
+            DELETE FROM agent_evidence_memories WHERE job_id = OLD.id;
+        END
+        """
+    )
+    try:
+        conn.execute(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS agent_evidence_memory_fts
+            USING fts5(memory_id UNINDEXED, title, content, tokenize='unicode61')
+            """
+        )
+        conn.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS agent_evidence_memory_fts_after_delete
+            AFTER DELETE ON agent_evidence_memories
+            BEGIN
+                DELETE FROM agent_evidence_memory_fts WHERE memory_id = CAST(OLD.id AS TEXT);
+            END
+            """
+        )
+        rows = conn.execute("SELECT id, title, content FROM agent_evidence_memories").fetchall()
+        for row in rows:
+            conn.execute("DELETE FROM agent_evidence_memory_fts WHERE memory_id = ?", (str(row["id"]),))
+            conn.execute(
+                "INSERT INTO agent_evidence_memory_fts (memory_id, title, content) VALUES (?, ?, ?)",
+                (str(row["id"]), row["title"], row["content"]),
+            )
+    except sqlite3.OperationalError:
+        return
 
 
 def table_column_names(conn: sqlite3.Connection, table_name: str) -> set[str]:

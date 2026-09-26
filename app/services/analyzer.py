@@ -6,6 +6,9 @@ from typing import Any
 
 TARGET_SKILLS = [
     "Python",
+    "Java",
+    "Go",
+    "C++",
     "FastAPI",
     "Flask",
     "RAG",
@@ -139,12 +142,19 @@ def strip_platform_safety_notice(text: str) -> str:
 
 
 def find_skills(text: str) -> list[str]:
-    lowered = text.lower()
     matched: list[str] = []
     for skill in TARGET_SKILLS:
-        if skill.lower() in lowered or skill in text:
+        if skill_present(text, skill):
             matched.append(skill)
     return matched
+
+
+def skill_present(text: str, skill: str) -> bool:
+    """Match programming tokens without treating words such as ``good`` as Go."""
+    if not text or not skill:
+        return False
+    escaped = re.escape(skill.lower())
+    return bool(re.search(rf"(?<![a-z0-9+#]){escaped}(?![a-z0-9+#])", text.lower()))
 
 
 def extract_city(text: str) -> str:
@@ -342,7 +352,7 @@ def alternative_skill_groups(required_skills: list[str], jd_text: str) -> list[l
         # "至少精通以下之一：Python/Go" puts it after the marker.
         scope = sentence[marker_index + len(marker) :] if marker == "以下之一" else sentence[:marker_index]
         scope_lower = scope.lower()
-        members = [skill for skill in required_skills if skill.lower() in scope_lower]
+        members = [skill for skill in required_skills if skill_present(scope_lower, skill)]
         if len(members) < 2:
             continue
         normalized_members = list(dict.fromkeys(members))
@@ -362,7 +372,7 @@ def score_job(
     preferences = preferences if isinstance(preferences, dict) else {}
     required_skills = list(dict.fromkeys(extracted.get("required_skills") or find_skills(text)))
     resume_lower = (resume_text or "").lower()
-    matched_skills = [skill for skill in required_skills if skill.lower() in resume_lower]
+    matched_skills = [skill for skill in required_skills if skill_present(resume_lower, skill)]
     non_blocking_skills = [skill for skill in required_skills if skill_is_non_blocking(skill)]
     alternative_groups = alternative_skill_groups(required_skills, text)
     alternative_members = {skill for group in alternative_groups for skill in group}

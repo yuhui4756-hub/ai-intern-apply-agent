@@ -2,12 +2,27 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import contextmanager
 from dataclasses import dataclass
+from contextvars import ContextVar
 from typing import Any
 
 import httpx
 
 from ..db import connect, utc_now
+
+
+model_trace_id: ContextVar[str] = ContextVar("model_trace_id", default="")
+
+
+@contextmanager
+def model_trace(trace_id: str):
+    """Attach a local Agent-turn trace to model-call metadata without prompts."""
+    token = model_trace_id.set(str(trace_id or "")[:80])
+    try:
+        yield
+    finally:
+        model_trace_id.reset(token)
 
 
 def estimate_tokens(text: str) -> int:
@@ -72,12 +87,13 @@ class OpenAICompatibleClient:
 
     def complete_json(self, messages: list[dict[str, str]]) -> dict[str, Any]:
         result = self.complete(messages, response_format={"type": "json_object"})
-        self.log_call(result, "success", "")
         try:
-            return json.loads(result.content)
+            parsed = json.loads(result.content)
         except json.JSONDecodeError as exc:
-            self.log_error(f"JSON parse failed: {exc}")
+            self.log_call(result, "error", f"JSON parse failed: {exc}")
             raise
+        self.log_call(result, "success", "")
+        return parsed
 
     def complete_json_with_image(self, system_prompt: str, user_prompt: str, image_data_url: str) -> dict[str, Any]:
         messages: list[dict[str, Any]] = [
@@ -91,12 +107,13 @@ class OpenAICompatibleClient:
             },
         ]
         result = self.complete(messages, response_format={"type": "json_object"})
-        self.log_call(result, "success", "")
         try:
-            return json.loads(result.content)
+            parsed = json.loads(result.content)
         except json.JSONDecodeError as exc:
-            self.log_error(f"JSON parse failed: {exc}")
+            self.log_call(result, "error", f"JSON parse failed: {exc}")
             raise
+        self.log_call(result, "success", "")
+        return parsed
 
     def complete_text(self, messages: list[dict[str, str]]) -> str:
         result = self.complete(messages)
@@ -111,11 +128,12 @@ class OpenAICompatibleClient:
             conn.execute(
                 """
                 INSERT INTO model_call_logs (
-                    task_type, model_profile, model_name, input_tokens, output_tokens,
+                    trace_id, task_type, model_profile, model_name, input_tokens, output_tokens,
                     total_tokens, estimated_cost, usage_source, status, error_message, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    model_trace_id.get(),
                     self.task_type,
                     self.profile.get("name") or "",
                     self.model,
@@ -135,10 +153,11 @@ class OpenAICompatibleClient:
             conn.execute(
                 """
                 INSERT INTO model_call_logs (
-                    task_type, model_profile, model_name, status, error_message, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    trace_id, task_type, model_profile, model_name, status, error_message, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    model_trace_id.get(),
                     self.task_type,
                     self.profile.get("name") or "",
                     self.model,

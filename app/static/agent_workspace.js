@@ -22,6 +22,7 @@
   const modelSelect = $("[data-model-select]");
   const autoCommunication = $("[data-auto-communication]");
   const manualMenu = $("[data-manual-menu]");
+  const evidenceMemories = $("[data-evidence-memories]");
 
   function text(parent, tag, value, className = "") {
     const element = document.createElement(tag);
@@ -178,6 +179,35 @@
         observations.appendChild(row);
       });
     }
+    renderEvidenceMemories();
+  }
+
+  function renderEvidenceMemories() {
+    evidenceMemories.replaceChildren();
+    const memories = state.conversation?.memories || [];
+    if (!memories.length) {
+      evidenceMemories.className = "agent-empty";
+      evidenceMemories.textContent = "尚未保存岗位结论。";
+      return;
+    }
+    evidenceMemories.className = "agent-memory-list";
+    memories.slice(0, 6).forEach((memory) => {
+      const article = document.createElement("article");
+      const heading = document.createElement("div");
+      text(heading, "strong", memory.title || "岗位结论");
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "agent-memory-delete";
+      remove.dataset.deleteMemoryId = memory.id;
+      remove.disabled = state.pending;
+      remove.title = "删除这条本地岗位记忆";
+      remove.setAttribute("aria-label", `删除岗位记忆：${memory.title || "岗位结论"}`);
+      remove.textContent = "×";
+      heading.appendChild(remove);
+      article.appendChild(heading);
+      text(article, "p", memory.content || "已保存的结构化岗位结论。");
+      evidenceMemories.appendChild(article);
+    });
   }
 
   function renderCanvas() {
@@ -210,7 +240,7 @@
     state.pending = pending;
     input.disabled = pending; send.disabled = pending;
     send.textContent = pending ? "执行中" : "发送";
-    root.querySelectorAll("[data-delete-session-id], [data-new-session], [data-session-id]").forEach((element) => { element.disabled = pending; });
+    root.querySelectorAll("[data-delete-session-id], [data-delete-memory-id], [data-new-session], [data-session-id]").forEach((element) => { element.disabled = pending; });
   }
 
   async function request(url, options = {}) {
@@ -227,7 +257,18 @@
   }
 
   root.addEventListener("click", async (event) => {
-    if (state.pending && event.target.closest("[data-delete-session-id], [data-new-session], [data-session-id]")) return;
+    if (state.pending && event.target.closest("[data-delete-session-id], [data-delete-memory-id], [data-new-session], [data-session-id]")) return;
+    const removeMemory = event.target.closest("[data-delete-memory-id]");
+    if (removeMemory) {
+      const memoryId = Number(removeMemory.dataset.deleteMemoryId);
+      if (!Number.isInteger(memoryId) || !window.confirm("删除这条本地岗位记忆？此操作不能撤销。")) return;
+      try {
+        const payload = await request(`/api/agent/memories/${memoryId}`, { method: "DELETE" });
+        if (state.conversation) state.conversation.memories = payload.memories || [];
+        render();
+      } catch (error) { window.alert(error.message || "删除岗位记忆失败。"); }
+      return;
+    }
     const removeSession = event.target.closest("[data-delete-session-id]");
     if (removeSession) {
       const sessionId = Number(removeSession.dataset.deleteSessionId);
