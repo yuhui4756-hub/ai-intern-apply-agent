@@ -3542,6 +3542,74 @@ AI Agent 应用开发工程师
     assert "高风险信号" not in result["scoring"]["skip_reason"]
 
 
+def test_analysis_requires_direct_jd_evidence_for_llm_caution_signals(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "grounded-caution.sqlite3"))
+
+    from app import main
+    from app.db import init_db
+
+    init_db()
+    monkeypatch.setattr(
+        main,
+        "try_llm_jd_extract",
+        lambda _text: (
+            {
+                "title": "AI 应用开发工程师",
+                "required_skills": ["Python"],
+                "caution_signals": ["全栈", "公司为 2024 年成立的初创企业", "同类岗位普遍 300-600 元/天"],
+            },
+            "",
+        ),
+    )
+
+    result = main.analyze_job_payload(
+        "AI 应用开发工程师，要求 Python，需与前端同学进行全栈协作。",
+        None,
+        generate_messages=False,
+    )
+
+    assert result["extracted"]["caution_signals"] == ["全栈"]
+    assert "公司为 2024 年成立" not in result["extracted"]["caution_signals"]
+    assert "同类岗位普遍" not in result["extracted"]["caution_signals"]
+
+
+def test_rescore_saved_job_drops_ungrounded_stored_caution_signals(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "rescore-grounded-caution.sqlite3"))
+
+    from app import main
+    from app.db import connect, dumps, init_db, loads
+
+    init_db()
+    monkeypatch.setattr(main, "try_llm_jd_extract", lambda _text: ({}, ""))
+    with connect() as conn:
+        job_id, _analysis = main.create_job_record(
+            conn,
+            jd_text="AI 应用开发工程师，要求 Python。",
+            resume_id=None,
+            generate_messages=False,
+        )
+        conn.execute(
+            "UPDATE job_postings SET extracted_json = ? WHERE id = ?",
+            (
+                dumps(
+                    {
+                        "extracted": {
+                            "required_skills": ["Python"],
+                            "risk_signals": [],
+                            "caution_signals": ["公司为 2024 年成立的初创企业"],
+                        },
+                        "scoring": {},
+                    }
+                ),
+                job_id,
+            ),
+        )
+        main.rescore_saved_job(conn, int(job_id))
+        stored = conn.execute("SELECT extracted_json FROM job_postings WHERE id = ?", (job_id,)).fetchone()
+
+    assert loads(stored["extracted_json"], {})["extracted"]["caution_signals"] == []
+
+
 def test_search_run_and_candidate_import_flow(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "search.sqlite3"))
 
@@ -3701,14 +3769,23 @@ def test_manual_edge_search_capture_flow(tmp_path, monkeypatch):
     from app import main
     from app.db import connect, init_db
 
-    monkeypatch.setattr(main, "open_manual_search_in_edge", lambda platform, keyword, city: "https://jobs.example.com/search?q=AI")
-    def capture_without_async_loop(platform, keyword, city, browser_channel="msedge"):
+    monkeypatch.setattr(
+        main,
+        "open_manual_search_target_in_edge",
+        lambda platform, keyword, city: ("https://jobs.example.com/search?q=AI", {"id": "manual-target"}),
+    )
+    captured_expected_urls = []
+    captured_target_ids = []
+
+    def capture_without_async_loop(platform, keyword, city, browser_channel="msedge", expected_url="", target_id=""):
         try:
             asyncio.get_running_loop()
         except RuntimeError:
             pass
         else:
             raise AssertionError("browser capture should run outside the FastAPI event loop")
+        captured_expected_urls.append(expected_url)
+        captured_target_ids.append(target_id)
         return SearchResult(
             platform=platform,
             keyword=keyword,
@@ -3755,6 +3832,99 @@ def test_manual_edge_search_capture_flow(tmp_path, monkeypatch):
     assert count == 1
     assert run["keyword"] == "AI 应用开发实习"
     assert run["city"] == "杭州"
+    assert captured_expected_urls == ["https://jobs.example.com/search?q=AI"]
+    assert captured_target_ids == ["manual-target"]
+
+
+def test_manual_edge_search_visual_capture_uses_saved_target_and_keeps_screenshot_ephemeral(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "manual-search-visual.sqlite3"))
+
+    from app import main
+    from app.db import connect, init_db, loads
+
+    captured_targets = []
+    visual_calls = []
+    monkeypatch.setattr(
+        main,
+        "open_manual_search_target_in_edge",
+        lambda _platform, _keyword, _city: ("https://www.zhipin.com/web/geek/job?query=AI", {"id": "bound-target"}),
+    )
+
+    def fake_capture(platform, keyword, city, browser_channel="msedge", expected_url="", target_id=""):
+        captured_targets.append((platform, keyword, city, expected_url, target_id))
+        return SearchResult(
+            platform=platform,
+            keyword=keyword,
+            city=city,
+            search_url="https://www.zhipin.com/web/geek/jobs?query=AI",
+            browser_channel=browser_channel,
+            candidates=[
+                SearchCandidate(
+                    title="AI Agent 开发实习生",
+                    company="",
+                    city=city,
+                    source_url="https://www.zhipin.com/job_detail/visual-manual.html",
+                    summary="AI Agent 开发实习生\n薪资数字未能从页面文本读取",
+                )
+            ],
+        )
+
+    def fake_visual(mode, message, **kwargs):
+        visual_calls.append((mode, message, kwargs))
+        return {
+            "status": "已完成",
+            "note": "页面视觉复核已完成；截图未保存，仅保留结构化摘要。",
+            "review": {
+                "candidate_jobs": [
+                    {
+                        "company": "视觉补全科技",
+                        "title": "AI Agent 开发实习生",
+                        "city": "深圳",
+                        "salary_text": "220-300 元/天",
+                        "experience_text": "经验不限",
+                    }
+                ]
+            },
+            "image_persisted": False,
+        }
+
+    monkeypatch.setattr(main, "capture_current_search_page", fake_capture)
+    monkeypatch.setattr(main, "run_visual_page_review", fake_visual)
+    init_db()
+    client = TestClient(main.app)
+
+    opened = client.post(
+        "/searches/open-manual",
+        data={"platform": "Boss 直聘", "keyword": "AI Agent 开发", "city": "深圳"},
+        follow_redirects=False,
+    )
+    assert opened.status_code == 303
+    response = client.post("/searches/capture-current-visual", data={"browser_channel": "msedge"}, follow_redirects=False)
+
+    assert response.status_code == 303
+    assert captured_targets == [("Boss 直聘", "AI Agent 开发", "深圳", "https://www.zhipin.com/web/geek/job?query=AI", "bound-target")]
+    assert visual_calls[0][0] == "viewport"
+    assert visual_calls[0][2]["target_id"] == "bound-target"
+    assert visual_calls[0][2]["salary_targets"] == [{"company": "", "title": "AI Agent 开发实习生", "city": "深圳"}]
+    with connect() as conn:
+        candidate = conn.execute("SELECT company, summary FROM job_candidates ORDER BY id DESC LIMIT 1").fetchone()
+        action = conn.execute(
+            "SELECT decision_json FROM agent_action_logs WHERE action_type = 'manual_search_visual_review' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        draft_count = conn.execute("SELECT COUNT(*) AS count FROM message_drafts").fetchone()["count"]
+        preparation_count = conn.execute("SELECT COUNT(*) AS count FROM application_preparations").fetchone()["count"]
+
+    assert candidate["company"] == "视觉补全科技"
+    assert "视觉薪资：220-300 元/天" in candidate["summary"]
+    decision = loads(action["decision_json"], {})
+    assert decision["target_id_present"] is True
+    assert decision["reconciled_count"] == 1
+    assert decision["image_persisted"] is False
+    assert decision["page_text_saved"] is False
+    assert decision["message_sent"] is False
+    assert decision["application_submitted"] is False
+    assert draft_count == 0
+    assert preparation_count == 0
 
 
 def test_controlled_job_discovery_is_bounded_and_never_creates_outbound_actions(tmp_path, monkeypatch):
@@ -4358,7 +4528,11 @@ def test_manual_edge_search_launch_uses_debug_profile(tmp_path, monkeypatch):
     monkeypatch.setattr(job_searcher, "find_edge_executable", lambda: Path("C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe"))
     monkeypatch.setattr(job_searcher, "is_debug_endpoint_ready", lambda timeout_seconds=1: False)
     monkeypatch.setattr(job_searcher, "wait_for_debug_endpoint", lambda timeout_seconds=8: True)
-    monkeypatch.setattr(job_searcher, "open_url_in_debug_browser", lambda url: opened_urls.append(url) or True)
+    monkeypatch.setattr(
+        job_searcher,
+        "create_controlled_edge_target",
+        lambda url: opened_urls.append(url) or {"id": "manual-target", "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/manual-target"},
+    )
     monkeypatch.setattr(
         job_searcher.subprocess,
         "Popen",

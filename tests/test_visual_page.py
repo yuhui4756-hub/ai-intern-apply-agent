@@ -84,6 +84,87 @@ def test_visual_page_rejects_recruitment_security_interstitial(monkeypatch):
         visual_page.capture_controlled_edge_visual_page("viewport")
 
 
+def test_visual_page_matches_equivalent_query_encoding():
+    assert visual_page.target_matches_expected_url(
+        "https://www.zhipin.com/web/geek/jobs?query=AI%20Agent&city=101280600",
+        "https://www.zhipin.com/web/geek/jobs?query=AI+Agent&city=101280600",
+    )
+
+
+def test_visual_page_uses_target_id_to_disambiguate_duplicate_search_tabs(monkeypatch):
+    intended = {
+        "id": "intended-search",
+        "type": "page",
+        "url": "https://www.zhipin.com/web/geek/jobs?query=AI%20Agent",
+        "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/intended-search",
+    }
+    duplicate = {**intended, "id": "older-search", "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/older-search"}
+    image = base64.b64encode(b"target-bound-image").decode("ascii")
+    called = []
+    monkeypatch.setattr(visual_page, "wait_for_debug_endpoint", lambda **_kwargs: True)
+    monkeypatch.setattr(visual_page, "read_controlled_edge_targets", lambda: [duplicate, intended])
+    monkeypatch.setattr(
+        visual_page,
+        "send_cdp_command",
+        lambda target, method, *_args, **_kwargs: called.append((target["id"], method)) or {"data": image},
+    )
+
+    captured = visual_page.capture_controlled_edge_visual_page("viewport", target_id="intended-search")
+
+    assert captured["metadata"]["image_persisted"] is False
+    assert called == [("intended-search", "Page.captureScreenshot")]
+
+
+def test_visual_page_rejects_target_id_from_another_platform(monkeypatch):
+    target = {
+        "id": "liepin-target",
+        "type": "page",
+        "url": "https://www.liepin.com/zhaopin/?key=Python",
+        "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/liepin-target",
+    }
+    monkeypatch.setattr(visual_page, "wait_for_debug_endpoint", lambda **_kwargs: True)
+    monkeypatch.setattr(visual_page, "read_controlled_edge_targets", lambda: [target])
+
+    with pytest.raises(ValueError, match="没有匹配当前搜索任务"):
+        visual_page.capture_controlled_edge_visual_page(
+            "viewport",
+            platform="Boss 直聘",
+            target_id="liepin-target",
+        )
+
+
+def test_visual_review_forwards_target_id_to_the_capture_layer(monkeypatch):
+    from app import main
+
+    class FakeClient:
+        configured = True
+        profile = {"name": "测试视觉模型"}
+        model = "vision-test"
+
+        def complete_json_with_image(self, *_args):
+            return {"page_type": "search_results", "candidate_jobs": [], "confidence": 0.8, "uncertainties": []}
+
+        def log_error(self, _message):
+            return None
+
+    captured_kwargs = []
+    monkeypatch.setattr(main, "client_for_task", lambda task_type: FakeClient() if task_type == "agent_chat" else None)
+    monkeypatch.setattr(
+        main,
+        "capture_controlled_edge_visual_page",
+        lambda _mode, **kwargs: captured_kwargs.append(kwargs) or {
+            "image_data_url": "data:image/jpeg;base64,dGVzdA==",
+            "metadata": {"platform": "Boss 直聘", "image_persisted": False},
+        },
+    )
+    monkeypatch.setattr(main, "control_history_for_model", lambda: [])
+
+    result = main.run_visual_page_review("viewport", "校准", target_id="manual-target")
+
+    assert result["status"] == "已完成"
+    assert captured_kwargs == [{"expected_url": "", "platform": "", "target_id": "manual-target"}]
+
+
 def test_visual_review_reuses_task_chat_model_and_history(monkeypatch):
     from app import main
 

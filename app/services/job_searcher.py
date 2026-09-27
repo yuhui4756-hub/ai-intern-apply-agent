@@ -9,10 +9,10 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import quote_plus, urljoin, urlparse
+from urllib.parse import parse_qsl, quote_plus, urljoin, urlparse
 
 from ..config import data_dir
-from .analyzer import extract_salary
+from .analyzer import TARGET_SKILLS, extract_salary
 from .job_fetcher import (
     FetchResult,
     ensure_public_http_url,
@@ -29,8 +29,32 @@ SKIP_URL_PARTS = ["login", "passport", "signup", "register", "javascript:", "mai
 DEGREE_WORDS = ["本科", "大专", "硕士", "博士", "学历不限", "不限学历"]
 TIME_WORDS = ["天/周", "周", "个月", "月", "长期", "实习"]
 COMPANY_HINTS = ["公司", "科技", "智能", "网络", "信息", "软件", "数据", "集团", "字节", "华为", "腾讯", "阿里", "百度"]
+TECHNOLOGY_ONLY_COMPANY_VALUES = {
+    *(item.lower() for item in TARGET_SKILLS),
+    "php",
+    "golang",
+    "django",
+    "scrapy",
+    "kubernetes",
+    "vllm",
+    "lora",
+    "mlops",
+    "tensorflow",
+    "pytorch",
+    "javascript",
+    "typescript",
+    "react",
+    "vue",
+    "c#",
+    "c++",
+}
 CITY_WORDS = ["北京", "上海", "广州", "深圳", "杭州", "重庆", "成都", "南京", "苏州", "厦门", "武汉", "长沙"]
 MASKED_SALARY_RE = re.compile(r"[□�]{2,}\s*(?:-|~|～|至|到|—|–|－)\s*[□�]{2,}\s*元\s*/?\s*[天日]")
+PRIVATE_FONT_GLYPH_RE = re.compile(r"[\ue000-\uf8ff]")
+PRIVATE_FONT_SALARY_RE = re.compile(
+    r"[\ue000-\uf8ff]{2,}\s*(?:-|~|～|至|到|—|–|－)\s*[\ue000-\uf8ff]{2,}\s*(?:[kK]|元\s*/?\s*[天日])?"
+)
+EXPERIENCE_ONLY_RE = re.compile(r"(?:经验不限|应届|在校|校招|(?:\d+\s*(?:-|~|～|至|到|—|–|－)\s*)?\d+\s*年(?:经验)?)$")
 RECRUITMENT_INTERSTITIAL_PATH_TOKENS = ("/passport", "/security", "/captcha", "/verify", "/login", "/signin")
 CITY_CODES = {
     "北京": "101010100",
@@ -140,11 +164,17 @@ def search_jobs_with_browser(
     return SearchResult(platform=platform, keyword=keyword, city=city, search_url=final_url, browser_channel=channel, candidates=candidates, note=note)
 
 
-def open_manual_search_in_edge(platform: str, keyword: str, city: str = "") -> str:
+def open_manual_search_target_in_edge(platform: str, keyword: str, city: str = "") -> tuple[str, dict]:
+    """Open one user-owned manual search tab and retain its CDP identity."""
     search_url = ensure_public_http_url(build_search_url(platform, keyword, city))
     _ensure_controlled_edge_started()
-    if not open_url_in_debug_browser(search_url):
-        raise ValueError("无法在受控 Edge 中打开搜索页，请确认 9222 调试端口仍可用。")
+    target = create_controlled_edge_target(search_url)
+    return search_url, target
+
+
+def open_manual_search_in_edge(platform: str, keyword: str, city: str = "") -> str:
+    """Backward-compatible manual search helper for callers that only need the URL."""
+    search_url, _target = open_manual_search_target_in_edge(platform, keyword, city)
     return search_url
 
 
@@ -191,13 +221,14 @@ def capture_current_search_page(
     browser_channel: str = "msedge",
     limit: int = 30,
     expected_url: str = "",
+    target_id: str = "",
 ) -> SearchResult:
     channel = normalize_browser_channel(browser_channel)
     if channel != "msedge":
         raise ValueError("当前页面采集先支持 Microsoft Edge。")
     try:
         (final_url, anchors), retry_count = retry_controlled_edge_read(
-            lambda: _capture_current_search_page_once(platform, expected_url)
+            lambda: _capture_current_search_page_once(platform, expected_url, target_id)
         )
     except ValueError:
         raise
@@ -230,10 +261,20 @@ def is_recruitment_interstitial_url(url: str) -> bool:
     return any(token in path for token in RECRUITMENT_INTERSTITIAL_PATH_TOKENS)
 
 
-def _capture_current_search_page_once(platform: str, expected_url: str) -> tuple[str, list[dict]]:
+def _capture_current_search_page_once(platform: str, expected_url: str, target_id: str = "") -> tuple[str, list[dict]]:
     if not wait_for_debug_endpoint(timeout_seconds=3):
         raise ValueError("没有检测到应用打开的 Edge 调试窗口，请先点击“打开 Edge 搜索页”。")
-    target = wait_for_controlled_search_page(platform, expected_url=expected_url)
+    targets = read_controlled_edge_targets()
+    if target_id:
+        target = next((item for item in targets if str(item.get("id") or "") == target_id), None)
+        if not target:
+            raise ValueError("应用刚打开的搜索标签已关闭或不再可读取，请重新打开搜索页。")
+        if not is_platform_search_page_url(target_url(target), platform):
+            raise ValueError("应用刚打开的标签不再是对应平台搜索页，请重新打开搜索页。")
+    else:
+        target = find_controlled_search_page(targets, platform, expected_url=expected_url)
+        if not target:
+            raise ValueError(f"等待 {platform or '招聘平台'} 搜索结果页超时。请确认受控 Edge 已打开对应搜索页后重试。")
     time.sleep(1.0)
     snapshot = evaluate_cdp_expression(target, controlled_search_snapshot_expression())
     if not isinstance(snapshot, dict):
@@ -646,13 +687,27 @@ def find_controlled_search_page(pages: list, platform: str, expected_url: str = 
     expected = urlparse(expected_url)
     expected_host = (expected.hostname or "").lower()
     expected_path = (expected.path or "").rstrip("/")
+    expected_query = normalized_query_pairs(expected_url)
     if expected_host:
+        # Prefer the exact page the caller opened. A platform may redirect a
+        # search URL (for example Boss /job -> /jobs), so only then fall back
+        # to another compatible search path on the same host.
         for page in reversed(pages):
             current_url = target_url(page)
             parsed = urlparse(current_url)
             host = (parsed.hostname or "").lower()
             path = (parsed.path or "").rstrip("/")
-            if host == expected_host and (path == expected_path or is_platform_search_page_url(current_url, platform)):
+            if host == expected_host and path == expected_path and normalized_query_pairs(current_url) == expected_query:
+                return page
+        for page in reversed(pages):
+            current_url = target_url(page)
+            parsed = urlparse(current_url)
+            host = (parsed.hostname or "").lower()
+            if (
+                host == expected_host
+                and is_platform_search_page_url(current_url, platform)
+                and normalized_query_pairs(current_url) == expected_query
+            ):
                 return page
     signals = platform_url_signals(platform)
     for page in reversed(pages):
@@ -661,6 +716,11 @@ def find_controlled_search_page(pages: list, platform: str, expected_url: str = 
         if any(signal in lowered for signal in signals) and is_platform_search_page_url(current_url, platform):
             return page
     return None
+
+
+def normalized_query_pairs(url: str) -> tuple[tuple[str, str], ...]:
+    """Compare semantically equivalent URL queries despite `+`/`%20` encoding."""
+    return tuple(sorted(parse_qsl(urlparse(url or "").query, keep_blank_values=True)))
 
 
 def is_platform_search_page_url(url: str, platform: str) -> bool:
@@ -907,7 +967,8 @@ def candidate_lines(text: str) -> list[str]:
 
 
 def sanitize_masked_salary(text: str) -> str:
-    return MASKED_SALARY_RE.sub("薪资数字未能从页面文本读取", text or "")
+    value = MASKED_SALARY_RE.sub("薪资数字未能从页面文本读取", text or "")
+    return PRIVATE_FONT_SALARY_RE.sub("薪资数字未能从页面文本读取", value)
 
 
 def clean_company_name(value: str) -> str:
@@ -919,11 +980,17 @@ def is_company_candidate(value: str, *, prefer_hint: bool) -> bool:
     lowered = text.lower()
     if not 2 <= len(text) <= 40:
         return False
+    if PRIVATE_FONT_GLYPH_RE.search(text):
+        return False
+    if lowered in TECHNOLOGY_ONLY_COMPANY_VALUES:
+        return False
     if any(keyword.lower() in lowered for keyword in JOB_KEYWORDS):
         return False
     if extract_salary(text) or "元/天" in text or "薪资" in text or "补贴" in text:
         return False
     if any(word in text for word in TIME_WORDS) and not any(hint in text for hint in COMPANY_HINTS):
+        return False
+    if EXPERIENCE_ONLY_RE.fullmatch(text):
         return False
     if text in DEGREE_WORDS or re.fullmatch(r"(?:\d+\s*)?(?:天/周|个月|月|周|本科|大专|硕士|博士)", text):
         return False
@@ -932,6 +999,29 @@ def is_company_candidate(value: str, *, prefer_hint: bool) -> bool:
     if prefer_hint and not any(hint in text for hint in COMPANY_HINTS):
         return False
     return True
+
+
+def candidate_field_quality_flags(candidate: object) -> list[str]:
+    """Return local extraction-quality flags without judging job suitability."""
+    if isinstance(candidate, dict):
+        title = str(candidate.get("title") or "")
+        company = str(candidate.get("company") or "")
+        summary = str(candidate.get("summary") or "")
+    else:
+        title = str(getattr(candidate, "title", "") or "")
+        company = str(getattr(candidate, "company", "") or "")
+        summary = str(getattr(candidate, "summary", "") or "")
+
+    flags: list[str] = []
+    if not normalize_text(title) or normalize_text(title) == "候选岗位":
+        flags.append("岗位名称缺失")
+    if not clean_company_name(company):
+        flags.append("公司缺失")
+    elif not is_company_candidate(company, prefer_hint=False):
+        flags.append("公司字段疑似非公司")
+    if "薪资数字未能从页面文本读取" in summary or bool(MASKED_SALARY_RE.search(summary)):
+        flags.append("薪资未解析")
+    return flags
 
 
 def build_candidate_summary(text: str, title: str, company: str) -> str:

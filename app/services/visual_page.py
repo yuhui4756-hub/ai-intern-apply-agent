@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 from math import sqrt
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 
 from .job_searcher import (
     is_recruitment_interstitial_url,
@@ -30,6 +30,7 @@ def capture_controlled_edge_visual_page(
     *,
     expected_url: str = "",
     platform: str = "",
+    target_id: str = "",
 ) -> dict[str, object]:
     """Capture one controlled recruitment page without writing the image to disk."""
     if mode not in {"viewport", "full_page"}:
@@ -37,7 +38,13 @@ def capture_controlled_edge_visual_page(
     if not wait_for_debug_endpoint(timeout_seconds=3):
         raise ValueError("没有检测到应用打开的 Edge 调试窗口，请先打开受控 Edge。")
     targets = [target for target in read_controlled_edge_targets() if visual_page_target(target)]
-    if expected_url:
+    if target_id:
+        targets = [target for target in targets if str(target.get("id") or "") == target_id]
+        # A saved CDP target is the primary binding for a manual search. Keep
+        # the platform check as a second guard in case that tab was navigated.
+        if platform:
+            targets = [target for target in targets if platform_for_url(target_url(target)) == platform]
+    elif expected_url:
         targets = [target for target in targets if target_matches_expected_url(target_url(target), expected_url)]
     elif platform:
         targets = [target for target in targets if platform_for_url(target_url(target)) == platform]
@@ -116,4 +123,6 @@ def target_matches_expected_url(url: str, expected_url: str) -> bool:
         return False
     if (current.path or "").rstrip("/") != (expected.path or "").rstrip("/"):
         return False
-    return current.query == expected.query
+    return tuple(sorted(parse_qsl(current.query, keep_blank_values=True))) == tuple(
+        sorted(parse_qsl(expected.query, keep_blank_values=True))
+    )

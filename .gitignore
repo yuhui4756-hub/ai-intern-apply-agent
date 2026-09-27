@@ -20,9 +20,9 @@ data/
 local_data/
 exports/
 logs/
+artifacts/
+output/
 .playwright-cli/
-output/playwright/
-artifacts/agent-quality-report.json
 dist/
 desktop/node_modules/
 desktop/release/

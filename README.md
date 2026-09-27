@@ -14,7 +14,7 @@
 - 管理投递状态和跳过原因。
 - 在收到面试邀请后生成准备计划、题库和复盘材料。
 
-需求规格见 [docs/requirements.md](docs/requirements.md)，自动化路线见 [docs/agent_automation_plan.md](docs/agent_automation_plan.md)，浏览器扩展说明见 [docs/browser_extension.md](docs/browser_extension.md)，当前完成度见 [docs/status.md](docs/status.md)，Agent 质量与证据见 [docs/agent_quality.md](docs/agent_quality.md)，工程取舍与简历素材见 [docs/resume_engineering_evidence.md](docs/resume_engineering_evidence.md)。
+需求规格见 [docs/requirements.md](docs/requirements.md)，自动化路线见 [docs/agent_automation_plan.md](docs/agent_automation_plan.md)，浏览器扩展说明见 [docs/browser_extension.md](docs/browser_extension.md)，当前完成度见 [docs/status.md](docs/status.md)，真实页面校准方法见 [docs/calibration.md](docs/calibration.md)，Agent 质量与证据见 [docs/agent_quality.md](docs/agent_quality.md)，工程取舍与简历素材见 [docs/resume_engineering_evidence.md](docs/resume_engineering_evidence.md)。
 
 ## Quick Start
 
@@ -53,6 +53,7 @@ API Key 可以在设置页直接填写；应用会保存到本地 `.env` 并立�
 - 岗位发现任务管理：搜索页与 JD 读取按步骤持久化，可暂停、取消、恢复失败/未完成步骤，或创建保留原历史的新回放任务；服务中断后任务会等待人工恢复。该机制只覆盖只读搜索、JD 获取和本地评分，不触发沟通、简历选择或平台提交。
 - 候选校准反馈：可在每条搜索候选上记录正确、误判或待观察，填写期望分流与备注；反馈仅保存为本地校准样本，不会自动改写规则或触发平台操作。
 - 候选校准报告：按平台汇总标注覆盖、正确/误判、期望分流和最近误判样本，帮助复核筛选质量；报告只读，不会自动重跑、改规则或操作招聘平台。
+- 质量校准仪表盘：`/calibration` 将本地页面读取、字段健康度、JD 导入、规则预筛、人工反馈、巡检和模型调用分开汇总；只读、不调用模型或浏览器，避免把自动诊断伪装成准确率。手动搜索页采集会绑定应用创建的受控 Edge 标签，并仅将视觉结果合并到唯一可对应的 DOM 候选。
 - JD 语义评分：明确写有“至少一种/之一”的技术要求按可替代要求计算；AI 编程工具使用不作为能力缺口。优先使用简历正文，正文为空时仅使用候选人画像中明确填写的技能作为匹配证据；岗位详情可按最新本地规则重新评分，不调用模型或重新抓取网页。
 - 岗位发现筛选：可在候选人画像维护城市优先级、最低/目标日薪、到岗天数、实习周期和远程偏好；岗位搜索页可临时覆盖本次关键词、城市与条件。搜索摘要或 JD 明确低于日薪底线的岗位会跳过后续 JD 读取或归档；月薪和未披露薪资不会被误判为低日薪。
 - Edge 浏览器岗位搜索采集：打开招聘平台搜索页，采集候选岗位链接，再逐条导入 JD 分析。
@@ -130,7 +131,7 @@ API Key 可以在设置页直接填写；应用会保存到本地 `.env` 并立�
 
 ```powershell
 .\.venv\Scripts\python -m pytest -q
-.\.venv\Scripts\python -m compileall app tests
+.\.venv\Scripts\python -m compileall app tests evals
 .\.venv\Scripts\python -m evals.run_agent_quality_eval --strict
 ```
 

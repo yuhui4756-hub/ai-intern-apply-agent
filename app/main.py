@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 import hashlib
 import json
 import os
@@ -79,6 +80,7 @@ from .services.interview_export import render_interview_review_pdf
 from .services.job_fetcher import FetchResult, ensure_public_http_url, fetch_job_from_url, normalize_visible_text, validate_fetched_text
 from .services.job_searcher import (
     SearchResult,
+    candidate_field_quality_flags,
     capture_current_search_page,
     close_controlled_edge_target,
     close_owned_search_target,
@@ -90,6 +92,7 @@ from .services.job_searcher import (
     fetch_job_from_controlled_edge,
     is_recruitment_interstitial_url,
     open_manual_search_in_edge,
+    open_manual_search_target_in_edge,
     search_jobs_in_controlled_edge,
     search_jobs_with_browser,
     wait_for_cdp_document_ready,
@@ -847,7 +850,8 @@ def try_llm_jd_extract(jd_text: str) -> tuple[dict[str, Any] | None, str]:
         "你是求职投递 Agent 的 JD 结构化抽取器。请只输出 JSON，不要输出 Markdown。"
         "字段：title, company, city, salary_text, internship_days, internship_duration, "
         "responsibilities(array), requirements(array), required_skills(array), bonus_skills(array), "
-        "risk_signals(array), caution_signals(array)。如果不知道，填空字符串或空数组。"
+        "risk_signals(array), caution_signals(array)。风险和谨慎项只能填写 JD 中直接可见的简短原文片段，"
+        "不能引入公司背景、行业对比、薪资市场判断或其他外部推断。如果不知道，填空字符串或空数组。"
     )
     try:
         return client.complete_json(
@@ -903,6 +907,24 @@ def apply_blacklists(extracted: dict[str, Any], jd_text: str) -> None:
     extracted["risk_signals"] = risk_signals
 
 
+def grounded_jd_signals(values: Any, jd_text: str) -> list[str]:
+    """Keep model safety signals only when the exact evidence exists in this JD.
+
+    A JD extractor may summarize or infer external company facts. Those claims
+    must not change risk level unless a user-triggered company-research flow
+    later stores its own source evidence.
+    """
+    source = normalize_visible_text(jd_text or "")
+    if not source:
+        return []
+    grounded: list[str] = []
+    for raw in clean_extracted({"caution_signals": values}).get("caution_signals", []):
+        signal = str(raw).strip()
+        if signal and signal in source and signal not in grounded:
+            grounded.append(signal)
+    return grounded
+
+
 def analyze_job_payload(
     jd_text: str,
     resume_id: int | None,
@@ -926,13 +948,13 @@ def analyze_job_payload(
     llm_extract, analysis_error = try_llm_jd_extract(analysis_text)
     extracted = clean_extracted({**fallback_extract, **(llm_extract or {})})
     extracted["required_skills"] = list(dict.fromkeys((llm_extract or {}).get("required_skills") or fallback_extract["required_skills"]))
-    grounded_llm_risks = [
-        signal
-        for signal in clean_extracted(llm_extract or {}).get("risk_signals", [])
-        if signal in analysis_text
-    ]
+    grounded_llm_risks = grounded_jd_signals((llm_extract or {}).get("risk_signals", []), analysis_text)
+    grounded_llm_cautions = grounded_jd_signals((llm_extract or {}).get("caution_signals", []), analysis_text)
     extracted["risk_signals"] = list(dict.fromkeys(fallback_extract["risk_signals"] + grounded_llm_risks))
-    extracted["caution_signals"] = list(dict.fromkeys((llm_extract or {}).get("caution_signals") or fallback_extract["caution_signals"]))
+    # Preserve the established extractor precedence: a grounded model signal
+    # is the concise explanation shown to the user; rules are the fallback
+    # when the model supplied nothing that can be traced to this JD.
+    extracted["caution_signals"] = list(dict.fromkeys(grounded_llm_cautions or fallback_extract["caution_signals"]))
     if fallback_extract.get("salary_text"):
         extracted["salary_text"] = fallback_extract["salary_text"]
     elif extracted.get("salary_text") and not looks_like_salary_text(extracted["salary_text"]):
@@ -986,6 +1008,10 @@ def rescore_saved_job(conn: Any, job_id: int) -> dict[str, Any]:
     extracted = clean_extracted(stored_extracted or fallback_extract)
     if not extracted.get("required_skills"):
         extracted["required_skills"] = fallback_extract["required_skills"]
+    stored_risks = grounded_jd_signals(extracted.get("risk_signals", []), analysis_text)
+    stored_cautions = grounded_jd_signals(extracted.get("caution_signals", []), analysis_text)
+    extracted["risk_signals"] = list(dict.fromkeys(fallback_extract["risk_signals"] + stored_risks))
+    extracted["caution_signals"] = list(dict.fromkeys(fallback_extract["caution_signals"] + stored_cautions))
     apply_blacklists(extracted, analysis_text)
     resume_id = job.get("selected_resume_id")
     resume_text, matching_evidence = get_matching_evidence(int(resume_id) if resume_id else None)
@@ -1217,6 +1243,7 @@ def default_search_form() -> dict[str, str]:
         "city": str(saved.get("city") or ""),
         "browser_channel": str(saved.get("browser_channel") or "msedge"),
         "search_url": str(saved.get("search_url") or ""),
+        "target_id": str(saved.get("target_id") or ""),
     }
 
 
@@ -1342,6 +1369,7 @@ def save_last_manual_search(
     city: str,
     browser_channel: str = "msedge",
     search_url: str = "",
+    target_id: str = "",
 ) -> None:
     set_setting(
         LAST_MANUAL_SEARCH_KEY,
@@ -1351,6 +1379,7 @@ def save_last_manual_search(
             "city": city,
             "browser_channel": browser_channel or "msedge",
             "search_url": search_url,
+            "target_id": target_id[:120],
         },
     )
 
@@ -5875,6 +5904,7 @@ def run_visual_page_review(
     *,
     expected_url: str = "",
     platform: str = "",
+    target_id: str = "",
     salary_targets: list[dict[str, str]] | None = None,
     client_override: OpenAICompatibleClient | None = None,
 ) -> dict[str, Any]:
@@ -5890,7 +5920,12 @@ def run_visual_page_review(
     client = clients[0]
     visual_attempts: list[dict[str, str]] = []
     try:
-        capture = capture_controlled_edge_visual_page(mode, expected_url=expected_url, platform=platform)
+        capture = capture_controlled_edge_visual_page(
+            mode,
+            expected_url=expected_url,
+            platform=platform,
+            target_id=target_id,
+        )
         metadata = capture.get("metadata") if isinstance(capture.get("metadata"), dict) else {}
         history = [item for item in control_history_for_model() if item.get("assistant")][-6:]
         history_text = "\n".join(
@@ -8840,11 +8875,13 @@ async def open_manual_search(request: Request) -> RedirectResponse:
         return redirect_with_notice("/searches", "请填写搜索关键词。", "error")
     save_last_manual_search(platform, keyword, city, "msedge")
     try:
-        search_url = await run_in_threadpool(open_manual_search_in_edge, platform, keyword, city)
+        search_url, target = await run_in_threadpool(open_manual_search_target_in_edge, platform, keyword, city)
     except Exception as exc:
         run_id = save_search_failure(platform, keyword, city, "msedge", f"打开 Edge 失败：{str(exc)}")
         return redirect_with_notice(f"/searches/{run_id}", f"打开 Edge 失败：{str(exc)[:160]}", "error")
-    save_last_manual_search(platform, keyword, city, "msedge", search_url)
+    # Keep the exact URL that was just opened so a later manual capture does
+    # not accidentally select an older same-platform search tab.
+    save_last_manual_search(platform, keyword, city, "msedge", search_url, str(target.get("id") or ""))
     return redirect_with_notice("/searches", f"已打开 Edge 搜索页：{search_url}。完成登录或筛选后，点击“采集当前 Edge 页面”。", "success")
 
 
@@ -8858,14 +8895,97 @@ async def capture_current_search(request: Request) -> RedirectResponse:
     browser_channel = search_form_value(form, "browser_channel", saved["browser_channel"]) or "msedge"
     if not keyword:
         return redirect_with_notice("/searches", "请填写搜索关键词。", "error")
-    save_last_manual_search(platform, keyword, city, browser_channel, saved.get("search_url", ""))
+    save_last_manual_search(platform, keyword, city, browser_channel, saved.get("search_url", ""), saved.get("target_id", ""))
     try:
-        result = await run_in_threadpool(capture_current_search_page, platform, keyword, city, browser_channel=browser_channel)
+        result = await run_in_threadpool(
+            capture_current_search_page,
+            platform,
+            keyword,
+            city,
+            browser_channel=browser_channel,
+            expected_url=str(saved.get("search_url") or ""),
+            target_id=str(saved.get("target_id") or ""),
+        )
     except Exception as exc:
         run_id = save_search_failure(platform, keyword, city, browser_channel, f"当前页面采集失败：{str(exc)}")
         return redirect_with_notice(f"/searches/{run_id}", f"当前页面采集失败：{str(exc)[:160]}", "error")
     run_id = save_search_result(result)
     return redirect_with_notice(f"/searches/{run_id}", f"已从当前 Edge 页面采集 {len(result.candidates)} 个候选岗位。", "success")
+
+
+@app.post("/searches/capture-current-visual")
+async def capture_current_search_with_visual_review(request: Request) -> RedirectResponse:
+    """Explicitly augment one saved manual-search target with an in-memory screenshot."""
+    form = await request.form()
+    saved = default_search_form()
+    platform = search_form_value(form, "platform", saved["platform"]) or "Boss 直聘"
+    keyword = search_form_value(form, "keyword", saved["keyword"])
+    city = search_form_value(form, "city", saved["city"])
+    browser_channel = search_form_value(form, "browser_channel", saved["browser_channel"]) or "msedge"
+    if not keyword:
+        return redirect_with_notice("/searches", "请填写搜索关键词。", "error")
+    search_url = str(saved.get("search_url") or "")
+    target_id = str(saved.get("target_id") or "")
+    save_last_manual_search(platform, keyword, city, browser_channel, search_url, target_id)
+    try:
+        result = await run_in_threadpool(
+            capture_current_search_page,
+            platform,
+            keyword,
+            city,
+            browser_channel=browser_channel,
+            expected_url=search_url,
+            target_id=target_id,
+        )
+    except Exception as exc:
+        run_id = save_search_failure(platform, keyword, city, browser_channel, f"当前页面采集失败：{str(exc)}")
+        return redirect_with_notice(f"/searches/{run_id}", f"当前页面采集失败：{str(exc)[:160]}", "error")
+
+    salary_targets = search_result_salary_visual_targets(result)
+    visual = await run_in_threadpool(
+        run_visual_page_review,
+        "viewport",
+        "为用户明确发起的本地校准补充当前搜索页的可见字段。",
+        expected_url=result.search_url,
+        platform=platform,
+        target_id=target_id,
+        salary_targets=salary_targets,
+    )
+    reconciled = 0
+    if visual.get("status") == "已完成":
+        reconciled = reconcile_search_result_with_visual_review(result, visual.get("review") or {})
+        if reconciled:
+            result.note = (result.note + " 视觉复核补充了唯一对应候选字段；截图未保存。").strip()
+        else:
+            result.note = (result.note + " 视觉复核未找到可唯一合并的字段；截图未保存。").strip()
+    else:
+        result.note = (result.note + f" 视觉复核未完成：{str(visual.get('note') or '')[:180]}。截图未保存。").strip()
+    run_id = save_search_result(result)
+    with connect() as conn:
+        log_agent_action(
+            conn,
+            action_type="manual_search_visual_review",
+            status=str(visual.get("status") or "未完成"),
+            summary=f"用户发起搜索页视觉复核：{platform} {keyword}",
+            platform=platform,
+            decision={
+                "run_id": run_id,
+                "target_id_present": bool(target_id),
+                "candidate_count": len(result.candidates),
+                "salary_target_count": len(salary_targets),
+                "reconciled_count": reconciled,
+                "image_persisted": False,
+                "page_text_saved": False,
+                "message_sent": False,
+                "application_submitted": False,
+            },
+        )
+    label = "已完成视觉复核" if visual.get("status") == "已完成" else "DOM 采集已完成，视觉复核未完成"
+    return redirect_with_notice(
+        f"/searches/{run_id}",
+        f"{label}：采集 {len(result.candidates)} 条候选，补充 {reconciled} 条字段；截图未保存。",
+        "success" if visual.get("status") == "已完成" else "warning",
+    )
 
 
 @app.get("/searches/{run_id}")
@@ -8992,6 +9112,279 @@ def candidate_calibration_report(conn: Any) -> dict[str, Any]:
     }
 
 
+def percent(value: int, total: int) -> int | None:
+    return round(value / total * 100) if total else None
+
+
+def calibration_quality_report(conn: Any) -> dict[str, Any]:
+    """Build a local-only calibration dashboard from saved observations.
+
+    Candidate field flags and rule pre-screening are diagnostics, not human
+    labels. They are intentionally separated from the feedback accuracy data.
+    """
+    profile = conn.execute("SELECT * FROM candidate_profile ORDER BY id LIMIT 1").fetchone()
+    profile_data = {key: profile[key] for key in profile.keys()} if profile else {}
+    preferences = discovery_filters_from_profile(profile_data)
+    run_rows = conn.execute(
+        """
+        SELECT r.id, r.platform, r.keyword, r.city, r.status, r.note, r.created_at,
+               COALESCE(COUNT(c.id), 0) AS candidate_count
+        FROM job_search_runs r
+        LEFT JOIN job_candidates c ON c.search_run_id = r.id
+        GROUP BY r.id
+        ORDER BY r.created_at DESC, r.id DESC
+        """
+    ).fetchall()
+    platform_metrics: dict[str, dict[str, Any]] = {}
+    for row in run_rows:
+        item = {key: row[key] for key in row.keys()}
+        platform = str(item.get("platform") or "平台待补充")
+        metric = platform_metrics.setdefault(
+            platform,
+            {
+                "platform": platform,
+                "run_count": 0,
+                "completed_count": 0,
+                "empty_count": 0,
+                "failed_count": 0,
+                "candidate_run_count": 0,
+                "candidate_count": 0,
+                "last_observed_at": "",
+            },
+        )
+        metric["run_count"] += 1
+        status = str(item.get("status") or "")
+        if status == "完成":
+            metric["completed_count"] += 1
+        elif status == "无结果":
+            metric["empty_count"] += 1
+        elif status == "失败":
+            metric["failed_count"] += 1
+        candidate_count = int(item.get("candidate_count") or 0)
+        metric["candidate_count"] += candidate_count
+        metric["candidate_run_count"] += int(candidate_count > 0)
+        metric["last_observed_at"] = metric["last_observed_at"] or str(item.get("created_at") or "")
+
+    platform_summary = []
+    for item in platform_metrics.values():
+        item["candidate_yield_percent"] = percent(item["candidate_run_count"], item["run_count"])
+        item["average_candidates"] = round(item["candidate_count"] / item["run_count"], 1) if item["run_count"] else 0
+        platform_summary.append(item)
+    platform_summary.sort(key=lambda item: (-item["run_count"], item["platform"]))
+
+    candidate_rows = conn.execute(
+        """
+        SELECT c.*, r.keyword AS run_keyword, r.city AS run_city, r.created_at AS run_created_at
+        FROM job_candidates c
+        LEFT JOIN job_search_runs r ON r.id = c.search_run_id
+        ORDER BY c.updated_at DESC, c.id DESC
+        """
+    ).fetchall()
+    field_flag_counts: Counter[str] = Counter()
+    pre_screen_reason_counts: Counter[str] = Counter()
+    flagged_candidates: list[dict[str, Any]] = []
+    auto_read_count = 0
+    auto_review_count = 0
+    for row in candidate_rows:
+        candidate = {key: row[key] for key in row.keys()}
+        flags = candidate_field_quality_flags(candidate)
+        field_flag_counts.update(flags)
+        if flags and len(flagged_candidates) < 20:
+            flagged_candidates.append(
+                {
+                    "id": int(candidate["id"]),
+                    "search_run_id": int(candidate["search_run_id"]),
+                    "platform": str(candidate.get("platform") or ""),
+                    "title": str(candidate.get("title") or "候选岗位"),
+                    "company": str(candidate.get("company") or ""),
+                    "flags": flags,
+                    "run_keyword": str(candidate.get("run_keyword") or ""),
+                    "run_city": str(candidate.get("run_city") or ""),
+                }
+            )
+        can_read, reason = discovery_candidate_screening(candidate, preferences)
+        if can_read:
+            auto_read_count += 1
+        else:
+            auto_review_count += 1
+            pre_screen_reason_counts[str(reason or "需要人工复核")] += 1
+
+    total_candidates = len(candidate_rows)
+    title_missing = field_flag_counts.get("岗位名称缺失", 0)
+    company_missing = field_flag_counts.get("公司缺失", 0)
+    company_suspect = field_flag_counts.get("公司字段疑似非公司", 0)
+    salary_unparsed = field_flag_counts.get("薪资未解析", 0)
+    field_health = {
+        "total_candidates": total_candidates,
+        "title_present_count": total_candidates - title_missing,
+        "company_present_count": total_candidates - company_missing,
+        "company_valid_count": total_candidates - company_missing - company_suspect,
+        "title_present_percent": percent(total_candidates - title_missing, total_candidates),
+        "company_present_percent": percent(total_candidates - company_missing, total_candidates),
+        "company_valid_percent": percent(total_candidates - company_missing - company_suspect, total_candidates),
+        "salary_unparsed_count": salary_unparsed,
+        "flag_counts": [{"label": label, "count": count} for label, count in field_flag_counts.most_common()],
+        "flagged_candidates": flagged_candidates,
+    }
+
+    feedback_report = candidate_calibration_report(conn)
+    detail_rows = conn.execute(
+        """
+        SELECT c.platform, c.status AS candidate_status, c.error_message,
+               j.id AS job_id, j.match_score, j.match_level, j.risk_level, j.recommendation,
+               j.analysis_source, j.jd_text, j.extracted_json
+        FROM job_candidates c
+        LEFT JOIN job_postings j ON j.id = c.job_id
+        """
+    ).fetchall()
+    detail_total = len(detail_rows)
+    detail_imported = sum(int(row["job_id"] is not None) for row in detail_rows)
+    detail_pending = sum(str(row["candidate_status"] or "") == "详情待补充" for row in detail_rows)
+    detail_failures = sum(str(row["candidate_status"] or "") == "导入失败" for row in detail_rows)
+    score_levels: Counter[str] = Counter()
+    risk_levels: Counter[str] = Counter()
+    source_counts: Counter[str] = Counter()
+    extracted_skill_total = 0
+    extracted_skill_jobs = 0
+    for row in detail_rows:
+        if row["job_id"] is None:
+            continue
+        score_levels[str(row["match_level"] or "未分档")] += 1
+        risk_levels[str(row["risk_level"] or "未分级")] += 1
+        source_counts[str(row["analysis_source"] or "未标记")] += 1
+        extracted_json = loads(row["extracted_json"], {})
+        extracted = extracted_json.get("extracted") if isinstance(extracted_json, dict) else {}
+        skills = extracted.get("required_skills") if isinstance(extracted, dict) else []
+        if isinstance(skills, list) and skills:
+            extracted_skill_jobs += 1
+            extracted_skill_total += len(skills)
+    detail_quality = {
+        "candidate_count": detail_total,
+        "imported_count": detail_imported,
+        "import_rate_percent": percent(detail_imported, detail_total),
+        "pending_count": detail_pending,
+        "failed_count": detail_failures,
+        "score_levels": [{"label": label, "count": count} for label, count in score_levels.most_common()],
+        "risk_levels": [{"label": label, "count": count} for label, count in risk_levels.most_common()],
+        "source_summary": [{"label": label, "count": count} for label, count in source_counts.most_common()],
+        "skill_extraction_coverage_percent": percent(extracted_skill_jobs, detail_imported),
+        "average_required_skill_count": round(extracted_skill_total / extracted_skill_jobs, 1) if extracted_skill_jobs else 0,
+    }
+    conversation_rows = conn.execute(
+        """
+        SELECT message_type, feedback_status, COUNT(*) AS count
+        FROM conversation_captures
+        GROUP BY message_type, feedback_status
+        """
+    ).fetchall()
+    conversation_type_counts: Counter[str] = Counter()
+    conversation_feedback_counts: Counter[str] = Counter()
+    for row in conversation_rows:
+        count = int(row["count"] or 0)
+        conversation_type_counts[str(row["message_type"] or "未分类")] += count
+        if str(row["feedback_status"] or ""):
+            conversation_feedback_counts[str(row["feedback_status"])] += count
+    conversation_total = sum(conversation_type_counts.values())
+    conversation_reviewed = sum(conversation_feedback_counts.values())
+    patrol_row = conn.execute(
+        """
+        SELECT COUNT(*) AS run_count, COALESCE(SUM(checked_count), 0) AS checked_count,
+               COALESCE(SUM(new_count), 0) AS new_count, COALESCE(SUM(skipped_count), 0) AS skipped_count,
+               COALESCE(SUM(error_count), 0) AS error_count
+        FROM message_patrol_runs
+        """
+    ).fetchone()
+    unread_scan_count = int(conn.execute("SELECT COUNT(*) AS count FROM unread_conversation_scans").fetchone()["count"])
+
+    model_rows = conn.execute(
+        """
+        SELECT task_type, COUNT(*) AS call_count,
+               COALESCE(SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END), 0) AS success_count,
+               COALESCE(SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END), 0) AS error_count,
+               COALESCE(SUM(total_tokens), 0) AS total_tokens,
+               COALESCE(SUM(estimated_cost), 0) AS estimated_cost
+        FROM model_call_logs
+        GROUP BY task_type
+        ORDER BY call_count DESC, task_type
+        """
+    ).fetchall()
+    model_summary = [
+        {
+            "task_type": str(row["task_type"] or "未分类"),
+            "call_count": int(row["call_count"] or 0),
+            "success_count": int(row["success_count"] or 0),
+            "error_count": int(row["error_count"] or 0),
+            "total_tokens": int(row["total_tokens"] or 0),
+            "estimated_cost": round(float(row["estimated_cost"] or 0), 4),
+        }
+        for row in model_rows
+    ]
+
+    search_summary = {
+        "run_count": len(run_rows),
+        "completed_count": sum(item["completed_count"] for item in platform_summary),
+        "empty_count": sum(item["empty_count"] for item in platform_summary),
+        "failed_count": sum(item["failed_count"] for item in platform_summary),
+        "candidate_run_count": sum(item["candidate_run_count"] for item in platform_summary),
+        "candidate_count": total_candidates,
+    }
+    search_summary["candidate_yield_percent"] = percent(search_summary["candidate_run_count"], search_summary["run_count"])
+
+    suggestions: list[str] = []
+    if feedback_report["reviewed_count"] < max(8, total_candidates // 20):
+        suggestions.append("人工候选反馈覆盖仍偏低；自动字段信号和规则预筛只能定位问题，不能替代正确/误判标注。")
+    if company_missing or company_suspect:
+        suggestions.append(f"公司字段有 {company_missing + company_suspect} 条缺失或疑似非公司值，优先复核最近字段异常样本。")
+    if search_summary["empty_count"]:
+        suggestions.append(f"已记录 {search_summary['empty_count']} 次零结果页面观测；应区分真实无结果、登录/筛选条件和 DOM 提取问题。")
+    if conversation_total and not conversation_reviewed:
+        suggestions.append("已有对话采集但尚未人工标注，暂不能以其分类结果评价 HR 消息判断质量。")
+    if not suggestions:
+        suggestions.append("当前校准数据结构完整；继续在真实页面上补充人工反馈，再决定是否调整规则。")
+
+    return {
+        "search_summary": search_summary,
+        "platform_summary": platform_summary,
+        "field_health": field_health,
+        "pre_screen": {
+            "auto_read_count": auto_read_count,
+            "auto_review_count": auto_review_count,
+            "reason_summary": [{"reason": reason, "count": count} for reason, count in pre_screen_reason_counts.most_common(8)],
+        },
+        "candidate_feedback": feedback_report,
+        "detail_quality": detail_quality,
+        "conversation": {
+            "total_count": conversation_total,
+            "reviewed_count": conversation_reviewed,
+            "type_summary": [{"label": label, "count": count} for label, count in conversation_type_counts.most_common()],
+            "feedback_summary": [{"label": label, "count": count} for label, count in conversation_feedback_counts.most_common()],
+        },
+        "patrol": {
+            "run_count": int(patrol_row["run_count"] or 0),
+            "checked_count": int(patrol_row["checked_count"] or 0),
+            "new_count": int(patrol_row["new_count"] or 0),
+            "skipped_count": int(patrol_row["skipped_count"] or 0),
+            "error_count": int(patrol_row["error_count"] or 0),
+            "unread_scan_count": unread_scan_count,
+        },
+        "model_summary": model_summary,
+        "recent_observations": [
+            {
+                "id": int(row["id"]),
+                "platform": str(row["platform"] or "平台待补充"),
+                "keyword": str(row["keyword"] or ""),
+                "city": str(row["city"] or ""),
+                "status": str(row["status"] or ""),
+                "candidate_count": int(row["candidate_count"] or 0),
+                "note": str(row["note"] or "")[:280],
+                "created_at": str(row["created_at"] or ""),
+            }
+            for row in run_rows[:16]
+        ],
+        "suggestions": suggestions,
+    }
+
+
 @app.get("/calibration/candidates")
 def candidate_calibration_page(request: Request) -> Any:
     with connect() as conn:
@@ -9005,6 +9398,28 @@ def candidate_calibration_page(request: Request) -> Any:
             "notice_type": request.query_params.get("notice_type", "info"),
         },
     )
+
+
+@app.get("/calibration")
+def calibration_dashboard_page(request: Request) -> Any:
+    with connect() as conn:
+        report = calibration_quality_report(conn)
+    return templates.TemplateResponse(
+        request,
+        "calibration_dashboard.html",
+        {
+            "report": report,
+            "notice": request.query_params.get("notice", ""),
+            "notice_type": request.query_params.get("notice_type", "info"),
+        },
+    )
+
+
+@app.get("/calibration/export.json")
+def calibration_dashboard_export() -> JSONResponse:
+    with connect() as conn:
+        report = calibration_quality_report(conn)
+    return JSONResponse({"ok": True, "report": report})
 
 
 @app.post("/candidates/{candidate_id}/feedback")

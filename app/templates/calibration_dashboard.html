@@ -1,0 +1,183 @@
+{% extends "layout.html" %}
+{% block title %}质量校准报告 - 简历投递 Agent{% endblock %}
+{% block content %}
+<section class="page-head">
+  <div>
+    <h1>质量校准报告</h1>
+    <p>汇总本地搜索、候选字段、规则预筛、人工反馈、巡检和模型调用观测。</p>
+  </div>
+  <div class="form-actions">
+    <a class="button" href="/calibration/candidates">人工候选反馈</a>
+    <a class="button" href="/calibration/export.json">导出 JSON</a>
+    <a class="button" href="/searches">返回岗位搜索</a>
+  </div>
+</section>
+
+{% if notice %}
+<section class="notice {{ notice_type }}">{{ notice }}</section>
+{% endif %}
+
+<section class="metrics">
+  <div class="metric"><span>搜索页面观测</span><strong>{{ report.search_summary.run_count }}</strong></div>
+  <div class="metric"><span>有候选页面</span><strong>{{ report.search_summary.candidate_run_count }}</strong></div>
+  <div class="metric"><span>零结果页面</span><strong>{{ report.search_summary.empty_count }}</strong></div>
+  <div class="metric"><span>候选记录</span><strong>{{ report.search_summary.candidate_count }}</strong></div>
+  <div class="metric"><span>人工标注候选</span><strong>{{ report.candidate_feedback.reviewed_count }}</strong></div>
+  <div class="metric"><span>已标注对话</span><strong>{{ report.conversation.reviewed_count }}</strong></div>
+</section>
+
+<section class="panel calibration-boundary">
+  <strong>读数口径</strong>
+  <span>真实页面观测、自动字段诊断、规则预筛和人工标注分别统计。只有人工“正确 / 误判”反馈才用于候选准确率；本页不调用模型、不访问招聘平台、不改写任何候选状态。</span>
+</section>
+
+<section class="grid-two">
+  <section class="panel">
+    <div class="panel-title"><div><h2>平台页面覆盖</h2><p class="muted">“有候选页面”只表示页面读取到候选，不代表岗位匹配。</p></div></div>
+    {% if report.platform_summary %}
+    <div class="calibration-bars">
+      {% for item in report.platform_summary %}
+      <div class="calibration-bar-row">
+        <div class="calibration-bar-label"><strong>{{ item.platform }}</strong><span>{{ item.candidate_run_count }}/{{ item.run_count }} 有候选 · {{ item.candidate_count }} 条记录</span></div>
+        <div class="calibration-bar-track"><span class="calibration-bar-fill" style="width: {{ item.candidate_yield_percent or 0 }}%"></span></div>
+        <div class="calibration-bar-meta">{% if item.candidate_yield_percent is not none %}{{ item.candidate_yield_percent }}%{% else %}-{% endif %}</div>
+      </div>
+      {% endfor %}
+    </div>
+    {% else %}<p class="empty">尚未记录搜索页面观测。</p>{% endif %}
+  </section>
+
+  <section class="panel">
+    <div class="panel-title"><div><h2>候选字段健康度</h2><p class="muted">仅检查标题、公司和薪资字段完整性，不评价岗位好坏。</p></div></div>
+    <dl class="calibration-definition-list">
+      <dt>岗位名称可读</dt><dd>{{ report.field_health.title_present_count }} / {{ report.field_health.total_candidates }}{% if report.field_health.title_present_percent is not none %} · {{ report.field_health.title_present_percent }}%{% endif %}</dd>
+      <dt>公司字段存在</dt><dd>{{ report.field_health.company_present_count }} / {{ report.field_health.total_candidates }}{% if report.field_health.company_present_percent is not none %} · {{ report.field_health.company_present_percent }}%{% endif %}</dd>
+      <dt>公司字段可信</dt><dd>{{ report.field_health.company_valid_count }} / {{ report.field_health.total_candidates }}{% if report.field_health.company_valid_percent is not none %} · {{ report.field_health.company_valid_percent }}%{% endif %}</dd>
+      <dt>薪资未解析</dt><dd>{{ report.field_health.salary_unparsed_count }}</dd>
+    </dl>
+    {% if report.field_health.flag_counts %}
+    <div class="calibration-chip-list">
+      {% for item in report.field_health.flag_counts %}<span class="badge warning">{{ item.label }} {{ item.count }}</span>{% endfor %}
+    </div>
+    {% endif %}
+  </section>
+</section>
+
+<section class="grid-two">
+  <section class="panel">
+    <div class="panel-title"><div><h2>JD 读取与评分覆盖</h2><p class="muted">只统计本地结果，不展示 JD 正文。</p></div></div>
+    <dl class="calibration-definition-list">
+      <dt>候选详情已导入</dt><dd>{{ report.detail_quality.imported_count }} / {{ report.detail_quality.candidate_count }}{% if report.detail_quality.import_rate_percent is not none %} · {{ report.detail_quality.import_rate_percent }}%{% endif %}</dd>
+      <dt>详情待补充</dt><dd>{{ report.detail_quality.pending_count }}</dd>
+      <dt>导入失败</dt><dd>{{ report.detail_quality.failed_count }}</dd>
+      <dt>技能字段有结果</dt><dd>{% if report.detail_quality.skill_extraction_coverage_percent is not none %}{{ report.detail_quality.skill_extraction_coverage_percent }}%{% else %}-{% endif %}</dd>
+      <dt>平均技术要求数</dt><dd>{{ report.detail_quality.average_required_skill_count }}</dd>
+    </dl>
+  </section>
+  <section class="panel">
+    <div class="panel-title"><div><h2>详情分析分布</h2><p class="muted">风险分级只来自 JD 文本、黑名单或后续独立公司研究。</p></div></div>
+    <div class="calibration-chip-list">
+      {% for item in report.detail_quality.score_levels %}<span class="badge">{{ item.label }} {{ item.count }}</span>{% endfor %}
+      {% for item in report.detail_quality.risk_levels %}<span class="badge{% if item.label == '谨慎' %} warning{% elif item.label == '高' %} danger{% endif %}">风险 {{ item.label }} {{ item.count }}</span>{% endfor %}
+    </div>
+    {% if report.detail_quality.source_summary %}
+    <ul class="compact-list calibration-detail-list">
+      {% for item in report.detail_quality.source_summary %}<li>{{ item.label }} <span class="badge">{{ item.count }}</span></li>{% endfor %}
+    </ul>
+    {% endif %}
+  </section>
+</section>
+
+<section class="grid-two">
+  <section class="panel">
+    <div class="panel-title"><div><h2>规则预筛模拟</h2><p class="muted">按当前画像偏好重放本地规则，不写入候选状态。</p></div></div>
+    <div class="calibration-split-metrics">
+      <div><span>可继续读取 JD</span><strong>{{ report.pre_screen.auto_read_count }}</strong></div>
+      <div><span>需人工复核</span><strong>{{ report.pre_screen.auto_review_count }}</strong></div>
+    </div>
+    {% if report.pre_screen.reason_summary %}
+    <ul class="compact-list">
+      {% for item in report.pre_screen.reason_summary %}<li>{{ item.reason }} <span class="badge">{{ item.count }}</span></li>{% endfor %}
+    </ul>
+    {% endif %}
+  </section>
+
+  <section class="panel">
+    <div class="panel-title"><div><h2>人工标注覆盖</h2><p class="muted">未标注样本不会计入候选准确率。</p></div></div>
+    <dl class="calibration-definition-list">
+      <dt>候选已标注</dt><dd>{{ report.candidate_feedback.reviewed_count }} / {{ report.candidate_feedback.total_candidates }}</dd>
+      <dt>正确</dt><dd>{{ report.candidate_feedback.feedback_counts.get('正确', 0) }}</dd>
+      <dt>误判</dt><dd>{{ report.candidate_feedback.feedback_counts.get('误判', 0) }}</dd>
+      <dt>待观察</dt><dd>{{ report.candidate_feedback.feedback_counts.get('待观察', 0) }}</dd>
+      <dt>详情待补充</dt><dd>{{ report.candidate_feedback.detail_pending_count }}</dd>
+    </dl>
+  </section>
+</section>
+
+<section class="grid-two">
+  <section class="panel">
+    <div class="panel-title"><div><h2>对话与巡检覆盖</h2><p class="muted">消息正文不在本页展示。</p></div></div>
+    <dl class="calibration-definition-list">
+      <dt>对话采集</dt><dd>{{ report.conversation.total_count }}</dd>
+      <dt>人工标注对话</dt><dd>{{ report.conversation.reviewed_count }}</dd>
+      <dt>巡检批次</dt><dd>{{ report.patrol.run_count }}</dd>
+      <dt>巡检新内容</dt><dd>{{ report.patrol.new_count }}</dd>
+      <dt>巡检跳过</dt><dd>{{ report.patrol.skipped_count }}</dd>
+      <dt>未读结构扫描</dt><dd>{{ report.patrol.unread_scan_count }}</dd>
+    </dl>
+    {% if report.conversation.type_summary %}<div class="calibration-chip-list">{% for item in report.conversation.type_summary %}<span class="badge">{{ item.label }} {{ item.count }}</span>{% endfor %}</div>{% endif %}
+  </section>
+
+  <section class="panel">
+    <div class="panel-title"><div><h2>模型调用概览</h2><p class="muted">只统计任务、状态、token 和费用估算，不展示 prompt 或正文。</p></div></div>
+    {% if report.model_summary %}
+    <div class="table-wrap compact-table">
+      <table>
+        <thead><tr><th>任务</th><th>调用</th><th>成功</th><th>错误</th><th>Token</th></tr></thead>
+        <tbody>{% for item in report.model_summary[:8] %}<tr><td>{{ item.task_type }}</td><td>{{ item.call_count }}</td><td>{{ item.success_count }}</td><td>{{ item.error_count }}</td><td>{{ item.total_tokens }}</td></tr>{% endfor %}</tbody>
+      </table>
+    </div>
+    {% else %}<p class="empty">尚未记录模型调用。</p>{% endif %}
+  </section>
+</section>
+
+<section class="panel">
+  <div class="panel-title"><div><h2>最近页面观测</h2><p class="muted">记录页面读取结果和候选数，不保存 Cookie、验证码或完整网页正文。</p></div></div>
+  {% if report.recent_observations %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>页面</th><th>关键词</th><th>结果</th><th>候选</th><th>说明</th><th>时间</th></tr></thead>
+      <tbody>
+        {% for item in report.recent_observations %}
+        <tr>
+          <td><a href="/searches/{{ item.id }}">{{ item.platform }}</a><div class="muted">{{ item.city or '不限城市' }}</div></td>
+          <td>{{ item.keyword or '-' }}</td>
+          <td><span class="badge{% if item.status == '失败' %} danger{% elif item.status == '无结果' %} warning{% endif %}">{{ item.status or '-' }}</span></td>
+          <td>{{ item.candidate_count }}</td>
+          <td class="calibration-note">{{ item.note or '-' }}</td>
+          <td>{{ item.created_at }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}<p class="empty">尚未记录页面观测。</p>{% endif %}
+</section>
+
+<section class="grid-two">
+  <section class="panel">
+    <div class="panel-title"><div><h2>最近字段异常</h2><p class="muted">自动检测结果，需结合页面人工复核。</p></div></div>
+    {% if report.field_health.flagged_candidates %}
+    <ul class="compact-list calibration-flagged-list">
+      {% for item in report.field_health.flagged_candidates[:10] %}
+      <li><a href="/searches/{{ item.search_run_id }}">{{ item.title }}</a><span>{{ item.company or '公司待确认' }} · {{ item.flags | join('、') }}</span></li>
+      {% endfor %}
+    </ul>
+    {% else %}<p class="empty">未发现字段异常。</p>{% endif %}
+  </section>
+  <section class="panel">
+    <div class="panel-title"><div><h2>下一轮校准</h2></div></div>
+    <ul class="compact-list">{% for item in report.suggestions %}<li>{{ item }}</li>{% endfor %}</ul>
+  </section>
+</section>
+{% endblock %}

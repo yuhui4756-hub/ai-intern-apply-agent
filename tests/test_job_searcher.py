@@ -3,6 +3,7 @@ import pytest
 from app.services import job_searcher
 from app.services.job_searcher import (
     build_search_url,
+    candidate_field_quality_flags,
     capture_current_search_page,
     close_owned_search_target,
     controlled_edge_status,
@@ -106,6 +107,48 @@ def test_extract_candidates_filters_mixed_card_fields():
     assert "北京字节跳动" not in candidates[1].summary
 
 
+def test_extract_candidates_does_not_use_a_technology_label_as_company_name():
+    anchors = [
+        {
+            "href": "https://www.zhipin.com/job_detail/technology-only-company.html",
+            "text": "Agent Python 后端开发",
+            "context": "Agent Python 后端开发\nPHP\nJava\nDocker\nPython\nFastAPI",
+        }
+    ]
+
+    candidates = extract_candidates_from_anchors(anchors, "Boss 直聘", "深圳")
+
+    assert len(candidates) == 1
+    assert candidates[0].company == ""
+
+
+def test_candidate_field_quality_flags_identifies_only_extraction_issues():
+    candidate = {
+        "title": "候选岗位",
+        "company": "Java",
+        "summary": "薪资数字未能从页面文本读取\nAI 应用开发",
+    }
+
+    assert candidate_field_quality_flags(candidate) == ["岗位名称缺失", "公司字段疑似非公司", "薪资未解析"]
+
+
+def test_extract_candidates_rejects_private_font_salary_as_a_company_name():
+    anchors = [
+        {
+            "href": "https://www.zhipin.com/job_detail/private-font-salary.html",
+            "text": "高级 Python 开发工程师（大模型方向）",
+            "context": "高级 Python 开发工程师（大模型方向）\n\ue032\ue039-\ue033\ue032K\n5-10年\nPython\nJava",
+        }
+    ]
+
+    candidates = extract_candidates_from_anchors(anchors, "Boss 直聘", "深圳")
+
+    assert len(candidates) == 1
+    assert candidates[0].company == ""
+    assert "薪资数字未能从页面文本读取" in candidates[0].summary
+    assert candidate_field_quality_flags(candidates[0]) == ["公司缺失", "薪资未解析"]
+
+
 def test_extract_candidates_rejects_liepin_career_navigation_with_global_search_context():
     anchors = [
         {
@@ -178,6 +221,24 @@ def test_find_controlled_search_page_accepts_boss_search_redirect_and_rejects_ne
     assert find_controlled_search_page([new_tab], "Boss 直聘") is None
 
 
+def test_find_controlled_search_page_accepts_redirected_path_and_equivalent_query_encoding():
+    expected = "https://www.zhipin.com/web/geek/job?query=AI+Agent+%E5%BC%80%E5%8F%91&city=101280600"
+    older = {
+        "id": "older-boss-search",
+        "type": "page",
+        "url": "https://www.zhipin.com/web/geek/jobs?query=AI%20%E5%BA%94%E7%94%A8&city=101280600",
+    }
+    redirected = {
+        "id": "redirected-boss-search",
+        "type": "page",
+        "url": "https://www.zhipin.com/web/geek/jobs?query=AI%20Agent%20%E5%BC%80%E5%8F%91&city=101280600",
+    }
+
+    selected = find_controlled_search_page([redirected, older], "Boss 直聘", expected_url=expected)
+
+    assert selected == redirected
+
+
 def test_find_controlled_search_page_accepts_cdp_target_dict():
     target = {
         "id": "boss-search",
@@ -193,6 +254,27 @@ def test_find_controlled_search_page_accepts_cdp_target_dict():
     )
 
     assert selected == target
+
+
+def test_find_controlled_search_page_prefers_exact_query_when_platform_has_multiple_search_tabs():
+    older_search = {
+        "id": "older-ai-search",
+        "type": "page",
+        "url": "https://www.liepin.com/zhaopin/?key=AI+%E5%BA%94%E7%94%A8&city=%E6%B7%B1%E5%9C%B3",
+    }
+    intended_search = {
+        "id": "new-python-search",
+        "type": "page",
+        "url": "https://www.liepin.com/zhaopin/?key=Python&city=%E6%B7%B1%E5%9C%B3",
+    }
+
+    selected = find_controlled_search_page(
+        [intended_search, older_search],
+        "猎聘",
+        expected_url=intended_search["url"],
+    )
+
+    assert selected == intended_search
 
 
 def test_capture_controlled_search_reads_cdp_target_without_playwright(monkeypatch):
@@ -214,7 +296,7 @@ def test_capture_controlled_search_reads_cdp_target_without_playwright(monkeypat
     }
 
     monkeypatch.setattr(job_searcher, "wait_for_debug_endpoint", lambda **_kwargs: True)
-    monkeypatch.setattr(job_searcher, "wait_for_controlled_search_page", lambda *_args, **_kwargs: target)
+    monkeypatch.setattr(job_searcher, "read_controlled_edge_targets", lambda: [target])
     monkeypatch.setattr(job_searcher, "evaluate_cdp_expression", lambda *_args, **_kwargs: snapshot)
     monkeypatch.setattr(job_searcher.time, "sleep", lambda _seconds: None)
 
@@ -222,6 +304,46 @@ def test_capture_controlled_search_reads_cdp_target_without_playwright(monkeypat
 
     assert result.search_url == target["url"]
     assert result.candidates[0].company == "测试智能科技"
+
+
+def test_capture_controlled_search_uses_saved_target_id_when_duplicate_tabs_share_a_url(monkeypatch):
+    intended = {
+        "id": "intended-search",
+        "type": "page",
+        "url": "https://www.zhipin.com/web/geek/jobs?query=AI%20Agent&city=101280600",
+        "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/intended-search",
+    }
+    duplicate = {**intended, "id": "older-search", "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/older-search"}
+    seen_targets = []
+
+    monkeypatch.setattr(job_searcher, "wait_for_debug_endpoint", lambda **_kwargs: True)
+    monkeypatch.setattr(job_searcher, "read_controlled_edge_targets", lambda: [duplicate, intended])
+    monkeypatch.setattr(job_searcher.time, "sleep", lambda _seconds: None)
+
+    def fake_evaluate(target, *_args, **_kwargs):
+        seen_targets.append(target["id"])
+        return {
+            "url": target["url"],
+            "anchors": [
+                {
+                    "href": "https://www.zhipin.com/job_detail/target-bound.html",
+                    "text": "AI Agent 开发实习生",
+                    "context": "AI Agent 开发实习生\n目标标签科技\n深圳\n200-300元/天",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(job_searcher, "evaluate_cdp_expression", fake_evaluate)
+    result = capture_current_search_page(
+        "Boss 直聘",
+        "AI Agent",
+        "深圳",
+        expected_url=intended["url"],
+        target_id="intended-search",
+    )
+
+    assert seen_targets == ["intended-search"]
+    assert result.candidates[0].company == "目标标签科技"
 
 
 def test_capture_controlled_search_stops_at_login_or_security_interstitial(monkeypatch):
@@ -315,26 +437,28 @@ def test_automatic_search_keeps_its_owned_target_until_the_task_closes_it(monkey
 
 
 def test_open_manual_search_opens_target_after_controlled_edge_starts(tmp_path, monkeypatch):
-    opened_urls = []
     launch_args = []
+    target = {"id": "manual-target", "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/manual-target"}
 
     monkeypatch.setattr(job_searcher, "find_edge_executable", lambda: tmp_path / "msedge.exe")
     monkeypatch.setattr(job_searcher, "browser_profile_dir", lambda _name: tmp_path / "profile")
     monkeypatch.setattr(job_searcher, "is_debug_endpoint_ready", lambda: False)
     monkeypatch.setattr(job_searcher, "wait_for_debug_endpoint", lambda: True)
-    monkeypatch.setattr(job_searcher, "open_url_in_debug_browser", lambda url: opened_urls.append(url) or True)
+    monkeypatch.setattr(job_searcher, "create_controlled_edge_target", lambda _url: target)
     monkeypatch.setattr(job_searcher.subprocess, "Popen", lambda args, **_kwargs: launch_args.extend(args))
 
     search_url = open_manual_search_in_edge("Boss 直聘", "AI Agent", "杭州")
 
-    assert opened_urls == [search_url]
+    launched_url, launched_target = job_searcher.open_manual_search_target_in_edge("Boss 直聘", "AI Agent", "杭州")
+    assert launched_url == search_url
+    assert launched_target == target
     assert launch_args[-1] == "about:blank"
 
 
 def test_capture_current_search_page_retries_transient_playwright_shutdown(monkeypatch):
     calls = []
 
-    def fake_read_once(_platform, _expected_url):
+    def fake_read_once(_platform, _expected_url, _target_id=""):
         calls.append(1)
         if len(calls) == 1:
             raise RuntimeError("Event loop is closed! Is Playwright already stopped?")
@@ -382,7 +506,7 @@ def test_fetch_controlled_edge_retries_only_transient_read_failure(monkeypatch):
 def test_controlled_edge_does_not_retry_non_transient_error(monkeypatch):
     calls = []
 
-    def fake_read_once(_platform, _expected_url):
+    def fake_read_once(_platform, _expected_url, _target_id=""):
         calls.append(1)
         raise RuntimeError("招聘平台要求完成验证码")
 

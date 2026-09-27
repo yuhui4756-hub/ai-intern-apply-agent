@@ -7,6 +7,7 @@
     <p>岗位发现会使用受控 Edge 的登录状态，按持久化任务轮换搜索并自动导入有限数量的 JD 评分。</p>
   </div>
   <div class="form-actions">
+    <a class="button primary" href="/calibration">质量校准报告</a>
     <a class="button" href="/calibration/candidates">候选校准报告</a>
     <a class="button" href="/jobs">岗位列表</a>
   </div>
@@ -128,6 +129,7 @@
       <div class="form-actions table-actions">
         <button class="button" type="submit" formaction="/searches/open-manual">打开受控 Edge 搜索页</button>
         <button class="button" type="submit" formaction="/searches/capture-current">采集当前 Edge 页面</button>
+        <button class="button" type="submit" formaction="/searches/capture-current-visual">采集并视觉复核</button>
         <button class="button" type="submit" formaction="/searches">使用独立浏览器采集</button>
       </div>
       <p class="muted">独立浏览器不共享受控 Edge 的登录状态，仅用于排查。</p>
