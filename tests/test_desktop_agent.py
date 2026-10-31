@@ -224,7 +224,7 @@ def test_desktop_search_task_uses_the_chat_selected_model_for_visual_work(tmp_pa
     assert created == [({"role": "AI 应用开发实习", "city": "杭州", "min_salary_per_day": None}, 1)]
 
 
-def test_desktop_auto_toggle_authorizes_only_current_session_without_enabling_patrol(tmp_path, monkeypatch):
+def test_desktop_auto_toggle_is_session_scoped_and_preserves_global_pause(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "desktop-agent-auto-toggle.sqlite3"))
     from app import main
     from app.db import get_setting, init_db, set_setting, utc_now
@@ -243,15 +243,24 @@ def test_desktop_auto_toggle_authorizes_only_current_session_without_enabling_pa
     monkeypatch.setattr(desktop_agent, "load_client", lambda _profile_id: (FakeClient(), {"id": 1, "name": "Terra", "model": "gpt-5.6-terra"}))
     client = TestClient(main.app)
     session_id = client.get("/api/agent/bootstrap").json()["conversation"]["session"]["id"]
-    response = client.post(
-        f"/api/agent/sessions/{session_id}/messages",
-        json={"message": "开启自动沟通", "auto_communication": True},
-    )
+    response = client.post(f"/api/agent/sessions/{session_id}/auto-communication", json={"enabled": True})
 
     assert response.status_code == 200
     assert response.json()["conversation"]["session"]["auto_communication"] is True
-    assert get_setting("automation_control", {})["paused"] is False
+    assert get_setting("automation_control", {})["paused"] is True
     assert get_setting("message_patrol_policy", {})["enabled"] is False
+
+    message_response = client.post(
+        f"/api/agent/sessions/{session_id}/messages",
+        json={"message": "继续分析岗位", "auto_communication": False},
+    )
+    assert message_response.status_code == 200
+    assert message_response.json()["conversation"]["session"]["auto_communication"] is True
+
+    response = client.post(f"/api/agent/sessions/{session_id}/auto-communication", json={"enabled": False})
+    assert response.status_code == 200
+    assert response.json()["conversation"]["session"]["auto_communication"] is False
+    assert get_setting("automation_control", {})["paused"] is True
 
 
 def test_desktop_auto_communication_uses_first_contact_gate_and_never_uploads(tmp_path, monkeypatch):
@@ -339,4 +348,63 @@ def test_desktop_auto_communication_blocks_low_score_before_opening_browser(tmp_
 
     assert result["status"] == "已阻止"
     assert "匹配分低于主动沟通阈值" in result["note"]
+    assert opened == []
+
+
+def test_desktop_auto_communication_respects_global_pause_before_opening_browser(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "desktop-agent-auto-contact-paused.sqlite3"))
+    from app import main
+    from app.db import connect, init_db, set_setting, utc_now
+
+    init_db()
+    now = utc_now()
+    set_setting("automation_control", {"paused": True, "pause_reason": "人工暂停", "updated_at": now})
+    with connect() as conn:
+        job_id = conn.execute(
+            """
+            INSERT INTO job_postings (platform, source_url, title, jd_text, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            ("Boss 直聘", "https://www.zhipin.com/job_detail/paused.html", "AI 应用开发实习生", "Python FastAPI", now, now),
+        ).lastrowid
+
+    opened = []
+    monkeypatch.setattr(main, "open_message_patrol_browser", lambda *_args: opened.append(True))
+
+    result = main.run_desktop_autonomous_first_contact(int(job_id), session_id=10)
+
+    assert result["status"] == "已暂停"
+    assert result["contact_clicked"] is False
+    assert result["message_sent"] is False
+    assert opened == []
+
+
+def test_desktop_auto_communication_rechecks_pause_after_draft_creation(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DB_PATH", str(tmp_path / "desktop-agent-auto-contact-pause-race.sqlite3"))
+    from app import main
+    from app.db import connect, init_db, utc_now
+
+    init_db()
+    now = utc_now()
+    with connect() as conn:
+        job_id = conn.execute(
+            """
+            INSERT INTO job_postings (platform, source_url, title, jd_text, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            ("Boss 直聘", "https://www.zhipin.com/job_detail/paused-race.html", "AI 应用开发实习生", "Python FastAPI", now, now),
+        ).lastrowid
+
+    pause_states = iter((False, True))
+    monkeypatch.setattr(main, "automation_control", lambda: {"paused": next(pause_states), "status_label": "运行中"})
+    monkeypatch.setattr(main, "ensure_desktop_autonomous_first_contact_draft", lambda *_args, **_kwargs: {"draft_id": 123})
+    opened = []
+    monkeypatch.setattr(main, "open_message_patrol_browser", lambda *_args: opened.append(True))
+
+    result = main.run_desktop_autonomous_first_contact(int(job_id), session_id=11)
+
+    assert result["status"] == "已暂停"
+    assert result["draft_id"] == 123
+    assert result["contact_clicked"] is False
+    assert result["message_sent"] is False
     assert opened == []

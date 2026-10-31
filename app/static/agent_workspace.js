@@ -23,6 +23,13 @@
   const autoCommunication = $("[data-auto-communication]");
   const manualMenu = $("[data-manual-menu]");
   const evidenceMemories = $("[data-evidence-memories]");
+  const contextPanel = $("[data-context-panel]");
+
+  function syncContextControls() {
+    const compact = window.matchMedia("(max-width: 1100px)").matches;
+    const expanded = compact ? root.classList.contains("context-open") : !contextPanel.classList.contains("collapsed");
+    root.querySelectorAll("[data-toggle-context]").forEach((button) => button.setAttribute("aria-expanded", String(expanded)));
+  }
 
   function text(parent, tag, value, className = "") {
     const element = document.createElement(tag);
@@ -58,7 +65,7 @@
       const empty = document.createElement("div");
       empty.className = "agent-welcome";
       text(empty, "h2", "从一个任务开始");
-      text(empty, "p", "可以让我搜索岗位、比较机会、检查简历、分析当前受控 Edge 页面，或准备沟通和面试。");
+      text(empty, "p", "可以让我找岗位、比较机会、分析当前岗位，或依据简历事实给出岗位定制建议。");
       transcript.appendChild(empty);
       return;
     }
@@ -121,10 +128,17 @@
     $("[data-session-summary]").textContent = session.summary || "用自然语言安排搜索、分析和准备工作。";
     $("[data-model-label]").textContent = session.model_profile_name || "未选择模型";
     autoCommunication.checked = Boolean(session.auto_communication);
-    $("[data-policy-note]").textContent = session.auto_communication ? "受限自动沟通已授权，仍受闸门与限额约束" : "关闭时仅生成草稿";
     const task = $("[data-task-context]");
     task.replaceChildren();
     const context = state.conversation?.state || {};
+    const isPaused = Boolean(context.automation?.paused);
+    const policyNote = $("[data-policy-note]");
+    policyNote.textContent = isPaused
+      ? "全局暂停中，不会自动沟通"
+      : session.auto_communication
+        ? "自动沟通已授权"
+        : "自动沟通已关闭";
+    policyNote.classList.toggle("is-paused", isPaused);
     const rows = [
       ["模型", session.model_profile_name || "未选择"],
       ["自动沟通", session.auto_communication ? "开启" : "关闭"],
@@ -234,11 +248,13 @@
     root.querySelectorAll("[data-view-switch]").forEach((item) => item.classList.toggle("active", item.dataset.viewSwitch === state.view));
     const newSession = root.querySelector("[data-new-session]");
     if (newSession) newSession.disabled = state.pending;
+    syncContextControls();
   }
 
   function setPending(pending) {
     state.pending = pending;
     input.disabled = pending; send.disabled = pending;
+    autoCommunication.disabled = pending;
     send.textContent = pending ? "执行中" : "发送";
     root.querySelectorAll("[data-delete-session-id], [data-delete-memory-id], [data-new-session], [data-session-id]").forEach((element) => { element.disabled = pending; });
   }
@@ -294,7 +310,12 @@
       return;
     }
     if (event.target.closest("[data-toggle-manual]") || event.target.closest("[data-open-manual]")) { manualMenu.hidden = !manualMenu.hidden; return; }
-    if (event.target.closest("[data-toggle-context]")) { $("[data-context-panel]").classList.toggle("collapsed"); return; }
+    if (event.target.closest("[data-toggle-context]")) {
+      if (window.matchMedia("(max-width: 1100px)").matches) root.classList.toggle("context-open");
+      else contextPanel.classList.toggle("collapsed");
+      syncContextControls();
+      return;
+    }
     if (event.target.closest("[data-new-session]")) {
       const payload = await request("/api/agent/sessions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model_profile_id: modelSelect.value || null }) });
       state.sessions = payload.sessions; state.conversation = payload.conversation; state.view = "chat"; $("[data-chat-view]").hidden = false; $("[data-canvas-view]").hidden = true; render(); input.focus(); return;
@@ -313,12 +334,45 @@
     if (filter) { state.canvasFilter = filter.dataset.canvasFilter; root.querySelectorAll("[data-canvas-filter]").forEach((item) => item.classList.toggle("active", item === filter)); renderCanvas(); }
   });
 
+  autoCommunication.addEventListener("change", async () => {
+    const session = activeSession();
+    if (!session) return;
+    const enabled = autoCommunication.checked;
+    if (enabled && !window.confirm("开启后，Agent 可能在岗位与风险闸门通过时自动发送岗位询问。全局暂停始终优先。")) {
+      autoCommunication.checked = false;
+      return;
+    }
+    autoCommunication.disabled = true;
+    try {
+      const payload = await request(`/api/agent/sessions/${session.id}/auto-communication`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled }),
+      });
+      state.conversation = payload.conversation;
+      render();
+    } catch (error) {
+      autoCommunication.checked = !enabled;
+      window.alert(error.message || "自动沟通设置保存失败。");
+    } finally {
+      autoCommunication.disabled = state.pending;
+    }
+  });
+
+  window.addEventListener("resize", syncContextControls);
+  window.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && root.classList.contains("context-open")) {
+      root.classList.remove("context-open");
+      syncContextControls();
+    }
+  });
+
   composer.addEventListener("submit", async (event) => {
     event.preventDefault();
     const message = input.value.trim(); if (!message) return;
     setPending(true);
     try {
-      const payload = await request(`/api/agent/sessions/${activeSession().id}/messages`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message, model_profile_id: Number(modelSelect.value) || null, auto_communication: autoCommunication.checked }) });
+      const payload = await request(`/api/agent/sessions/${activeSession().id}/messages`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message, model_profile_id: Number(modelSelect.value) || null }) });
       state.conversation = payload.conversation; state.sessions = payload.sessions; state.canvas = payload.canvas; input.value = ""; render();
     } catch (error) { window.alert(error.message || "任务执行失败。"); }
     finally { setPending(false); input.focus(); }

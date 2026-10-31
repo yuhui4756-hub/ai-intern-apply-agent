@@ -65,6 +65,36 @@ def test_agent_contract_rejects_extra_tool_arguments_and_strict_types():
     assert coerced_boolean.violations[0].code == "invalid_arguments"
 
 
+def test_agent_contract_allows_resume_tailoring_without_file_or_submit_arguments():
+    accepted = validate_planner_output(
+        {
+            "plan": "根据当前岗位和已导入简历准备证据。",
+            "tool_calls": [{"name": "tailor_resume", "arguments": {"job_id": 7}}],
+            "response": "",
+            "task_summary": "",
+        }
+    )
+    rejected = validate_planner_output(
+        {
+            "plan": "读取简历并覆盖文件。",
+            "tool_calls": [
+                {
+                    "name": "tailor_resume",
+                    "arguments": {"job_id": 7, "file_path": "C:/resume.docx", "save": True},
+                }
+            ],
+            "response": "",
+            "task_summary": "",
+        }
+    )
+
+    assert accepted.violations == []
+    assert accepted.tool_calls[0].name == "tailor_resume"
+    assert accepted.tool_calls[0].arguments == {"job_id": 7}
+    assert rejected.tool_calls == []
+    assert rejected.violations[0].code == "invalid_arguments"
+
+
 def test_agent_contract_rejects_unknown_top_level_fields():
     with pytest.raises(AgentContractError):
         validate_planner_output(
@@ -96,6 +126,31 @@ def test_planner_prompt_marks_job_and_tool_observations_as_untrusted():
     assert "<trusted_user_request>" in user
     assert "<untrusted_local_context>" in user
     assert "submit_application" in user
+
+
+def test_planner_prompt_limits_resume_tailoring_to_supported_evidence():
+    messages = planner_messages("针对当前岗位优化我的简历", {}, [], [])
+
+    system = str(messages[0]["content"])
+    assert "简历定制建议必须由用户在本轮明确提出" in system
+    assert "不得新增未经证实的技能、数字、日期、职责或结果" in system
+    assert "最多三条" in system
+    assert "不编辑、保存或覆盖简历文件" in system
+
+
+def test_planner_response_preserves_line_breaks():
+    from app.services.desktop_agent import normalize_plan
+
+    plan = normalize_plan(
+        {
+            "plan": "",
+            "tool_calls": [],
+            "response": "原文：参与检索评测\n建议稿：负责 RAG 检索评测",
+            "task_summary": "",
+        }
+    )
+
+    assert plan["response"] == "原文：参与检索评测\n建议稿：负责 RAG 检索评测"
 
 
 def test_desktop_agent_repairs_an_unknown_tool_before_executing_safe_plan(tmp_path, monkeypatch):

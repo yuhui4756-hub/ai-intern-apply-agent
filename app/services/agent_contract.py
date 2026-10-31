@@ -79,6 +79,7 @@ TOOL_ARGUMENT_MODELS: dict[str, type[ContractModel]] = {
     "prepare_communication": JobIdArguments,
     "prepare_interview": JobIdArguments,
     "check_resume": JobIdArguments,
+    "tailor_resume": JobIdArguments,
     "check_unread": EmptyArguments,
     "search_memory": SearchMemoryArguments,
     "save_job_evidence": JobIdArguments,

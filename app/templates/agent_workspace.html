@@ -6,6 +6,7 @@
   <link rel="icon" href="data:,">
   <title>求职agent</title>
   <link rel="stylesheet" href="{{ url_for('static', path='styles.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', path='agent_workspace.css') }}">
 </head>
 <body class="agent-app-body">
   <div class="agent-shell" data-agent-workspace data-bootstrap='{{ bootstrap | tojson }}'>
@@ -30,7 +31,7 @@
         </div>
         <div class="agent-header-actions">
           <span class="agent-edge-status" data-edge-status>受控 Edge 未检查</span>
-          <button class="agent-icon-button" type="button" data-toggle-context title="显示或隐藏上下文面板">面板</button>
+          <button class="agent-icon-button" type="button" data-toggle-context aria-controls="agent-context-panel" aria-expanded="true" title="显示或隐藏上下文面板">面板</button>
         </div>
       </header>
 
@@ -61,7 +62,7 @@
           <a href="/communications" target="_blank">沟通草稿</a>
           <a href="/interviews" target="_blank">面试准备</a>
         </div>
-        <textarea data-composer-input rows="3" placeholder="例如：根据我的简历搜索杭州的 AI 应用开发实习，优先每周 5 天的岗位"></textarea>
+        <textarea data-composer-input rows="3" placeholder="例如：针对当前岗位，依据我的简历事实给出最多三条修改建议"></textarea>
         <div class="agent-composer-controls">
           <button class="agent-add-button" type="button" data-toggle-manual title="打开备用手动工具">+</button>
           <label class="agent-model-select">模型
@@ -77,9 +78,9 @@
       </form>
     </main>
 
-    <aside class="agent-context" data-context-panel>
+    <aside id="agent-context-panel" class="agent-context" data-context-panel>
       <section class="agent-context-section">
-        <div class="agent-context-heading"><h2>当前任务</h2><span data-model-label>未选择模型</span></div>
+        <div class="agent-context-heading"><h2>当前任务</h2><span data-model-label>未选择模型</span><button class="agent-context-close" type="button" data-toggle-context aria-controls="agent-context-panel" aria-expanded="true" title="收起上下文面板">关闭</button></div>
         <dl data-task-context></dl>
       </section>
       <section class="agent-context-section">

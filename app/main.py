@@ -20,7 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.concurrency import run_in_threadpool
 
-from .config import ROOT_DIR, TASK_TYPES, looks_masked, mask_secret, recordings_dir, set_env_value, suggest_api_key_env
+from .config import ENV_PATH, ROOT_DIR, TASK_TYPES, looks_masked, mask_secret, recordings_dir, set_env_value, suggest_api_key_env
 from .db import connect, dumps, get_setting, init_db, loads, set_setting, utc_now
 from .services.analyzer import (
     build_interview_review,
@@ -7655,19 +7655,43 @@ async def desktop_agent_message(session_id: int, request: Request) -> JSONRespon
     profile_id = payload.get("model_profile_id")
     if profile_id is not None and (isinstance(profile_id, bool) or not str(profile_id).isdigit()):
         return api_error("模型档案编号无效。")
-    auto = payload.get("auto_communication")
-    if auto is not None and not isinstance(auto, bool):
-        return api_error("自动沟通开关必须是布尔值。")
     try:
         conversation = await desktop_agent.process_turn(
             session_id,
             str(payload.get("message") or ""),
             model_profile_id=int(profile_id) if profile_id is not None else None,
-            auto_communication=auto,
         )
     except ValueError as exc:
         return api_error(str(exc), 404 if "会话" in str(exc) else 400)
     return JSONResponse({"ok": True, "conversation": conversation, "sessions": desktop_agent.list_sessions(), "canvas": desktop_agent.canvas_items()})
+
+
+@app.post("/api/agent/sessions/{session_id}/auto-communication")
+async def desktop_agent_auto_communication(session_id: int, request: Request) -> JSONResponse:
+    try:
+        payload = await request.json()
+    except ValueError:
+        return api_error("请求体必须是 JSON 对象。")
+    if not isinstance(payload, dict) or not isinstance(payload.get("enabled"), bool):
+        return api_error("自动沟通开关必须是布尔值。")
+
+    session = desktop_agent.set_session_auto_communication(session_id, payload["enabled"])
+    if not session:
+        return api_error("没有找到 Agent 任务会话。", 404)
+    with connect() as conn:
+        log_agent_action(
+            conn,
+            action_type="desktop_agent_auto_communication",
+            status="已授权" if payload["enabled"] else "已关闭",
+            summary="用户更新了当前 Agent 会话的自动沟通授权。",
+            decision={
+                "session_id": session_id,
+                "session_auto_communication": payload["enabled"],
+                "global_paused": automation_control()["paused"],
+                "message_sent": False,
+            },
+        )
+    return JSONResponse({"ok": True, "conversation": desktop_agent.conversation_payload(session_id)})
 
 
 @app.post("/api/agent/sessions/{session_id}/summary")
@@ -10549,6 +10573,14 @@ def ensure_desktop_autonomous_first_contact_draft(conn: Any, job_id: int, *, ses
 
 
 def run_desktop_autonomous_first_contact(job_id: int, *, session_id: int) -> dict[str, Any]:
+    if automation_control()["paused"]:
+        return {
+            "status": "已暂停",
+            "note": "全局自动化已暂停，未打开招聘页面或发起沟通。",
+            "contact_clicked": False,
+            "message_sent": False,
+        }
+
     with connect() as conn:
         draft_result = ensure_desktop_autonomous_first_contact_draft(conn, job_id, session_id=session_id)
         if not draft_result.get("draft_id"):
@@ -10556,9 +10588,25 @@ def run_desktop_autonomous_first_contact(job_id: int, *, session_id: int) -> dic
         job = conn.execute("SELECT platform, source_url FROM job_postings WHERE id = ?", (job_id,)).fetchone()
     if not job:
         return {"status": "已阻止", "note": "岗位已不存在。", **draft_result}
+    if automation_control()["paused"]:
+        return {
+            "status": "已暂停",
+            "note": "全局自动化已暂停，草稿已保留，未打开招聘页面或发起沟通。",
+            **draft_result,
+            "contact_clicked": False,
+            "message_sent": False,
+        }
     try:
         open_message_patrol_browser(str(job["source_url"] or ""))
         time.sleep(0.8)
+        if automation_control()["paused"]:
+            return {
+                "status": "已暂停",
+                "note": "全局自动化已暂停，未继续打开会话或发送消息。",
+                **draft_result,
+                "contact_clicked": False,
+                "message_sent": False,
+            }
         contact = click_first_contact_in_controlled_edge(str(job["source_url"] or ""), str(job["platform"] or ""))
         time.sleep(0.8)
     except Exception as exc:
@@ -11764,7 +11812,7 @@ def settings_page(request: Request) -> Any:
         profile["api_key_env_shared_with"] = [name for name in env_usage.get(key_name, []) if name != profile.get("name")]
         profile["api_key_env_suggestion"] = suggest_api_key_env(profile.get("name") or "", profile.get("base_url") or "")
         profiles.append(profile)
-    env_path = ROOT_DIR / ".env"
+    env_path = ENV_PATH
     return templates.TemplateResponse(
         request,
         "settings.html",
